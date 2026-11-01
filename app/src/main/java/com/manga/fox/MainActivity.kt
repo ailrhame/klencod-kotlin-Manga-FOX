@@ -10,9 +10,13 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.pm.PackageManager
 import android.content.Intent
+import android.content.SharedPreferences
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.RectF
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
@@ -27,6 +31,8 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
@@ -35,6 +41,7 @@ import android.widget.Button
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import com.google.android.gms.tasks.Tasks
@@ -52,17 +59,26 @@ import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
 private const val ACTION_SHOW_RESULTS = "com.manga.fox.SHOW_RESULTS"
-private const val MAX_CAPTURE_FRAMES = 24
+private const val ACTION_STOP_CAPTURE = "com.manga.fox.STOP_CAPTURE"
+private const val PREFS_NAME = "manga_fox_v2_preferences"
+private const val PREF_FONT_SIZE = "font_size_sp"
+private const val PREF_FONT_FAMILY = "font_family"
+private const val PREF_FONT_BOLD = "font_bold"
+private const val PREF_LENS_SIZE = "lens_size_dp"
+private const val PREF_LENS_ALPHA = "lens_alpha"
+private const val MAX_CAPTURE_FRAMES = 120
 
 object MangaFoxRuntime {
     @Volatile var status: String = "جاهز للترجمة"
-    @Volatile var resultPages: List<Bitmap> = emptyList()
+    @Volatile var resultPages: List<String> = emptyList()
     @Volatile var resultTitle: String = "الفصل المترجم"
     @Volatile var lastError: String = ""
 }
@@ -72,11 +88,13 @@ class MainActivity : android.app.Activity() {
     private val panel = Color.rgb(25, 25, 31)
     private val gold = Color.rgb(255, 190, 65)
     private lateinit var statusText: TextView
+    private lateinit var preferences: SharedPreferences
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         applySystemBars()
-        if (intent?.action == ACTION_SHOW_RESULTS) showResults() else showHome()
+        handleIntent(intent)
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 701)
         }
@@ -85,7 +103,19 @@ class MainActivity : android.app.Activity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (intent.action == ACTION_SHOW_RESULTS) showResults()
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(source: Intent?) {
+        when (source?.action) {
+            ACTION_SHOW_RESULTS -> showResults()
+            ACTION_STOP_CAPTURE -> {
+                showHome()
+                MangaFoxAccessibilityService.instance?.stopCaptureByUser()
+                    ?: toast("خدمة Manga Fox غير متصلة؛ أعد تفعيلها ثم حاول مرة أخرى")
+            }
+            else -> showHome()
+        }
     }
 
     override fun onResume() {
@@ -166,8 +196,14 @@ class MainActivity : android.app.Activity() {
             val service = MangaFoxAccessibilityService.instance
             if (service == null) toast("فعّل خدمة Manga Fox أولاً، ثم افتح فصل المانجا") else service.startFullChapterCapture()
         })
+        actions.addView(actionButton("إيقاف الالتقاط الحالي", false) {
+            val service = MangaFoxAccessibilityService.instance
+            if (service == null) toast("خدمة Manga Fox غير متصلة") else service.stopCaptureByUser()
+        })
         actions.addView(actionButton("عرض آخر نتيجة مترجمة", false) { showResults() })
         root.addView(actions, matchWrap(dp(16)))
+
+        addSettingsCard(root)
 
         val statusCard = card()
         statusCard.addView(text("الحالة", 16f, Color.WHITE, true))
@@ -183,6 +219,78 @@ class MainActivity : android.app.Activity() {
         scroll.addView(root)
         setContentView(scroll)
         refreshStatus()
+    }
+
+    private fun addSettingsCard(root: LinearLayout) {
+        val settingsCard = card()
+        settingsCard.addView(text("إعدادات القراءة والترجمة", 18f, Color.WHITE, true))
+        settingsCard.addView(text("تُطبّق إعدادات الخط على الترجمات الجديدة. ويمكن تغيير حجم العدسة وشفافيتها مباشرة.", 12f, Color.LTGRAY))
+
+        addSettingSlider(
+            settingsCard, "حجم الخط العربي", 10, 40,
+            preferences.getInt(PREF_FONT_SIZE, 22), " sp"
+        ) { value -> preferences.edit().putInt(PREF_FONT_SIZE, value).apply() }
+
+        val fontFamilies = listOf("sans-serif" to "نسخي", "serif" to "تقليدي", "sans-serif-medium" to "متوسط", "casual" to "يدوي")
+        val initialFamily = fontFamilies.firstOrNull { it.first == preferences.getString(PREF_FONT_FAMILY, "sans-serif") }?.second ?: "نسخي"
+        val familyButton = actionButton("نوع الخط: $initialFamily · اضغط للتغيير", false) { }
+        // Use a stable reference so the button label can be updated without rebuilding the screen.
+        familyButton.setOnClickListener {
+            val current = preferences.getString(PREF_FONT_FAMILY, "sans-serif")
+            val currentIndex = fontFamilies.indexOfFirst { it.first == current }.let { if (it < 0) 0 else it }
+            val next = fontFamilies[(currentIndex + 1) % fontFamilies.size]
+            preferences.edit().putString(PREF_FONT_FAMILY, next.first).apply()
+            familyButton.text = "نوع الخط: ${next.second} · اضغط للتغيير"
+        }
+        settingsCard.addView(familyButton, matchWrap(dp(4)))
+
+        val boldButton = actionButton(
+            if (preferences.getBoolean(PREF_FONT_BOLD, true)) "سماكة الخط: عريض ✓" else "سماكة الخط: عادي", false
+        ) { }
+        boldButton.setOnClickListener {
+            val enabled = !preferences.getBoolean(PREF_FONT_BOLD, true)
+            preferences.edit().putBoolean(PREF_FONT_BOLD, enabled).apply()
+            boldButton.text = if (enabled) "سماكة الخط: عريض ✓" else "سماكة الخط: عادي"
+        }
+        settingsCard.addView(boldButton, matchWrap(dp(4)))
+
+        addSettingSlider(
+            settingsCard, "حجم العدسة العائمة", 42, 96,
+            preferences.getInt(PREF_LENS_SIZE, 58), " dp"
+        ) { value ->
+            preferences.edit().putInt(PREF_LENS_SIZE, value).apply()
+            MangaFoxAccessibilityService.instance?.applyLensSettings()
+        }
+        addSettingSlider(
+            settingsCard, "شفافية العدسة", 35, 100,
+            preferences.getInt(PREF_LENS_ALPHA, 100), "%"
+        ) { value ->
+            preferences.edit().putInt(PREF_LENS_ALPHA, value).apply()
+            MangaFoxAccessibilityService.instance?.applyLensSettings()
+        }
+        root.addView(settingsCard, matchWrap(dp(16)))
+    }
+
+    private fun addSettingSlider(
+        parent: LinearLayout, label: String, minValue: Int, maxValue: Int,
+        initialValue: Int, suffix: String, onChanged: (Int) -> Unit
+    ) {
+        val labelView = text("$label: ${initialValue.coerceIn(minValue, maxValue)}$suffix", 13f, Color.LTGRAY, true)
+        parent.addView(labelView, matchWrap())
+        val slider = SeekBar(this).apply {
+            max = maxValue - minValue
+            progress = initialValue.coerceIn(minValue, maxValue) - minValue
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    val value = minValue + progress
+                    labelView.text = "$label: $value$suffix"
+                    if (fromUser) onChanged(value)
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+                override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+            })
+        }
+        parent.addView(slider, matchWrap(dp(8)))
     }
 
     private fun showResults() {
@@ -213,22 +321,36 @@ class MainActivity : android.app.Activity() {
                 gravity = Gravity.CENTER
                 setPadding(0, 0, 0, dp(10))
             }, matchWrap())
-            pages.forEachIndexed { index, bitmap ->
-                val image = ImageView(this).apply {
-                    setImageBitmap(bitmap)
-                    scaleType = ImageView.ScaleType.FIT_CENTER
-                    adjustViewBounds = true
-                    contentDescription = "الجزء المترجم ${index + 1}"
+            val pageViews = ArrayList<ZoomableImageView>()
+            pages.forEachIndexed { index, filePath ->
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(filePath, bounds)
+                val sourceWidth = bounds.outWidth.coerceAtLeast(1)
+                val sourceHeight = bounds.outHeight.coerceAtLeast(1)
+                val image = ZoomableImageView(this).apply {
+                    setImageFile(filePath)
+                    contentDescription = "الجزء المترجم ${index + 1} — كبّر بإصبعين"
                     setBackgroundColor(Color.WHITE)
                 }
+                val displayWidth = resources.displayMetrics.widthPixels - dp(24)
+                val displayHeight = (sourceHeight * (displayWidth.toFloat() / sourceWidth)).toInt().coerceAtLeast(dp(180))
                 root.addView(image, LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = dp(3) })
+                    LinearLayout.LayoutParams.MATCH_PARENT, displayHeight
+                ).apply { bottomMargin = dp(4) })
+                pageViews.add(image)
             }
+            scroll.setOnScrollChangeListener { _, _, _, _, _ -> updateVisiblePageImages(pageViews) }
+            scroll.post { updateVisiblePageImages(pageViews) }
         }
         scroll.addView(root)
         setContentView(scroll)
+    }
+
+    private fun updateVisiblePageImages(pages: List<ZoomableImageView>) {
+        val visibleBounds = android.graphics.Rect()
+        pages.forEach { page ->
+            if (page.getLocalVisibleRect(visibleBounds)) page.loadPage() else page.releasePage()
+        }
     }
 
     private fun refreshStatus() {
@@ -287,6 +409,131 @@ class MainActivity : android.app.Activity() {
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
 }
 
+private class ZoomableImageView(context: Context) : ImageView(context) {
+    private val drawMatrix = Matrix()
+    private val displayedRect = RectF()
+    private var userScale = 1f
+    private var lastX = 0f
+    private var lastY = 0f
+    private var dragging = false
+    private var imageFilePath: String? = null
+    private var loadedBitmap: Bitmap? = null
+    private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScale(detector: ScaleGestureDetector): Boolean {
+            val next = (userScale * detector.scaleFactor).coerceIn(1f, 5f)
+            val factor = next / userScale
+            userScale = next
+            drawMatrix.postScale(factor, factor, detector.focusX, detector.focusY)
+            fixBounds()
+            imageMatrix = drawMatrix
+            return true
+        }
+    })
+
+    init {
+        scaleType = ScaleType.MATRIX
+        isClickable = true
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        resetBaseMatrix()
+    }
+
+    fun setImageFile(path: String) {
+        imageFilePath = path
+        releasePage()
+    }
+
+    fun loadPage() {
+        if (loadedBitmap != null) return
+        val path = imageFilePath ?: return
+        val bitmap = BitmapFactory.decodeFile(path) ?: return
+        loadedBitmap = bitmap
+        super.setImageBitmap(bitmap)
+        post { resetBaseMatrix() }
+    }
+
+    fun releasePage() {
+        val old = loadedBitmap
+        loadedBitmap = null
+        super.setImageDrawable(null)
+        old?.let { if (!it.isRecycled) it.recycle() }
+        userScale = 1f
+        drawMatrix.reset()
+    }
+
+    override fun onDetachedFromWindow() {
+        releasePage()
+        super.onDetachedFromWindow()
+    }
+
+    private fun resetBaseMatrix() {
+        val d = drawable ?: return
+        if (width <= 0 || height <= 0 || d.intrinsicWidth <= 0 || d.intrinsicHeight <= 0) return
+        val fit = min(width.toFloat() / d.intrinsicWidth, height.toFloat() / d.intrinsicHeight)
+        val left = (width - d.intrinsicWidth * fit) / 2f
+        val top = (height - d.intrinsicHeight * fit) / 2f
+        drawMatrix.reset()
+        drawMatrix.setScale(fit, fit)
+        drawMatrix.postTranslate(left, top)
+        userScale = 1f
+        imageMatrix = drawMatrix
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        scaleDetector.onTouchEvent(event)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                lastX = event.x
+                lastY = event.y
+                dragging = userScale > 1.01f
+                parent?.requestDisallowInterceptTouchEvent(dragging)
+                return true
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                parent?.requestDisallowInterceptTouchEvent(true)
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (userScale > 1.01f && !scaleDetector.isInProgress && event.pointerCount == 1) {
+                    val dx = event.x - lastX
+                    val dy = event.y - lastY
+                    drawMatrix.postTranslate(dx, dy)
+                    fixBounds()
+                    imageMatrix = drawMatrix
+                    dragging = true
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                }
+                lastX = event.x
+                lastY = event.y
+                return true
+            }
+            MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (userScale <= 1.01f) parent?.requestDisallowInterceptTouchEvent(false)
+                if (event.actionMasked != MotionEvent.ACTION_POINTER_UP && userScale <= 1.01f) resetBaseMatrix()
+                return true
+            }
+        }
+        return true
+    }
+
+    private fun fixBounds() {
+        val d = drawable ?: return
+        displayedRect.set(0f, 0f, d.intrinsicWidth.toFloat(), d.intrinsicHeight.toFloat())
+        drawMatrix.mapRect(displayedRect)
+        var dx = 0f
+        var dy = 0f
+        if (displayedRect.width() <= width) dx = width / 2f - displayedRect.centerX()
+        else if (displayedRect.left > 0f) dx = -displayedRect.left
+        else if (displayedRect.right < width) dx = width - displayedRect.right
+        if (displayedRect.height() <= height) dy = height / 2f - displayedRect.centerY()
+        else if (displayedRect.top > 0f) dy = -displayedRect.top
+        else if (displayedRect.bottom < height) dy = height - displayedRect.bottom
+        drawMatrix.postTranslate(dx, dy)
+    }
+}
+
 class MangaFoxAccessibilityService : AccessibilityService() {
     companion object {
         @Volatile var instance: MangaFoxAccessibilityService? = null
@@ -301,8 +548,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private var captureRunning = false
     private var fullChapterMode = false
     private var captureCount = 0
+    private var unchangedFrameCount = 0
     private var previousFrame: Bitmap? = null
-    private val capturedSegments = ArrayList<Bitmap>()
+    private val capturedSegments = ArrayList<File>()
     private var bubbleWasAdded = false
 
     private val recognizersDelegate = lazy {
@@ -333,7 +581,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         instance = null
         previousFrame?.recycle()
         previousFrame = null
-        capturedSegments.forEach { if (!it.isRecycled) it.recycle() }
+        capturedSegments.forEach { runCatching { it.delete() } }
         capturedSegments.clear()
         if (recognizersDelegate.isInitialized()) recognizers.forEach { runCatching { it.close() } }
         if (languageIdentifierDelegate.isInitialized()) runCatching { languageIdentifier.close() }
@@ -349,7 +597,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
         captureRunning = true
         fullChapterMode = false
-        capturedSegments.forEach { if (!it.isRecycled) it.recycle() }
+        capturedSegments.forEach { runCatching { it.delete() } }
         capturedSegments.clear()
         MangaFoxRuntime.status = "التقاط الشاشة الحالية..."
         removeFloatingBubble()
@@ -358,11 +606,12 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 if (bitmap == null) {
                     finishCaptureWithError(error ?: "تعذر التقاط الشاشة")
                 } else {
-                    val segment = cropContent(bitmap, 0f)
-                    bitmap.recycle()
+                    capturedSegments.forEach { runCatching { it.delete() } }
                     capturedSegments.clear()
-                    capturedSegments.add(segment)
-                    finishCaptureAndTranslate()
+                    runCatching { capturedSegments.add(storeCaptureSegment(bitmap, 0)) }
+                        .onSuccess { finishCaptureAndTranslate() }
+                        .onFailure { finishCaptureWithError("تعذر حفظ لقطة الشاشة: ${it.localizedMessage ?: "خطأ تخزين"}") }
+                    bitmap.recycle()
                 }
             }
         }, 250L)
@@ -377,19 +626,21 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         captureRunning = true
         fullChapterMode = true
         captureCount = 0
+        unchangedFrameCount = 0
         previousFrame?.recycle()
         previousFrame = null
-        capturedSegments.forEach { if (!it.isRecycled) it.recycle() }
+        capturedSegments.forEach { runCatching { it.delete() } }
         capturedSegments.clear()
         MangaFoxRuntime.status = "بدء التقاط الفصل العمودي..."
         removeFloatingBubble()
-        mainHandler.postDelayed({ captureNextFrame() }, 350L)
+        notifyCaptureProgress()
+        mainHandler.postDelayed({ captureNextFrame() }, 450L)
     }
 
     private fun captureNextFrame() {
         if (!captureRunning || !fullChapterMode) return
         if (captureCount >= MAX_CAPTURE_FRAMES) {
-            finishCaptureAndTranslate("تم الوصول إلى الحد الآمن (24 لقطة)، وهذه نتيجة جزئية إذا كان الفصل أطول")
+            finishCaptureAndTranslate("وصل الالتقاط إلى حد الأمان (${MAX_CAPTURE_FRAMES} لقطة). يمكنك بدء التقاط آخر لاستكمال بقية الفصل.")
             return
         }
         requestScreenshot { bitmap, error ->
@@ -409,32 +660,69 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             val previous = previousFrame
             if (previous != null && looksUnchanged(previous, bitmap)) {
                 bitmap.recycle()
-                finishCaptureAndTranslate("وصل الالتقاط إلى نهاية المحتوى أو لم يعد هناك تمرير جديد")
+                unchangedFrameCount++
+                MangaFoxRuntime.status = "لم يتغير المحتوى؛ محاولة التمرير ${unchangedFrameCount}/3..."
+                notifyCaptureProgress()
+                if (unchangedFrameCount >= 3) {
+                    finishCaptureAndTranslate("وصل الالتقاط إلى نهاية المحتوى بعد 3 محاولات تمرير دون تغير")
+                } else {
+                    dispatchNextSwipe(previous)
+                }
                 return@requestScreenshot
             }
 
-            val overlap = if (previous == null) 0f else 0.27f
-            capturedSegments.add(cropContent(bitmap, overlap))
+            unchangedFrameCount = 0
+            val overlapPx = if (previous == null) 0 else findVerticalOverlap(previous, bitmap)
+            try {
+                capturedSegments.add(storeCaptureSegment(bitmap, overlapPx))
+            } catch (e: Exception) {
+                bitmap.recycle()
+                finishCaptureAndTranslate("تعذر حفظ جزء من الفصل: ${e.localizedMessage ?: "خطأ تخزين"}")
+                return@requestScreenshot
+            }
             previousFrame?.recycle()
             previousFrame = bitmap
             captureCount++
-            MangaFoxRuntime.status = "التقاط الفصل: $captureCount من $MAX_CAPTURE_FRAMES"
+            MangaFoxRuntime.status = "التقاط الفصل: $captureCount لقطة · الحد الوقائي $MAX_CAPTURE_FRAMES"
+            notifyCaptureProgress()
+            dispatchNextSwipe(bitmap)
+        }
+    }
 
-            val height = bitmap.height.toFloat()
-            val path = Path().apply {
-                moveTo(bitmap.width * 0.52f, height * 0.84f)
-                lineTo(bitmap.width * 0.52f, height * 0.18f)
+    private fun dispatchNextSwipe(bitmap: Bitmap) {
+        if (!captureRunning || !fullChapterMode) return
+        val height = bitmap.height.toFloat()
+        val path = Path().apply {
+            moveTo(bitmap.width * 0.52f, height * 0.86f)
+            lineTo(bitmap.width * 0.52f, height * 0.13f)
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, 620L))
+            .build()
+        val callback = object : AccessibilityService.GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription) {
+                mainHandler.postDelayed({ captureNextFrame() }, 850L)
             }
-            val gesture = GestureDescription.Builder()
-                .addStroke(GestureDescription.StrokeDescription(path, 0L, 520L))
-                .build()
-            val dispatched = dispatchGesture(gesture, null, null)
-            if (!dispatched) {
-                finishCaptureAndTranslate("تعذر تمرير التطبيق تلقائياً؛ تمت معالجة الأجزاء التي التقطت")
-            } else {
-                mainHandler.postDelayed({ captureNextFrame() }, 1250L)
+
+            override fun onCancelled(gestureDescription: GestureDescription) {
+                // A canceled swipe is checked just like an unchanged frame; repeated
+                // failures eventually stop safely instead of silently losing content.
+                mainHandler.postDelayed({ captureNextFrame() }, 650L)
             }
         }
+        val dispatched = dispatchGesture(gesture, callback, mainHandler)
+        if (!dispatched) {
+            finishCaptureAndTranslate("تعذر تنفيذ حركة التمرير؛ تمت معالجة الأجزاء التي التقطت")
+        }
+    }
+
+    fun stopCaptureByUser() {
+        if (!captureRunning) {
+            toast("لا توجد عملية التقاط نشطة")
+            return
+        }
+        if (capturedSegments.isEmpty()) finishCaptureWithError("تم إيقاف الالتقاط قبل التقاط أي جزء")
+        else finishCaptureAndTranslate("أوقف المستخدم الالتقاط يدوياً؛ تمت ترجمة الأجزاء التي جُمعت")
     }
 
     private fun requestScreenshot(callback: (Bitmap?, String?) -> Unit) {
@@ -486,18 +774,92 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun cropContent(source: Bitmap, overlapFraction: Float): Bitmap {
-        val top = (source.height * 0.035f).toInt().coerceAtMost(source.height - 2)
-        val bottom = (source.height * 0.965f).toInt().coerceAtLeast(top + 1)
-        val contentHeight = bottom - top
-        val cut = (contentHeight * overlapFraction).toInt().coerceIn(0, contentHeight - 1)
-        val cropped = Bitmap.createBitmap(source, 0, top + cut, source.width, contentHeight - cut)
-        val maxWidth = 900
+    /**
+     * Finds how many pixels at the top of the new frame repeat the bottom of the
+     * previous frame. If a reliable match cannot be found, returns zero so the
+     * app prefers a harmless duplicate strip over deleting real artwork.
+     */
+    private fun findVerticalOverlap(previous: Bitmap, current: Bitmap): Int {
+        if (previous.width != current.width || previous.height != current.height) return 0
+        val h = previous.height
+        val minOverlap = (h * 0.12f).toInt().coerceAtLeast(24)
+        val maxOverlap = (h * 0.74f).toInt().coerceAtMost(h - 24)
+        if (maxOverlap <= minOverlap) return 0
+        val candidateStep = (h / 180).coerceAtLeast(3)
+        val sampleRows = 42
+        val sampleColumns = 20
+        var bestOverlap = 0
+        var bestScore = Double.MAX_VALUE
+        var secondBestScore = Double.MAX_VALUE
+        var secondBestOverlap = 0
+        var overlap = minOverlap
+        while (overlap <= maxOverlap) {
+            var total = 0L
+            var samples = 0
+            for (row in 0 until sampleRows) {
+                val offset = ((row + 0.5f) * overlap / sampleRows).toInt()
+                val py = (h - overlap + offset).coerceIn(0, h - 1)
+                val cy = offset.coerceIn(0, h - 1)
+                for (column in 0 until sampleColumns) {
+                    val x = ((column + 0.5f) * previous.width / sampleColumns).toInt().coerceIn(0, previous.width - 1)
+                    val a = previous.getPixel(x, py)
+                    val b = current.getPixel(x, cy)
+                    total += abs(Color.red(a) - Color.red(b))
+                    total += abs(Color.green(a) - Color.green(b))
+                    total += abs(Color.blue(a) - Color.blue(b))
+                    samples += 3
+                }
+            }
+            val score = total.toDouble() / samples.coerceAtLeast(1)
+            if (score < bestScore) {
+                if (bestOverlap > 0 && abs(overlap - bestOverlap) > candidateStep * 3) {
+                    secondBestScore = bestScore
+                    secondBestOverlap = bestOverlap
+                }
+                bestScore = score
+                bestOverlap = overlap
+            } else if (abs(overlap - bestOverlap) > candidateStep * 3 && score < secondBestScore) {
+                secondBestScore = score
+                secondBestOverlap = overlap
+            }
+            overlap += candidateStep
+        }
+        // Typical exact manga overlap is very close. Refuse uncertain or flat/blank matches.
+        if (bestScore > 31.0 || bestOverlap == 0) return 0
+        if (secondBestOverlap > 0 && secondBestScore - bestScore < 1.6) return 0
+        // Leave a tiny safety band from the repeated area: duplicates are safer than lost pixels.
+        return (bestOverlap - 10).coerceAtLeast(0)
+    }
+
+    private fun cropContent(source: Bitmap, overlapTopPx: Int): Bitmap {
+        // Do not trim fixed percentages from screen edges: panels and speech bubbles
+        // may legitimately touch them. Only remove verified repeated rows.
+        val cut = overlapTopPx.coerceIn(0, source.height - 1)
+        val cropped = Bitmap.createBitmap(source, 0, cut, source.width, source.height - cut)
+        val maxWidth = 1080
         if (cropped.width <= maxWidth) return cropped
         val targetHeight = (cropped.height * (maxWidth.toFloat() / cropped.width)).toInt().coerceAtLeast(1)
         val scaled = Bitmap.createScaledBitmap(cropped, maxWidth, targetHeight, true)
         cropped.recycle()
         return scaled
+    }
+
+    private fun storeCaptureSegment(source: Bitmap, overlapTopPx: Int): File {
+        val segment = cropContent(source, overlapTopPx)
+        val file = File(cacheDir, "mfox_capture_${System.currentTimeMillis()}_${captureCount}_${capturedSegments.size}.jpg")
+        try {
+            FileOutputStream(file).use { stream ->
+                if (!segment.compress(Bitmap.CompressFormat.JPEG, 91, stream)) {
+                    throw IllegalStateException("تعذر ضغط صورة الالتقاط")
+                }
+            }
+        } catch (e: Exception) {
+            file.delete()
+            throw e
+        } finally {
+            if (!segment.isRecycled) segment.recycle()
+        }
+        return file
     }
 
     private fun looksUnchanged(first: Bitmap, second: Bitmap): Boolean {
@@ -517,13 +879,14 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         a.recycle()
         b.recycle()
         val average = difference.toDouble() / (28.0 * 56.0 * 3.0)
-        return average < 1.35
+        return average < 2.3
     }
 
     private fun finishCaptureAndTranslate(note: String = "") {
         if (!captureRunning) return
         captureRunning = false
         fullChapterMode = false
+        clearCaptureNotification()
         previousFrame?.recycle()
         previousFrame = null
         restoreFloatingBubble()
@@ -537,25 +900,42 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         if (note.isNotBlank()) MangaFoxRuntime.lastError = note
 
         worker.execute {
-            val translatedPages = ArrayList<Bitmap>()
+            val translatedFiles = ArrayList<String>()
             try {
-                workPages.forEachIndexed { index, page ->
+                workPages.forEachIndexed { index, file ->
                     MangaFoxRuntime.status = "تحليل وترجمة المقطع ${index + 1} من ${workPages.size}..."
-                    translatedPages.add(translateBitmap(page))
-                    if (!page.isRecycled) page.recycle()
+                    val page = BitmapFactory.decodeFile(file.absolutePath)
+                        ?: throw IllegalStateException("تعذر قراءة المقطع ${index + 1}")
+                    var translated: Bitmap? = null
+                    try {
+                        val outputBitmap = translateBitmap(page)
+                        translated = outputBitmap
+                        val outputFile = File(cacheDir, "mfox_result_${System.currentTimeMillis()}_$index.jpg")
+                        FileOutputStream(outputFile).use { stream ->
+                            if (!outputBitmap.compress(Bitmap.CompressFormat.JPEG, 92, stream)) {
+                                throw IllegalStateException("تعذر حفظ نتيجة المقطع ${index + 1}")
+                            }
+                        }
+                        translatedFiles.add(outputFile.absolutePath)
+                    } finally {
+                        if (!page.isRecycled) page.recycle()
+                        translated?.let { if (!it.isRecycled) it.recycle() }
+                        runCatching { file.delete() }
+                    }
                 }
-                MangaFoxRuntime.resultPages = translatedPages
+                val oldFiles = MangaFoxRuntime.resultPages
+                MangaFoxRuntime.resultPages = translatedFiles
+                oldFiles.forEach { runCatching { File(it).delete() } }
                 MangaFoxRuntime.resultTitle = if (workPages.size > 1) "الفصل العمودي" else "الصفحة الحالية"
-                MangaFoxRuntime.status = "اكتملت الترجمة: ${translatedPages.size} مقطع"
+                MangaFoxRuntime.status = "اكتملت الترجمة: ${translatedFiles.size} مقطع"
                 MangaFoxRuntime.lastError = note
                 mainHandler.post {
                     val notified = notifyResultsReady()
                     toast(if (notified) "اكتملت الترجمة العربية. اضغط إشعار Manga Fox لعرض الفصل" else "اكتملت الترجمة. افتح Manga Fox ثم اختر عرض آخر نتيجة مترجمة")
                 }
             } catch (e: Exception) {
-                workPages.forEach { if (!it.isRecycled) it.recycle() }
-                translatedPages.forEach { if (!it.isRecycled) it.recycle() }
-                MangaFoxRuntime.resultPages = emptyList()
+                workPages.forEach { runCatching { it.delete() } }
+                translatedFiles.forEach { runCatching { File(it).delete() } }
                 MangaFoxRuntime.lastError = "حدث خطأ أثناء الترجمة: ${e.localizedMessage ?: "خطأ غير معروف"}"
                 MangaFoxRuntime.status = "تعذرت الترجمة"
                 mainHandler.post { toast(MangaFoxRuntime.lastError) }
@@ -566,9 +946,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private fun finishCaptureWithError(message: String) {
         captureRunning = false
         fullChapterMode = false
+        clearCaptureNotification()
         previousFrame?.recycle()
         previousFrame = null
-        capturedSegments.forEach { if (!it.isRecycled) it.recycle() }
+        capturedSegments.forEach { runCatching { it.delete() } }
         capturedSegments.clear()
         MangaFoxRuntime.status = "تعذر الالتقاط"
         MangaFoxRuntime.lastError = message
@@ -672,10 +1053,14 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private fun drawArabicText(canvas: Canvas, text: String, rect: Rect) {
         val horizontalPadding = max(4, rect.width() / 20)
         val maxWidth = (rect.width() - horizontalPadding * 2).coerceAtLeast(12)
-        var size = (rect.height() * 0.66f).coerceIn(10f,  thirtyPx())
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val preferredSp = prefs.getInt(PREF_FONT_SIZE, 22).coerceIn(10, 40)
+        val preferredPx = preferredSp * resources.displayMetrics.density
+        var size = min((rect.height() * 0.72f).coerceAtLeast(10f), preferredPx)
+        size = size.coerceIn(10f, 64f)
         var layout = buildArabicLayout(text, maxWidth, size)
-        while (layout.height > rect.height() && size > 9f) {
-            size -= 1.5f
+        while (layout.height > rect.height() && size > 8f) {
+            size -= 1f
             layout = buildArabicLayout(text, maxWidth, size)
         }
         val x = rect.left + horizontalPadding
@@ -687,10 +1072,13 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     private fun buildArabicLayout(value: String, width: Int, size: Float): android.text.StaticLayout {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val family = prefs.getString(PREF_FONT_FAMILY, "sans-serif") ?: "sans-serif"
+        val style = if (prefs.getBoolean(PREF_FONT_BOLD, true)) Typeface.BOLD else Typeface.NORMAL
         val paint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(20, 20, 22)
             textSize = size
-            typeface = Typeface.create("sans-serif", Typeface.BOLD)
+            typeface = Typeface.create(family, style)
         }
         return android.text.StaticLayout.Builder.obtain(value, 0, value.length, paint, width)
             .setAlignment(android.text.Layout.Alignment.ALIGN_CENTER)
@@ -703,6 +1091,18 @@ class MangaFoxAccessibilityService : AccessibilityService() {
 
     private fun thirtyPx(): Float = 30f * resources.displayMetrics.density
 
+    fun applyLensSettings() {
+        val view = bubble ?: return
+        val params = bubbleParams ?: return
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val size = prefs.getInt(PREF_LENS_SIZE, 58).coerceIn(42, 96)
+        params.width = dp(size)
+        params.height = dp(size)
+        view.textSize = (size * 0.40f).coerceIn(18f, 38f)
+        view.alpha = prefs.getInt(PREF_LENS_ALPHA, 100).coerceIn(35, 100) / 100f
+        if (bubbleWasAdded) runCatching { windowManager.updateViewLayout(view, params) }
+    }
+
     fun ensureFloatingBubble() {
         if (Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)) showFloatingBubble()
     }
@@ -710,9 +1110,12 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private fun showFloatingBubble() {
         if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) return
         if (bubbleWasAdded || !this::windowManager.isInitialized) return
+        val lensPrefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val lensSize = lensPrefs.getInt(PREF_LENS_SIZE, 58).coerceIn(42, 96)
+        val lensAlpha = lensPrefs.getInt(PREF_LENS_ALPHA, 100).coerceIn(35, 100) / 100f
         val view = TextView(this).apply {
             text = "狐"
-            textSize = 23f
+            textSize = (lensSize * 0.40f).coerceIn(18f, 38f)
             typeface = Typeface.create("sans-serif-black", Typeface.BOLD)
             setTextColor(Color.BLACK)
             gravity = Gravity.CENTER
@@ -722,17 +1125,18 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 setStroke(dp(2), Color.WHITE)
             }
             elevation = dp(8).toFloat()
+            alpha = lensAlpha
             contentDescription = "Manga Fox Translator. اضغط لترجمة الجزء، واضغط مطولاً لترجمة الفصل"
         }
         val params = WindowManager.LayoutParams(
-            dp(58), dp(58),
+            dp(lensSize), dp(lensSize),
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = dp(12)
-            y = (resources.displayMetrics.heightPixels * 0.36f).toInt()
+            x = lensPrefs.getInt("lens_x", dp(12))
+            y = lensPrefs.getInt("lens_y", (resources.displayMetrics.heightPixels * 0.36f).toInt())
         }
         var downX = 0f
         var downY = 0f
@@ -761,7 +1165,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     true
                 }
                 android.view.MotionEvent.ACTION_UP -> {
-                    if (!moved) {
+                    if (moved) {
+                        lensPrefs.edit().putInt("lens_x", params.x).putInt("lens_y", params.y).apply()
+                    } else {
                         if (event.eventTime - event.downTime > 550L) startFullChapterCapture()
                         else startSingleCapture()
                     }
@@ -799,6 +1205,37 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 }
             }
         }, 250L)
+    }
+
+    private fun notifyCaptureProgress() {
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channelId = "manga_fox_capture"
+        if (Build.VERSION.SDK_INT >= 26) {
+            manager.createNotificationChannel(NotificationChannel(channelId, "التقاط Manga Fox", NotificationManager.IMPORTANCE_LOW))
+        }
+        val stopIntent = Intent(this, MainActivity::class.java).apply {
+            action = ACTION_STOP_CAPTURE
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        }
+        val stopPending = PendingIntent.getActivity(
+            this, 402, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val builder = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, channelId) else Notification.Builder(this)
+        val notification = builder
+            .setSmallIcon(android.R.drawable.ic_menu_search)
+            .setContentTitle("Manga Fox · التقاط الفصل")
+            .setContentText("${captureCount} لقطة ملتقطة · اضغط زر إيقاف الالتقاط في الإشعار")
+            .setOngoing(true)
+            .addAction(android.R.drawable.ic_media_pause, "إيقاف الالتقاط", stopPending)
+            .build()
+        runCatching { manager.notify(402, notification) }
+    }
+
+    private fun clearCaptureNotification() {
+        runCatching {
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(402)
+        }
     }
 
     private fun notifyResultsReady(): Boolean {
