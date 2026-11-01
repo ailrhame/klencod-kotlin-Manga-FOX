@@ -36,7 +36,6 @@ import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.Button
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -62,6 +61,7 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -166,6 +166,7 @@ class MainActivity : android.app.Activity() {
         intro.addView(text("ترجمة الفصل العمودي بالكامل", 20f, gold, true))
         intro.addView(text("تلتقط Manga Fox لقطات متتابعة أثناء النزول، وتدمجها كصفحات متسلسلة، ثم تتعرف على النصوص وتترجمها إلى العربية داخل نسخة طويلة قابلة للتمرير.", 14f, Color.LTGRAY))
         intro.addView(text("تعمل المعالجة على الجهاز بعد تنزيل نماذج اللغات. يلزم اتصال بالإنترنت لتنزيل النموذج أول مرة.", 13f, Color.rgb(195, 185, 165)))
+        intro.addView(text("مهم: افتح الفصل في تطبيق قراءة المانجا أولاً، ثم ارجع إلى Manga Fox واضغط زر الترجمة. سيُخفى Manga Fox تلقائياً ليظهر قارئ المانجا قبل بدء التصوير.", 13f, Color.rgb(255, 205, 120)))
         root.addView(intro, matchWrap(dp(18)))
 
         val permissions = card()
@@ -190,11 +191,23 @@ class MainActivity : android.app.Activity() {
         actions.addView(text("الترجمة", 18f, Color.WHITE, true))
         actions.addView(actionButton("ترجمة الشاشة الحالية", true) {
             val service = MangaFoxAccessibilityService.instance
-            if (service == null) toast("فعّل خدمة Manga Fox أولاً") else service.startSingleCapture()
+            if (service == null) {
+                toast("فعّل خدمة Manga Fox أولاً")
+            } else {
+                service.startSingleCapture(900L)
+                window.decorView.postDelayed({ moveTaskToBack(true) }, 120L)
+            }
         })
         actions.addView(actionButton("ترجمة الفصل العمودي كاملاً", true) {
             val service = MangaFoxAccessibilityService.instance
-            if (service == null) toast("فعّل خدمة Manga Fox أولاً، ثم افتح فصل المانجا") else service.startFullChapterCapture()
+            if (service == null) {
+                toast("فعّل خدمة Manga Fox أولاً، ثم افتح فصل المانجا")
+            } else {
+                service.startFullChapterCapture(1300L)
+                // Move Manga Fox out of the foreground before the first screenshot.
+                // The previously opened manga reader becomes the active display.
+                window.decorView.postDelayed({ moveTaskToBack(true) }, 120L)
+            }
         })
         actions.addView(actionButton("إيقاف الالتقاط الحالي", false) {
             val service = MangaFoxAccessibilityService.instance
@@ -211,7 +224,7 @@ class MainActivity : android.app.Activity() {
         statusCard.addView(statusText, matchWrap())
         root.addView(statusCard, matchWrap(dp(16)))
 
-        root.addView(text("ملاحظة: الالتقاط الكامل يحتاج Android 11 أو أحدث. قد تمنع بعض تطبيقات القراءة تصوير الشاشة. النسخة الأولية تترجم مناطق النص المكتشفة وقد لا تمسح الكتابة من الخلفيات المعقدة بالكامل.", 12f, Color.GRAY).apply {
+        root.addView(text("ملاحظة: الالتقاط الكامل يحتاج Android 11 أو أحدث. يجب أن يكون قارئ المانجا هو التطبيق المفتوح قبل الضغط على زر الترجمة. قد تمنع بعض تطبيقات القراءة تصوير الشاشة. النسخة الأولية تترجم مناطق النص المكتشفة وقد لا تمسح الكتابة من الخلفيات المعقدة بالكامل.", 12f, Color.GRAY).apply {
             setPadding(dp(4), dp(6), dp(4), dp(14))
         }, matchWrap())
         root.addView(text("MANGA FOX  ·  N5CR4", 12f, gold).apply { gravity = Gravity.CENTER }, matchWrap())
@@ -549,19 +562,23 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private var fullChapterMode = false
     private var captureCount = 0
     private var unchangedFrameCount = 0
+    private var screenshotRetryCount = 0
+    private var gestureFailureCount = 0
+    @Volatile private var translationRunning = false
     private var previousFrame: Bitmap? = null
     private val capturedSegments = ArrayList<File>()
     private var bubbleWasAdded = false
 
-    private val recognizersDelegate = lazy {
-        listOf(
-            TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS),
-            TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build()),
-            TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()),
-            TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
-        )
-    }
-    private val recognizers: List<TextRecognizer> by recognizersDelegate
+    // Recognizers are created on demand. Keeping all four ML Kit engines alive
+    // from the beginning increased the chance of memory pressure on long chapters.
+    private val latinRecognizerDelegate = lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
+    private val latinRecognizer: TextRecognizer by latinRecognizerDelegate
+    private val japaneseRecognizerDelegate = lazy { TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build()) }
+    private val japaneseRecognizer: TextRecognizer by japaneseRecognizerDelegate
+    private val koreanRecognizerDelegate = lazy { TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()) }
+    private val koreanRecognizer: TextRecognizer by koreanRecognizerDelegate
+    private val chineseRecognizerDelegate = lazy { TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build()) }
+    private val chineseRecognizer: TextRecognizer by chineseRecognizerDelegate
     private val languageIdentifierDelegate = lazy { LanguageIdentification.getClient() }
     private val languageIdentifier by languageIdentifierDelegate
 
@@ -571,6 +588,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         MangaFoxRuntime.status = "خدمة العدسة متصلة"
         showFloatingBubble()
+        // If Android/OEM stopped the service during a chapter capture, keep the
+        // JPEG segments and recover them when the accessibility service returns.
+        mainHandler.postDelayed({ recoverInterruptedCapture() }, 900L)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
@@ -578,19 +598,37 @@ class MangaFoxAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         removeFloatingBubble()
-        instance = null
+        if (instance === this) instance = null
         previousFrame?.recycle()
         previousFrame = null
-        capturedSegments.forEach { runCatching { it.delete() } }
-        capturedSegments.clear()
-        if (recognizersDelegate.isInitialized()) recognizers.forEach { runCatching { it.close() } }
-        if (languageIdentifierDelegate.isInitialized()) runCatching { languageIdentifier.close() }
+        clearCaptureNotification()
+        if (captureRunning && capturedSegments.isNotEmpty()) {
+            // Do not erase completed screenshots if the system tears down the
+            // accessibility service. They can be translated after reconnection.
+            MangaFoxRuntime.status = "انقطعت خدمة الالتقاط؛ تم الاحتفاظ بـ ${capturedSegments.size} مقطع للاستعادة"
+            MangaFoxRuntime.lastError = "أوقف النظام خدمة Manga Fox أثناء الالتقاط. أعد تفعيل الخدمة لاستعادة المقاطع المحفوظة."
+        } else if (!translationRunning) {
+            capturedSegments.forEach { runCatching { it.delete() } }
+            capturedSegments.clear()
+        }
+        if (!translationRunning) closeRecognitionResources()
         worker.shutdown()
         super.onDestroy()
     }
 
-    fun startSingleCapture() {
-        if (captureRunning) return
+    private fun closeRecognitionResources() {
+        if (latinRecognizerDelegate.isInitialized()) runCatching { latinRecognizer.close() }
+        if (japaneseRecognizerDelegate.isInitialized()) runCatching { japaneseRecognizer.close() }
+        if (koreanRecognizerDelegate.isInitialized()) runCatching { koreanRecognizer.close() }
+        if (chineseRecognizerDelegate.isInitialized()) runCatching { chineseRecognizer.close() }
+        if (languageIdentifierDelegate.isInitialized()) runCatching { languageIdentifier.close() }
+    }
+
+    fun startSingleCapture(startDelayMs: Long = 250L) {
+        if (captureRunning || translationRunning) {
+            toast("هناك عملية ترجمة أو التقاط قيد التنفيذ")
+            return
+        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             toast("الالتقاط التلقائي يحتاج Android 11 أو أحدث")
             return
@@ -614,11 +652,20 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     bitmap.recycle()
                 }
             }
-        }, 250L)
+        }, startDelayMs.coerceIn(200L, 5000L))
     }
 
-    fun startFullChapterCapture() {
-        if (captureRunning) return
+    fun startFullChapterCapture(startDelayMs: Long = 450L) {
+        if (captureRunning || translationRunning) {
+            toast("هناك عملية ترجمة أو التقاط قيد التنفيذ")
+            return
+        }
+        val pendingRecovery = pendingCaptureFiles().isNotEmpty()
+        if (pendingRecovery) {
+            recoverInterruptedCapture()
+            toast("عثر Manga Fox على مقاطع محفوظة من جلسة سابقة؛ بدأت استعادتها أولاً")
+            return
+        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             toast("ترجمة الفصل الكامل تحتاج Android 11 أو أحدث")
             return
@@ -627,6 +674,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         fullChapterMode = true
         captureCount = 0
         unchangedFrameCount = 0
+        screenshotRetryCount = 0
+        gestureFailureCount = 0
         previousFrame?.recycle()
         previousFrame = null
         capturedSegments.forEach { runCatching { it.delete() } }
@@ -634,7 +683,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         MangaFoxRuntime.status = "بدء التقاط الفصل العمودي..."
         removeFloatingBubble()
         notifyCaptureProgress()
-        mainHandler.postDelayed({ captureNextFrame() }, 450L)
+        mainHandler.postDelayed({ captureNextFrame() }, startDelayMs.coerceIn(250L, 5000L))
     }
 
     private fun captureNextFrame() {
@@ -649,16 +698,32 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 return@requestScreenshot
             }
             if (bitmap == null) {
-                if (capturedSegments.isNotEmpty()) {
-                    finishCaptureAndTranslate("توقف الالتقاط: ${error ?: "تعذر أخذ لقطة أخرى"}")
+                screenshotRetryCount++
+                if (screenshotRetryCount < 3 && captureRunning) {
+                    MangaFoxRuntime.status = "تعذر التصوير مؤقتاً؛ إعادة المحاولة ${screenshotRetryCount}/2"
+                    notifyCaptureProgress()
+                    mainHandler.postDelayed({ captureNextFrame() }, 900L * screenshotRetryCount)
+                } else if (capturedSegments.isNotEmpty()) {
+                    finishCaptureAndTranslate("توقف الالتقاط بعد محاولات التصوير: ${error ?: "تعذر أخذ لقطة أخرى"}")
                 } else {
-                    finishCaptureWithError(error ?: "تعذر التقاط الشاشة")
+                    finishCaptureWithError(error ?: "تعذر التقاط الشاشة بعد 3 محاولات")
                 }
                 return@requestScreenshot
             }
+            screenshotRetryCount = 0
 
+            val displayWidth = bitmap.width
+            val displayHeight = bitmap.height
+            val comparisonFrame = try {
+                createComparisonFrame(bitmap)
+            } catch (e: Exception) {
+                bitmap.recycle()
+                finishCaptureWithError("تعذر تجهيز إطار المقارنة: ${e.localizedMessage ?: "نقص ذاكرة"}")
+                return@requestScreenshot
+            }
             val previous = previousFrame
-            if (previous != null && looksUnchanged(previous, bitmap)) {
+            if (previous != null && looksUnchanged(previous, comparisonFrame)) {
+                comparisonFrame.recycle()
                 bitmap.recycle()
                 unchangedFrameCount++
                 MangaFoxRuntime.status = "لم يتغير المحتوى؛ محاولة التمرير ${unchangedFrameCount}/3..."
@@ -666,53 +731,70 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 if (unchangedFrameCount >= 3) {
                     finishCaptureAndTranslate("وصل الالتقاط إلى نهاية المحتوى بعد 3 محاولات تمرير دون تغير")
                 } else {
-                    dispatchNextSwipe(previous)
+                    dispatchNextSwipe(displayWidth, displayHeight)
                 }
                 return@requestScreenshot
             }
 
             unchangedFrameCount = 0
-            val overlapPx = if (previous == null) 0 else findVerticalOverlap(previous, bitmap)
+            val overlapSmall = if (previous == null) 0 else findVerticalOverlap(previous, comparisonFrame)
+            val overlapPx = if (overlapSmall <= 0) 0 else
+                ((overlapSmall.toFloat() / comparisonFrame.height) * bitmap.height).toInt().coerceIn(0, bitmap.height - 1)
             try {
                 capturedSegments.add(storeCaptureSegment(bitmap, overlapPx))
             } catch (e: Exception) {
+                comparisonFrame.recycle()
                 bitmap.recycle()
                 finishCaptureAndTranslate("تعذر حفظ جزء من الفصل: ${e.localizedMessage ?: "خطأ تخزين"}")
                 return@requestScreenshot
             }
             previousFrame?.recycle()
-            previousFrame = bitmap
+            previousFrame = comparisonFrame
             captureCount++
             MangaFoxRuntime.status = "التقاط الفصل: $captureCount لقطة · الحد الوقائي $MAX_CAPTURE_FRAMES"
             notifyCaptureProgress()
-            dispatchNextSwipe(bitmap)
+            dispatchNextSwipe(displayWidth, displayHeight)
+            // The compressed JPEG segment is now on disk; release the full-size
+            // display bitmap and keep only its small comparison copy in RAM.
+            if (!bitmap.isRecycled) bitmap.recycle()
         }
     }
 
-    private fun dispatchNextSwipe(bitmap: Bitmap) {
+    private fun dispatchNextSwipe(displayWidth: Int, displayHeight: Int) {
         if (!captureRunning || !fullChapterMode) return
-        val height = bitmap.height.toFloat()
+        val width = displayWidth.toFloat()
+        val height = displayHeight.toFloat()
         val path = Path().apply {
-            moveTo(bitmap.width * 0.52f, height * 0.86f)
-            lineTo(bitmap.width * 0.52f, height * 0.13f)
+            moveTo(width * 0.52f, height * 0.86f)
+            lineTo(width * 0.52f, height * 0.13f)
         }
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0L, 620L))
             .build()
         val callback = object : AccessibilityService.GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription) {
-                mainHandler.postDelayed({ captureNextFrame() }, 850L)
+                gestureFailureCount = 0
+                mainHandler.postDelayed({ captureNextFrame() }, 1100L)
             }
 
             override fun onCancelled(gestureDescription: GestureDescription) {
-                // A canceled swipe is checked just like an unchanged frame; repeated
-                // failures eventually stop safely instead of silently losing content.
-                mainHandler.postDelayed({ captureNextFrame() }, 650L)
+                gestureFailureCount++
+                if (gestureFailureCount >= 3) {
+                    finishCaptureAndTranslate("تعذر تمرير صفحة القراءة بعد 3 محاولات؛ تمت معالجة المقاطع التي جُمعت")
+                } else {
+                    MangaFoxRuntime.status = "أُلغيت حركة التمرير؛ إعادة المحاولة ${gestureFailureCount}/3"
+                    mainHandler.postDelayed({ captureNextFrame() }, 900L)
+                }
             }
         }
         val dispatched = dispatchGesture(gesture, callback, mainHandler)
         if (!dispatched) {
-            finishCaptureAndTranslate("تعذر تنفيذ حركة التمرير؛ تمت معالجة الأجزاء التي التقطت")
+            gestureFailureCount++
+            if (gestureFailureCount >= 3) {
+                finishCaptureAndTranslate("رفض النظام تنفيذ التمرير؛ تمت معالجة المقاطع التي جُمعت")
+            } else {
+                mainHandler.postDelayed({ captureNextFrame() }, 900L)
+            }
         }
     }
 
@@ -730,19 +812,42 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             callback(null, "يلزم Android 11 أو أحدث")
             return
         }
+
+        val delivered = AtomicBoolean(false)
+        val timeout = Runnable {
+            if (delivered.compareAndSet(false, true)) {
+                callback(null, "انتهت مهلة تصوير الشاشة؛ لم يستجب النظام")
+            }
+        }
+        mainHandler.postDelayed(timeout, 9000L)
+        fun deliver(bitmap: Bitmap?, error: String?) {
+            if (delivered.compareAndSet(false, true)) {
+                mainHandler.removeCallbacks(timeout)
+                callback(bitmap, error)
+            } else {
+                bitmap?.let { if (!it.isRecycled) it.recycle() }
+            }
+        }
+
         val screenshotCallback = object : AccessibilityService.TakeScreenshotCallback {
             override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
-                var bitmap: Bitmap? = null
+                var buffer: HardwareBuffer? = null
+                var hardwareBitmap: Bitmap? = null
+                var result: Bitmap? = null
+                var failure: String? = null
                 try {
-                    val buffer: HardwareBuffer = screenshot.hardwareBuffer
-                    val hardwareBitmap = Bitmap.wrapHardwareBuffer(buffer, screenshot.colorSpace)
-                    bitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
-                    buffer.close()
+                    val screenshotBuffer = screenshot.hardwareBuffer
+                    buffer = screenshotBuffer
+                    hardwareBitmap = Bitmap.wrapHardwareBuffer(screenshotBuffer, screenshot.colorSpace)
+                    result = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+                    if (result == null) failure = "أعاد النظام لقطة شاشة فارغة"
                 } catch (e: Exception) {
-                    callback(null, "تعذر تجهيز لقطة الشاشة: ${e.localizedMessage ?: "خطأ غير معروف"}")
-                    return
+                    failure = "تعذر تجهيز لقطة الشاشة: ${e.localizedMessage ?: "خطأ غير معروف"}"
+                } finally {
+                    runCatching { hardwareBitmap?.recycle() }
+                    runCatching { buffer?.close() }
                 }
-                if (bitmap == null) callback(null, "أعاد النظام لقطة شاشة فارغة") else callback(bitmap, null)
+                deliver(result, failure)
             }
 
             override fun onFailure(errorCode: Int) {
@@ -752,26 +857,27 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     AccessibilityService.ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT -> "الالتقاط سريع جداً؛ أعد المحاولة"
                     else -> "فشل التقاط الشاشة، رمز الخطأ: $errorCode"
                 }
-                callback(null, message)
+                deliver(null, message)
             }
         }
 
         try {
-            if (Build.VERSION.SDK_INT >= 34) {
-                val activeWindow = windows.firstOrNull {
-                    it.isActive && it.type == AccessibilityWindowInfo.TYPE_APPLICATION
-                }
-                if (activeWindow != null) {
-                    takeScreenshotOfWindow(activeWindow.id, mainExecutor, screenshotCallback)
-                } else {
-                    takeScreenshot(android.view.Display.DEFAULT_DISPLAY, mainExecutor, screenshotCallback)
-                }
-            } else {
-                takeScreenshot(android.view.Display.DEFAULT_DISPLAY, mainExecutor, screenshotCallback)
-            }
+            // Capture the complete display, not a cropped active window. Gesture
+            // coordinates are display coordinates too, so both now share one space.
+            takeScreenshot(android.view.Display.DEFAULT_DISPLAY, mainExecutor, screenshotCallback)
         } catch (e: Exception) {
-            callback(null, "تعذر بدء الالتقاط: ${e.localizedMessage ?: "خطأ نظام"}")
+            deliver(null, "تعذر بدء الالتقاط: ${e.localizedMessage ?: "خطأ نظام"}")
         }
+    }
+
+    private fun createComparisonFrame(source: Bitmap): Bitmap {
+        val maxWidth = 720
+        if (source.width <= maxWidth) {
+            return source.copy(Bitmap.Config.ARGB_8888, false)
+                ?: throw IllegalStateException("تعذر إنشاء نسخة المقارنة")
+        }
+        val scaledHeight = (source.height * (maxWidth.toFloat() / source.width)).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(source, maxWidth, scaledHeight, true)
     }
 
     /**
@@ -846,7 +952,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
 
     private fun storeCaptureSegment(source: Bitmap, overlapTopPx: Int): File {
         val segment = cropContent(source, overlapTopPx)
-        val file = File(cacheDir, "mfox_capture_${System.currentTimeMillis()}_${captureCount}_${capturedSegments.size}.jpg")
+        val file = File(filesDir, "mfox_capture_${System.currentTimeMillis()}_${captureCount}_${capturedSegments.size}.jpg")
         try {
             FileOutputStream(file).use { stream ->
                 if (!segment.compress(Bitmap.CompressFormat.JPEG, 91, stream)) {
@@ -896,50 +1002,88 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
         val workPages = ArrayList(capturedSegments)
         capturedSegments.clear()
+        translateSavedSegments(workPages, note, if (workPages.size > 1) "الفصل العمودي" else "الصفحة الحالية")
+    }
+
+    private fun pendingCaptureFiles(): List<File> {
+        return listOf(filesDir, cacheDir)
+            .flatMap { directory -> directory.listFiles()?.asList().orEmpty() }
+            .filter { it.isFile && it.name.startsWith("mfox_capture_") && it.length() > 0L }
+            .distinctBy { it.absolutePath }
+            .sortedBy { it.name }
+    }
+
+    private fun recoverInterruptedCapture() {
+        if (captureRunning || translationRunning || instance !== this) return
+        val pending = pendingCaptureFiles()
+        if (pending.isEmpty()) return
+        MangaFoxRuntime.status = "استعادة ${pending.size} مقطع محفوظ بعد انقطاع الخدمة..."
+        translateSavedSegments(
+            ArrayList(pending),
+            "تمت استعادة المقاطع المحفوظة بعد إعادة تشغيل خدمة الالتقاط.",
+            "الفصل المستعاد"
+        )
+    }
+
+    private fun translateSavedSegments(workPages: ArrayList<File>, note: String, title: String) {
+        if (workPages.isEmpty() || translationRunning) return
+        translationRunning = true
         MangaFoxRuntime.status = "بدء استخراج النصوص وترجمتها..."
         if (note.isNotBlank()) MangaFoxRuntime.lastError = note
 
-        worker.execute {
-            val translatedFiles = ArrayList<String>()
-            try {
-                workPages.forEachIndexed { index, file ->
-                    MangaFoxRuntime.status = "تحليل وترجمة المقطع ${index + 1} من ${workPages.size}..."
-                    val page = BitmapFactory.decodeFile(file.absolutePath)
-                        ?: throw IllegalStateException("تعذر قراءة المقطع ${index + 1}")
-                    var translated: Bitmap? = null
-                    try {
-                        val outputBitmap = translateBitmap(page)
-                        translated = outputBitmap
-                        val outputFile = File(cacheDir, "mfox_result_${System.currentTimeMillis()}_$index.jpg")
-                        FileOutputStream(outputFile).use { stream ->
-                            if (!outputBitmap.compress(Bitmap.CompressFormat.JPEG, 92, stream)) {
-                                throw IllegalStateException("تعذر حفظ نتيجة المقطع ${index + 1}")
+        try {
+            worker.execute {
+                val translatedFiles = ArrayList<String>()
+                try {
+                    workPages.forEachIndexed { index, file ->
+                        MangaFoxRuntime.status = "تحليل وترجمة المقطع ${index + 1} من ${workPages.size}..."
+                        val page = BitmapFactory.decodeFile(file.absolutePath)
+                            ?: throw IllegalStateException("تعذر قراءة المقطع ${index + 1}")
+                        var translated: Bitmap? = null
+                        try {
+                            val outputBitmap = translateBitmap(page)
+                            translated = outputBitmap
+                            val outputFile = File(cacheDir, "mfox_result_${System.currentTimeMillis()}_$index.jpg")
+                            FileOutputStream(outputFile).use { stream ->
+                                if (!outputBitmap.compress(Bitmap.CompressFormat.JPEG, 92, stream)) {
+                                    throw IllegalStateException("تعذر حفظ نتيجة المقطع ${index + 1}")
+                                }
                             }
+                            translatedFiles.add(outputFile.absolutePath)
+                        } finally {
+                            if (!page.isRecycled) page.recycle()
+                            translated?.let { if (!it.isRecycled) it.recycle() }
+                            runCatching { file.delete() }
                         }
-                        translatedFiles.add(outputFile.absolutePath)
-                    } finally {
-                        if (!page.isRecycled) page.recycle()
-                        translated?.let { if (!it.isRecycled) it.recycle() }
-                        runCatching { file.delete() }
+                    }
+                    val oldFiles = MangaFoxRuntime.resultPages
+                    MangaFoxRuntime.resultPages = translatedFiles
+                    oldFiles.forEach { runCatching { File(it).delete() } }
+                    MangaFoxRuntime.resultTitle = title
+                    MangaFoxRuntime.status = "اكتملت الترجمة: ${translatedFiles.size} مقطع"
+                    MangaFoxRuntime.lastError = note
+                    mainHandler.post {
+                        translationRunning = false
+                        if (instance !== this@MangaFoxAccessibilityService) closeRecognitionResources()
+                        val notified = notifyResultsReady()
+                        toast(if (notified) "اكتملت الترجمة العربية. اضغط إشعار Manga Fox لعرض الفصل" else "اكتملت الترجمة. افتح Manga Fox ثم اختر عرض آخر نتيجة مترجمة")
+                    }
+                } catch (e: Exception) {
+                    workPages.forEach { runCatching { it.delete() } }
+                    translatedFiles.forEach { runCatching { File(it).delete() } }
+                    MangaFoxRuntime.lastError = "حدث خطأ أثناء الترجمة: ${e.localizedMessage ?: "خطأ غير معروف"}"
+                    MangaFoxRuntime.status = "تعذرت الترجمة"
+                    mainHandler.post {
+                        translationRunning = false
+                        if (instance !== this@MangaFoxAccessibilityService) closeRecognitionResources()
+                        toast(MangaFoxRuntime.lastError)
                     }
                 }
-                val oldFiles = MangaFoxRuntime.resultPages
-                MangaFoxRuntime.resultPages = translatedFiles
-                oldFiles.forEach { runCatching { File(it).delete() } }
-                MangaFoxRuntime.resultTitle = if (workPages.size > 1) "الفصل العمودي" else "الصفحة الحالية"
-                MangaFoxRuntime.status = "اكتملت الترجمة: ${translatedFiles.size} مقطع"
-                MangaFoxRuntime.lastError = note
-                mainHandler.post {
-                    val notified = notifyResultsReady()
-                    toast(if (notified) "اكتملت الترجمة العربية. اضغط إشعار Manga Fox لعرض الفصل" else "اكتملت الترجمة. افتح Manga Fox ثم اختر عرض آخر نتيجة مترجمة")
-                }
-            } catch (e: Exception) {
-                workPages.forEach { runCatching { it.delete() } }
-                translatedFiles.forEach { runCatching { File(it).delete() } }
-                MangaFoxRuntime.lastError = "حدث خطأ أثناء الترجمة: ${e.localizedMessage ?: "خطأ غير معروف"}"
-                MangaFoxRuntime.status = "تعذرت الترجمة"
-                mainHandler.post { toast(MangaFoxRuntime.lastError) }
             }
+        } catch (e: Exception) {
+            translationRunning = false
+            workPages.forEach { runCatching { it.delete() } }
+            finishCaptureWithError("تعذر تشغيل عامل الترجمة: ${e.localizedMessage ?: "خطأ داخلي"}")
         }
     }
 
@@ -961,10 +1105,25 @@ class MangaFoxAccessibilityService : AccessibilityService() {
 
     private fun translateBitmap(source: Bitmap): Bitmap {
         val input = InputImage.fromBitmap(source, 0)
-        val recognizedResults = recognizers.mapNotNull { recognizer ->
-            runCatching { Tasks.await(recognizer.process(input)) }.getOrNull()
+        var best: Text? = runCatching { Tasks.await(latinRecognizer.process(input)) }.getOrNull()
+        fun hasEnoughReadableText(result: Text?): Boolean {
+            val value = result?.text.orEmpty()
+            return value.length >= 24 && value.count { it.isLetter() } >= 16
         }
-        val best = recognizedResults.maxByOrNull { result -> result.text.length }
+        // Most English pages need only the Latin engine. Create/run the heavier
+        // CJK engines sequentially, and only when the first pass found little text.
+        if (!hasEnoughReadableText(best)) {
+            val candidate = runCatching { Tasks.await(japaneseRecognizer.process(input)) }.getOrNull()
+            if (candidate != null && candidate.text.length > (best?.text?.length ?: 0)) best = candidate
+        }
+        if (!hasEnoughReadableText(best)) {
+            val candidate = runCatching { Tasks.await(koreanRecognizer.process(input)) }.getOrNull()
+            if (candidate != null && candidate.text.length > (best?.text?.length ?: 0)) best = candidate
+        }
+        if (!hasEnoughReadableText(best)) {
+            val candidate = runCatching { Tasks.await(chineseRecognizer.process(input)) }.getOrNull()
+            if (candidate != null && candidate.text.length > (best?.text?.length ?: 0)) best = candidate
+        }
         val lines = best?.textBlocks?.flatMap { it.lines }?.filter { it.text.isNotBlank() }.orEmpty()
         if (lines.isEmpty()) return source.copy(Bitmap.Config.ARGB_8888, true)
             ?: throw IllegalStateException("تعذر نسخ الصورة للمعالجة")
