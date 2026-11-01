@@ -24,7 +24,6 @@
 
         <service
             android:name=".MangaFoxAccessibilityService"
-            android:description="Manga Fox captures visible manga pages after you enable the service."
             android:exported="true"
             android:label="Manga Fox Translator"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
