@@ -1,6 +1,7 @@
 package com.manga.fox
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
 import android.Manifest
 import android.app.Notification
@@ -1117,6 +1118,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private var bubble: TextView? = null
     private var bubbleParams: WindowManager.LayoutParams? = null
     @Volatile private var currentForegroundPackage: String? = null
+    @Volatile private var hostActivityResumed: Boolean = false
     private var captureRunning = false
     private var fullChapterMode = false
     private var captureCount = 0
@@ -1145,13 +1147,33 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        // Apply the service capabilities at runtime as well as in the generated XML.
+        // This makes window/package events available on OEM builds that ignore part
+        // of the static accessibility configuration.
+        runCatching {
+            val info = serviceInfo ?: AccessibilityServiceInfo()
+            info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                AccessibilityEvent.TYPE_WINDOWS_CHANGED or
+                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+            info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
+            info.notificationTimeout = 80L
+            info.flags = info.flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
+                AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
+            serviceInfo = info
+        }
         MangaFoxRuntime.status = "خدمة العدسة متصلة"
         syncForegroundPackage()
-        // Some Android skins deliver the first window event late; retry the initial
-        // foreground lookup briefly instead of leaving the lens hidden indefinitely.
-        mainHandler.postDelayed({ syncForegroundPackage() }, 350L)
-        mainHandler.postDelayed({ syncForegroundPackage() }, 1100L)
-        mainHandler.postDelayed({ syncForegroundPackage() }, 2200L)
+        // Re-check several times because some Android skins expose the active window late.
+        mainHandler.postDelayed({ syncForegroundPackage() }, 300L)
+        mainHandler.postDelayed({ syncForegroundPackage() }, 800L)
+        mainHandler.postDelayed({ syncForegroundPackage() }, 1500L)
+        mainHandler.postDelayed({
+            syncForegroundPackage()
+            if (!hostActivityResumed && currentForegroundPackage.isNullOrBlank()) {
+                currentForegroundPackage = "__external__"
+                refreshLensAppFilter()
+            }
+        }, 1900L)
         refreshLensAppFilter()
         mainHandler.postDelayed({ recoverInterruptedCapture() }, 900L)
     }
@@ -1178,14 +1200,29 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     fun onHostActivityResumed() {
+        hostActivityResumed = true
         currentForegroundPackage = packageName
         refreshLensAppFilter()
     }
 
     fun onHostActivityPaused() {
-        mainHandler.postDelayed({ syncForegroundPackage() }, 350L)
-        mainHandler.postDelayed({ syncForegroundPackage() }, 900L)
-        mainHandler.postDelayed({ syncForegroundPackage() }, 1600L)
+        hostActivityResumed = false
+        // Let the next app become active, then query the accessibility root.
+        mainHandler.postDelayed({ syncForegroundPackage() }, 250L)
+        mainHandler.postDelayed({ syncForegroundPackage() }, 650L)
+        mainHandler.postDelayed({
+            syncForegroundPackage()
+            // rootInActiveWindow can be null on some Infinix/XOS builds. The
+            // Activity lifecycle is a reliable fallback: paused means external UI.
+            if (!hostActivityResumed && currentForegroundPackage == packageName) {
+                currentForegroundPackage = "__external__"
+                refreshLensAppFilter()
+            } else if (!hostActivityResumed && currentForegroundPackage.isNullOrBlank()) {
+                currentForegroundPackage = "__external__"
+                refreshLensAppFilter()
+            }
+        }, 1100L)
+        mainHandler.postDelayed({ syncForegroundPackage() }, 1800L)
     }
     override fun onInterrupt() = Unit
 
@@ -2047,7 +2084,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val enabled = prefs.getBoolean(PREF_LENS_ENABLED, true)
         val foreground = currentForegroundPackage
-        val shouldShow = enabled && !foreground.isNullOrBlank() && foreground != packageName
+        val overlayAllowed = Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)
+        val shouldShow = enabled && overlayAllowed && !hostActivityResumed &&
+            (foreground.isNullOrBlank() || foreground != packageName)
         if (shouldShow) {
             if (bubble == null) showFloatingBubble() else if (!bubbleWasAdded) restoreFloatingBubble()
         } else {
@@ -2144,17 +2183,25 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         runCatching {
             windowManager.addView(view, params)
             bubbleWasAdded = true
-        }.onFailure {
+            MangaFoxRuntime.status = "العدسة العائمة ظاهرة"
+        }.onFailure { error ->
             bubble = null
             bubbleParams = null
             bubbleWasAdded = false
+            MangaFoxRuntime.status = "تعذر إظهار العدسة: ${error.javaClass.simpleName}"
+            MangaFoxRuntime.lastError = "تعذر إنشاء النافذة العائمة. تحقق من إذن الظهور فوق التطبيقات الأخرى. ${error.message ?: ""}"
         }
     }
 
     private fun removeFloatingBubble() {
         val view = bubble
         if (view != null && bubbleWasAdded) runCatching { windowManager.removeView(view) }
+        // Drop the detached View reference. Keeping it made the re-enable path
+        // call restoreFloatingBubble(), which only scheduled another refresh and
+        // never re-attached or recreated the overlay.
         bubbleWasAdded = false
+        bubble = null
+        bubbleParams = null
     }
 
     private fun restoreFloatingBubble() {
