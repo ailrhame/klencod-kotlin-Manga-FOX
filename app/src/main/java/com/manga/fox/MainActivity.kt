@@ -2044,7 +2044,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val count = prefs.getInt(PREF_LENS_COUNT, 3).coerceIn(1, 3)
         if (count <= 1) return
         val size = prefs.getInt(PREF_LENS_SIZE, 58).coerceIn(42, 96)
-        val alpha = prefs.getInt(PREF_LENS_ALPHA, 100).coerceIn(35, 100) / 100f
+        val lensAlpha = prefs.getInt(PREF_LENS_ALPHA, 100).coerceIn(35, 100) / 100f
         val definitions = listOf("◉" to { startSingleCapture() }, "∞" to { startFullChapterCapture() })
         definitions.take(count - 1).forEachIndexed { index, pair ->
             val extra = TextView(this).apply {
@@ -2054,7 +2054,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 gravity = Gravity.CENTER
                 setTextColor(Color.BLACK)
                 background = lensBackground(if (index == 0) Color.rgb(95, 205, 255) else Color.rgb(190, 135, 255))
-                alpha = alpha
+                this.alpha = lensAlpha
                 contentDescription = if (index == 0) "التقاط صورة واحدة" else "التقاط الفصل كاملاً"
                 setOnClickListener { pair.second.invoke() }
             }
