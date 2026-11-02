@@ -87,6 +87,7 @@ private const val MAX_CAPTURE_FRAMES = 120
 object MangaFoxRuntime {
     @Volatile var status: String = "جاهز للترجمة"
     @Volatile var resultPages: List<String> = emptyList()
+    @Volatile var sourcePages: List<String> = emptyList()
     @Volatile var resultTitle: String = "الفصل المترجم"
     @Volatile var lastError: String = ""
     @Volatile var progressPercent: Int = 0
@@ -297,6 +298,7 @@ class MainActivity : android.app.Activity() {
         val settingsCard = card()
         settingsCard.addView(text("إعدادات القراءة والترجمة", 18f, Color.WHITE, true))
         settingsCard.addView(text("عاين شكل الحروف مباشرة، وغيّر الحجم والسماكة ونوع الخط. يمكنك تنزيل خطوط عربية أو استيراد ملف TTF / OTF من هاتفك.", 12f, Color.LTGRAY))
+        settingsCard.addView(text("ملاحظة: النتائج المحفوظة كصور لا تتغير تلقائياً؛ بعد تعديل الخط افتح النتيجة واضغط «إعادة تطبيق الخط والحجم» لإعادة إخراجها.", 11f, gold))
 
         val previewPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -567,6 +569,17 @@ class MainActivity : android.app.Activity() {
             setPadding(0, 0, 0, dp(8))
         }, matchWrap())
         root.addView(actionButton("العودة إلى الرئيسية", false) { showHome() }, matchWrap(dp(10)))
+        root.addView(actionButton("إعادة تطبيق الخط والحجم المختار على هذه الترجمة", true) {
+            val service = MangaFoxAccessibilityService.instance
+            if (MangaFoxRuntime.sourcePages.isEmpty()) {
+                toast("لا توجد صور أصلية محفوظة لهذه النتيجة. ترجم الفصل مجدداً بعد تحديث النسخة.")
+            } else if (service == null) {
+                toast("فعّل خدمة Manga Fox لإعادة تنسيق الترجمة")
+            } else {
+                service.retranslateLastResults()
+                toast("بدأت إعادة تنسيق الصور بالخط والحجم الحاليين")
+            }
+        }, matchWrap(dp(8)))
 
         val pages = MangaFoxRuntime.resultPages
         if (pages.isEmpty()) {
@@ -1025,16 +1038,16 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val width = displayWidth.toFloat()
         val height = displayHeight.toFloat()
         val path = Path().apply {
-            moveTo(width * 0.52f, height * 0.86f)
-            lineTo(width * 0.52f, height * 0.13f)
+            moveTo(width * 0.52f, height * 0.84f)
+            lineTo(width * 0.52f, height * 0.39f)
         }
         val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0L, 620L))
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, 720L))
             .build()
         val callback = object : AccessibilityService.GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription) {
                 gestureFailureCount = 0
-                mainHandler.postDelayed({ captureNextFrame() }, 1100L)
+                mainHandler.postDelayed({ captureNextFrame() }, 1450L)
             }
 
             override fun onCancelled(gestureDescription: GestureDescription) {
@@ -1148,12 +1161,15 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private fun findVerticalOverlap(previous: Bitmap, current: Bitmap): Int {
         if (previous.width != current.width || previous.height != current.height) return 0
         val h = previous.height
-        val minOverlap = (h * 0.12f).toInt().coerceAtLeast(24)
-        val maxOverlap = (h * 0.74f).toInt().coerceAtMost(h - 24)
+        // A shorter swipe intentionally creates a large shared band. Searching
+        // only plausible overlap values reduces false matches on repeated panels.
+        val minOverlap = (h * 0.18f).toInt().coerceAtLeast(28)
+        val maxOverlap = (h * 0.70f).toInt().coerceAtMost(h - 32)
         if (maxOverlap <= minOverlap) return 0
-        val candidateStep = (h / 180).coerceAtLeast(3)
-        val sampleRows = 42
-        val sampleColumns = 20
+
+        val candidateStep = 2
+        val sampleRows = 64
+        val sampleColumns = 32
         var bestOverlap = 0
         var bestScore = Double.MAX_VALUE
         var secondBestScore = Double.MAX_VALUE
@@ -1170,31 +1186,32 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     val x = ((column + 0.5f) * previous.width / sampleColumns).toInt().coerceIn(0, previous.width - 1)
                     val a = previous.getPixel(x, py)
                     val b = current.getPixel(x, cy)
-                    total += abs(Color.red(a) - Color.red(b))
-                    total += abs(Color.green(a) - Color.green(b))
-                    total += abs(Color.blue(a) - Color.blue(b))
-                    samples += 3
+                    // Grayscale comparison is less sensitive to minor display color shifts.
+                    val ga = (Color.red(a) * 3 + Color.green(a) * 6 + Color.blue(a)) / 10
+                    val gb = (Color.red(b) * 3 + Color.green(b) * 6 + Color.blue(b)) / 10
+                    total += abs(ga - gb)
+                    samples++
                 }
             }
             val score = total.toDouble() / samples.coerceAtLeast(1)
             if (score < bestScore) {
-                if (bestOverlap > 0 && abs(overlap - bestOverlap) > candidateStep * 3) {
-                    secondBestScore = bestScore
-                    secondBestOverlap = bestOverlap
-                }
+                secondBestScore = bestScore
+                secondBestOverlap = bestOverlap
                 bestScore = score
                 bestOverlap = overlap
-            } else if (abs(overlap - bestOverlap) > candidateStep * 3 && score < secondBestScore) {
+            } else if (abs(overlap - bestOverlap) > 24 && score < secondBestScore) {
                 secondBestScore = score
                 secondBestOverlap = overlap
             }
             overlap += candidateStep
         }
-        // Typical exact manga overlap is very close. Refuse uncertain or flat/blank matches.
-        if (bestScore > 31.0 || bestOverlap == 0) return 0
-        if (secondBestOverlap > 0 && secondBestScore - bestScore < 1.6) return 0
-        // Leave a tiny safety band from the repeated area: duplicates are safer than lost pixels.
-        return (bestOverlap - 10).coerceAtLeast(0)
+
+        // Reject ambiguous matches rather than cutting away unique artwork.
+        if (bestOverlap == 0 || bestScore > 24.0) return 0
+        if (secondBestOverlap > 0 && secondBestScore - bestScore < 3.0) return 0
+        // Keep a generous safety strip: a few repeated pixels are preferable to
+        // losing even one row of new artwork.
+        return (bestOverlap - max(24, (h * 0.018f).toInt())).coerceAtLeast(0)
     }
 
     private fun cropContent(source: Bitmap, overlapTopPx: Int): Bitmap {
@@ -1285,7 +1302,25 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         )
     }
 
-    private fun translateSavedSegments(workPages: ArrayList<File>, note: String, title: String) {
+    fun retranslateLastResults() {
+        if (translationRunning || captureRunning) {
+            toast("انتظر انتهاء العملية الحالية")
+            return
+        }
+        val originals = MangaFoxRuntime.sourcePages.map { File(it) }.filter { it.isFile && it.length() > 0L }
+        if (originals.isEmpty()) {
+            toast("الصور الأصلية غير متوفرة؛ أعد التقاط الفصل")
+            return
+        }
+        translateSavedSegments(ArrayList(originals), "أعيد تطبيق إعدادات الخط الحالية.", MangaFoxRuntime.resultTitle, preserveInputs = true)
+    }
+
+    private fun translateSavedSegments(
+        workPages: ArrayList<File>,
+        note: String,
+        title: String,
+        preserveInputs: Boolean = false
+    ) {
         if (workPages.isEmpty() || translationRunning) return
         translationRunning = true
         MangaFoxRuntime.progressPercent = 0
@@ -1297,6 +1332,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         try {
             worker.execute {
                 val translatedFiles = ArrayList<String>()
+                val newSourceFiles = ArrayList<String>()
                 try {
                     workPages.forEachIndexed { index, file ->
                         MangaFoxRuntime.status = "تحليل وترجمة المقطع ${index + 1} من ${workPages.size}..."
@@ -1305,6 +1341,11 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                             ?: throw IllegalStateException("تعذر قراءة المقطع ${index + 1}")
                         var translated: Bitmap? = null
                         try {
+                            if (!preserveInputs) {
+                                val sourceCopy = File(filesDir, "mfox_source_${System.currentTimeMillis()}_${index}.jpg")
+                                file.inputStream().use { input -> sourceCopy.outputStream().use { output -> input.copyTo(output) } }
+                                newSourceFiles.add(sourceCopy.absolutePath)
+                            }
                             val outputBitmap = translateBitmap(page) { fraction, detail ->
                                 val aggregate = (((index + fraction.coerceIn(0f, 1f)) / workPages.size) * 100f).toInt().coerceIn(0, 99)
                                 updateTranslationLens(aggregate, "${index + 1}/${workPages.size} · $detail")
@@ -1321,12 +1362,17 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                         } finally {
                             if (!page.isRecycled) page.recycle()
                             translated?.let { if (!it.isRecycled) it.recycle() }
-                            runCatching { file.delete() }
+                            if (!preserveInputs) runCatching { file.delete() }
                         }
                     }
                     val oldFiles = MangaFoxRuntime.resultPages
                     MangaFoxRuntime.resultPages = translatedFiles
                     oldFiles.forEach { runCatching { File(it).delete() } }
+                    if (!preserveInputs) {
+                        val oldSources = MangaFoxRuntime.sourcePages
+                        MangaFoxRuntime.sourcePages = newSourceFiles.toList()
+                        oldSources.forEach { runCatching { File(it).delete() } }
+                    }
                     MangaFoxRuntime.resultTitle = title
                     MangaFoxRuntime.status = "اكتملت الترجمة: ${translatedFiles.size} مقطع"
                     MangaFoxRuntime.lastError = note
@@ -1341,7 +1387,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                         toast(if (notified) "اكتملت الترجمة العربية. اضغط إشعار Manga Fox لعرض الفصل" else "اكتملت الترجمة. افتح Manga Fox ثم اختر عرض آخر نتيجة مترجمة")
                     }
                 } catch (e: Exception) {
-                    workPages.forEach { runCatching { it.delete() } }
+                    if (!preserveInputs) workPages.forEach { runCatching { it.delete() } }
+                    newSourceFiles.forEach { runCatching { File(it).delete() } }
                     translatedFiles.forEach { runCatching { File(it).delete() } }
                     MangaFoxRuntime.lastError = "حدث خطأ أثناء الترجمة: ${e.localizedMessage ?: "خطأ غير معروف"}"
                     MangaFoxRuntime.status = "تعذرت الترجمة"
@@ -1509,10 +1556,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val preferredSp = prefs.getInt(PREF_FONT_SIZE, 22).coerceIn(10, 40)
         val preferredPx = preferredSp * resources.displayMetrics.density
-        var size = min((rect.height() * 0.72f).coerceAtLeast(10f), preferredPx)
+        var size = min((rect.height() * 0.88f).coerceAtLeast(10f), preferredPx)
         size = size.coerceIn(10f, 64f)
         var layout = buildArabicLayout(text, maxWidth, size)
-        while (layout.height > rect.height() && size > 8f) {
+        while (layout.height > rect.height() && size > 7f) {
             size -= 1f
             layout = buildArabicLayout(text, maxWidth, size)
         }
