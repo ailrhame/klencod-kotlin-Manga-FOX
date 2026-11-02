@@ -2503,7 +2503,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val lineParts = block.lines.filter { it.text.isNotBlank() }
         val phrase = if (boundsAtSource != null && boundsAtSource.height() > boundsAtSource.width() * 2.2f && lineParts.isNotEmpty()) {
             // Vertical Japanese columns are read from right to left, then top to bottom.
-            lineParts.sortedByDescending { it.boundingBox?.centerX() ?: 0f }
+            lineParts.sortedByDescending { it.boundingBox?.centerX() ?: 0 }
                 .joinToString("") { it.text.trim() }
         } else {
             lineParts.joinToString(" ") { it.text.trim() }.ifBlank { block.text.trim() }
