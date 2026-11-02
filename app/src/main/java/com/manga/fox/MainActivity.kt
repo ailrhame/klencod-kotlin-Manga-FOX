@@ -30,6 +30,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
+import android.provider.OpenableColumns
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
@@ -60,6 +61,9 @@ import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.File
 import java.io.FileOutputStream
+import java.net.URL
+import java.net.HttpURLConnection
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
@@ -72,6 +76,10 @@ private const val PREFS_NAME = "manga_fox_v2_preferences"
 private const val PREF_FONT_SIZE = "font_size_sp"
 private const val PREF_FONT_FAMILY = "font_family"
 private const val PREF_FONT_BOLD = "font_bold"
+private const val PREF_FONT_FILE = "font_file_path"
+private const val PREF_FONT_LABEL = "font_file_label"
+private const val PREF_FONT_THICKNESS = "font_thickness"
+private const val REQUEST_PICK_FONT = 713
 private const val PREF_LENS_SIZE = "lens_size_dp"
 private const val PREF_LENS_ALPHA = "lens_alpha"
 private const val MAX_CAPTURE_FRAMES = 120
@@ -81,6 +89,8 @@ object MangaFoxRuntime {
     @Volatile var resultPages: List<String> = emptyList()
     @Volatile var resultTitle: String = "الفصل المترجم"
     @Volatile var lastError: String = ""
+    @Volatile var progressPercent: Int = 0
+    @Volatile var progressDetail: String = ""
 }
 
 class MainActivity : android.app.Activity() {
@@ -89,6 +99,10 @@ class MainActivity : android.app.Activity() {
     private val gold = Color.rgb(255, 190, 65)
     private lateinit var statusText: TextView
     private lateinit var preferences: SharedPreferences
+    private var fontPreview: TextView? = null
+    private var fontStatusText: TextView? = null
+    private var readingFullscreen = false
+    private val fontDownloadExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -133,7 +147,41 @@ class MainActivity : android.app.Activity() {
         }
     }
 
+    private fun setReadingFullscreen(enabled: Boolean) {
+        readingFullscreen = enabled
+        @Suppress("DEPRECATION")
+        run {
+            window.decorView.systemUiVisibility = if (enabled) {
+                (View.SYSTEM_UI_FLAG_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION)
+            } else {
+                View.SYSTEM_UI_FLAG_VISIBLE
+            }
+        }
+        if (enabled) {
+            window.statusBarColor = Color.BLACK
+            window.navigationBarColor = Color.BLACK
+        } else {
+            applySystemBars()
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && readingFullscreen) setReadingFullscreen(true)
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (readingFullscreen) showHome() else super.onBackPressed()
+    }
+
     private fun showHome() {
+        setReadingFullscreen(false)
         val scroll = ScrollView(this).apply {
             setBackgroundColor(dark)
             isFillViewport = true
@@ -228,6 +276,17 @@ class MainActivity : android.app.Activity() {
             setPadding(dp(4), dp(6), dp(4), dp(14))
         }, matchWrap())
         root.addView(text("MANGA FOX  ·  N5CR4", 12f, gold).apply { gravity = Gravity.CENTER }, matchWrap())
+        root.addView(text("حقوقي · N5CR4  ↗", 13f, gold, true).apply {
+            gravity = Gravity.CENTER
+            setPadding(0, dp(12), 0, dp(8))
+            isClickable = true
+            isFocusable = true
+            setOnClickListener {
+                runCatching {
+                    startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://t.me/N5CR4")))
+                }.onFailure { toast("تعذر فتح تيليجرام") }
+            }
+        }, matchWrap())
 
         scroll.addView(root)
         setContentView(scroll)
@@ -237,35 +296,110 @@ class MainActivity : android.app.Activity() {
     private fun addSettingsCard(root: LinearLayout) {
         val settingsCard = card()
         settingsCard.addView(text("إعدادات القراءة والترجمة", 18f, Color.WHITE, true))
-        settingsCard.addView(text("تُطبّق إعدادات الخط على الترجمات الجديدة. ويمكن تغيير حجم العدسة وشفافيتها مباشرة.", 12f, Color.LTGRAY))
+        settingsCard.addView(text("عاين شكل الحروف مباشرة، وغيّر الحجم والسماكة ونوع الخط. يمكنك تنزيل خطوط عربية أو استيراد ملف TTF / OTF من هاتفك.", 12f, Color.LTGRAY))
+
+        val previewPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = rounded(Color.rgb(242, 239, 230), 14)
+        }
+        previewPanel.addView(TextView(this).apply {
+            text = "معاينة الخط"
+            textSize = 11f
+            setTextColor(Color.DKGRAY)
+            gravity = Gravity.CENTER
+        }, matchWrap())
+        fontPreview = TextView(this).apply {
+            text = "هذا مثال لمعاينة الخط العربي\nالقراءة والترجمة في Manga Fox"
+            textSize = preferences.getInt(PREF_FONT_SIZE, 22).toFloat()
+            setTextColor(Color.rgb(25, 25, 28))
+            gravity = Gravity.CENTER
+            textDirection = View.TEXT_DIRECTION_RTL
+            setPadding(dp(4), dp(8), dp(4), dp(8))
+            minHeight = dp(82)
+        }
+        previewPanel.addView(fontPreview, matchWrap())
+        settingsCard.addView(previewPanel, matchWrap(dp(10)))
 
         addSettingSlider(
             settingsCard, "حجم الخط العربي", 10, 40,
             preferences.getInt(PREF_FONT_SIZE, 22), " sp"
-        ) { value -> preferences.edit().putInt(PREF_FONT_SIZE, value).apply() }
+        ) { value ->
+            preferences.edit().putInt(PREF_FONT_SIZE, value).apply()
+            updateFontPreview()
+        }
+        addSettingSlider(
+            settingsCard, "سماكة الحروف في المعاينة والترجمة", 0, 10,
+            preferences.getInt(PREF_FONT_THICKNESS, 2), " / 10"
+        ) { value ->
+            preferences.edit().putInt(PREF_FONT_THICKNESS, value).apply()
+            updateFontPreview()
+        }
 
-        val fontFamilies = listOf("sans-serif" to "نسخي", "serif" to "تقليدي", "sans-serif-medium" to "متوسط", "casual" to "يدوي")
-        val initialFamily = fontFamilies.firstOrNull { it.first == preferences.getString(PREF_FONT_FAMILY, "sans-serif") }?.second ?: "نسخي"
-        val familyButton = actionButton("نوع الخط: $initialFamily · اضغط للتغيير", false) { }
-        // Use a stable reference so the button label can be updated without rebuilding the screen.
+        val fontFamilies = listOf(
+            "sans-serif" to "نسخي حديث",
+            "serif" to "تقليدي",
+            "sans-serif-medium" to "متوسط",
+            "sans-serif-condensed" to "مضغوط",
+            "casual" to "يدوي"
+        )
+        val currentFamily = preferences.getString(PREF_FONT_FAMILY, "sans-serif") ?: "sans-serif"
+        val familyName = fontFamilies.firstOrNull { it.first == currentFamily }?.second ?: "خط مخصص"
+        val familyButton = actionButton("خط النظام: $familyName · تغيير", false) { }
         familyButton.setOnClickListener {
             val current = preferences.getString(PREF_FONT_FAMILY, "sans-serif")
             val currentIndex = fontFamilies.indexOfFirst { it.first == current }.let { if (it < 0) 0 else it }
             val next = fontFamilies[(currentIndex + 1) % fontFamilies.size]
-            preferences.edit().putString(PREF_FONT_FAMILY, next.first).apply()
-            familyButton.text = "نوع الخط: ${next.second} · اضغط للتغيير"
+            preferences.edit().remove(PREF_FONT_FILE).remove(PREF_FONT_LABEL)
+                .putString(PREF_FONT_FAMILY, next.first).apply()
+            familyButton.text = "خط النظام: ${next.second} · تغيير"
+            updateFontPreview()
         }
         settingsCard.addView(familyButton, matchWrap(dp(4)))
 
         val boldButton = actionButton(
-            if (preferences.getBoolean(PREF_FONT_BOLD, true)) "سماكة الخط: عريض ✓" else "سماكة الخط: عادي", false
+            if (preferences.getBoolean(PREF_FONT_BOLD, true)) "نمط الخط: عريض ✓" else "نمط الخط: عادي", false
         ) { }
         boldButton.setOnClickListener {
             val enabled = !preferences.getBoolean(PREF_FONT_BOLD, true)
             preferences.edit().putBoolean(PREF_FONT_BOLD, enabled).apply()
-            boldButton.text = if (enabled) "سماكة الخط: عريض ✓" else "سماكة الخط: عادي"
+            boldButton.text = if (enabled) "نمط الخط: عريض ✓" else "نمط الخط: عادي"
+            updateFontPreview()
         }
         settingsCard.addView(boldButton, matchWrap(dp(4)))
+
+        settingsCard.addView(text("خطوط عربية قابلة للتنزيل", 14f, gold, true).apply {
+            setPadding(0, dp(12), 0, dp(4))
+        }, matchWrap())
+        settingsCard.addView(actionButton("تنزيل Noto Kufi Arabic · كوفي", false) {
+            downloadArabicFont(
+                "Noto Kufi Arabic", "NotoKufiArabic-Regular.ttf",
+                "https://cdn.jsdelivr.net/gh/notofonts/notofonts.github.io/fonts/NotoKufiArabic/unhinted/ttf/NotoKufiArabic-Regular.ttf"
+            )
+        }, matchWrap(dp(4)))
+        settingsCard.addView(actionButton("تنزيل Noto Naskh Arabic · نسخي", false) {
+            downloadArabicFont(
+                "Noto Naskh Arabic", "NotoNaskhArabic-Regular.ttf",
+                "https://cdn.jsdelivr.net/gh/notofonts/notofonts.github.io/fonts/NotoNaskhArabic/hinted/ttf/NotoNaskhArabic-Regular.ttf"
+            )
+        }, matchWrap(dp(4)))
+        settingsCard.addView(actionButton("تنزيل Noto Sans Arabic · حديث", false) {
+            downloadArabicFont(
+                "Noto Sans Arabic", "NotoSansArabic-Regular.ttf",
+                "https://cdn.jsdelivr.net/gh/notofonts/notofonts.github.io/fonts/NotoSansArabic/unhinted/ttf/NotoSansArabic-Regular.ttf"
+            )
+        }, matchWrap(dp(4)))
+        settingsCard.addView(actionButton("استيراد خط من الهاتف · TTF / OTF / TTC", true) {
+            pickFontFromDevice()
+        }, matchWrap(dp(4)))
+        val fontStatus = text(
+            preferences.getString(PREF_FONT_LABEL, null)?.let { "الخط المحدد: $it" } ?: "الخط الحالي: $familyName",
+            12f, Color.LTGRAY
+        )
+        fontStatusText = fontStatus
+        settingsCard.addView(fontStatus, matchWrap())
 
         addSettingSlider(
             settingsCard, "حجم العدسة العائمة", 42, 96,
@@ -281,9 +415,120 @@ class MainActivity : android.app.Activity() {
             preferences.edit().putInt(PREF_LENS_ALPHA, value).apply()
             MangaFoxAccessibilityService.instance?.applyLensSettings()
         }
+        updateFontPreview()
         root.addView(settingsCard, matchWrap(dp(16)))
     }
 
+    private fun updateFontPreview() {
+        val preview = fontPreview ?: return
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val size = prefs.getInt(PREF_FONT_SIZE, 22).coerceIn(10, 40)
+        preview.textSize = size.toFloat()
+        preview.typeface = resolveArabicTypeface(prefs)
+        preview.paint.style = Paint.Style.FILL_AND_STROKE
+        preview.paint.strokeWidth = prefs.getInt(PREF_FONT_THICKNESS, 2).coerceIn(0, 10) / 10f
+        preview.invalidate()
+        fontStatusText?.text = prefs.getString(PREF_FONT_LABEL, null)?.let { "الخط المحدد: $it" }
+            ?: "الخط الحالي: ${prefs.getString(PREF_FONT_FAMILY, "sans-serif")}"
+    }
+
+    private fun pickFontFromDevice() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf(
+                "font/ttf", "font/otf", "application/x-font-ttf", "application/x-font-otf",
+                "application/octet-stream"
+            ))
+        }
+        runCatching { startActivityForResult(intent, REQUEST_PICK_FONT) }
+            .onFailure { toast("تعذر فتح مدير الملفات") }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_PICK_FONT || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        runCatching {
+            val displayName = contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
+            } ?: "font.ttf"
+            val extension = displayName.substringAfterLast('.', "").lowercase()
+            require(extension in setOf("ttf", "otf", "ttc")) { "اختر ملف خط TTF أو OTF أو TTC" }
+            val fontDir = File(filesDir, "fonts").apply { mkdirs() }
+            val safeName = displayName.replace(Regex("[^A-Za-z0-9._-]"), "_").take(80)
+            val target = File(fontDir, "import_${System.currentTimeMillis()}_$safeName")
+            val inputStream = requireNotNull(contentResolver.openInputStream(uri)) { "تعذر قراءة ملف الخط" }
+            inputStream.use { input ->
+                FileOutputStream(target).use { output ->
+                    val buffer = ByteArray(8192)
+                    var total = 0L
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        total += read
+                        require(total <= 15L * 1024L * 1024L) { "حجم الخط أكبر من 15 ميغابايت" }
+                        output.write(buffer, 0, read)
+                    }
+                }
+            }
+            Typeface.createFromFile(target)
+            preferences.edit().putString(PREF_FONT_FILE, target.absolutePath)
+                .putString(PREF_FONT_LABEL, displayName).apply()
+            updateFontPreview()
+            toast("تم استيراد الخط وتفعيله: $displayName")
+        }.onFailure { toast("تعذر استيراد الخط: ${it.localizedMessage ?: "ملف غير صالح"}") }
+    }
+
+    private fun downloadArabicFont(label: String, fileName: String, sourceUrl: String) {
+        toast("بدأ تنزيل $label")
+        fontDownloadExecutor.execute {
+            val fontDir = File(filesDir, "fonts").apply { mkdirs() }
+            val target = File(fontDir, fileName)
+            val temp = File(fontDir, "$fileName.part.${fileName.substringAfterLast('.', "ttf")}")
+            try {
+                val connection = (URL(sourceUrl).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 20000
+                    readTimeout = 30000
+                    requestMethod = "GET"
+                    setRequestProperty("User-Agent", "MangaFox-Android")
+                }
+                try {
+                    connection.connect()
+                    if (connection.responseCode !in 200..299) throw IllegalStateException("HTTP ${connection.responseCode}")
+                    connection.inputStream.use { input ->
+                        FileOutputStream(temp).use { output ->
+                            val buffer = ByteArray(8192)
+                            var total = 0L
+                            while (true) {
+                                val read = input.read(buffer)
+                                if (read <= 0) break
+                                total += read
+                                if (total > 15L * 1024L * 1024L) throw IllegalStateException("ملف الخط كبير جداً")
+                                output.write(buffer, 0, read)
+                            }
+                        }
+                    }
+                } finally {
+                    connection.disconnect()
+                }
+                Typeface.createFromFile(temp)
+                if (target.exists()) target.delete()
+                if (!temp.renameTo(target)) throw IllegalStateException("تعذر حفظ الخط")
+                runOnUiThread {
+                    preferences.edit().putString(PREF_FONT_FILE, target.absolutePath)
+                        .putString(PREF_FONT_LABEL, label).apply()
+                    updateFontPreview()
+                    toast("تم تنزيل $label وتفعيله")
+                }
+            } catch (e: Exception) {
+                temp.delete()
+                runOnUiThread { toast("فشل تنزيل الخط: ${e.localizedMessage ?: "تحقق من الإنترنت"}") }
+            }
+        }
+    }
     private fun addSettingSlider(
         parent: LinearLayout, label: String, minValue: Int, maxValue: Int,
         initialValue: Int, suffix: String, onChanged: (Int) -> Unit
@@ -307,6 +552,7 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun showResults() {
+        setReadingFullscreen(true)
         val scroll = ScrollView(this).apply {
             setBackgroundColor(dark)
             isFillViewport = true
@@ -545,6 +791,20 @@ private class ZoomableImageView(context: Context) : ImageView(context) {
         else if (displayedRect.bottom < height) dy = height - displayedRect.bottom
         drawMatrix.postTranslate(dx, dy)
     }
+}
+
+private fun resolveArabicTypeface(prefs: SharedPreferences): Typeface {
+    val style = if (prefs.getBoolean(PREF_FONT_BOLD, true)) Typeface.BOLD else Typeface.NORMAL
+    val customPath = prefs.getString(PREF_FONT_FILE, null)
+    if (!customPath.isNullOrBlank()) {
+        val custom = runCatching {
+            val file = File(customPath)
+            if (file.isFile) Typeface.createFromFile(file) else null
+        }.getOrNull()
+        if (custom != null) return Typeface.create(custom, style)
+    }
+    val family = prefs.getString(PREF_FONT_FAMILY, "sans-serif") ?: "sans-serif"
+    return Typeface.create(family, style)
 }
 
 class MangaFoxAccessibilityService : AccessibilityService() {
@@ -1028,7 +1288,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private fun translateSavedSegments(workPages: ArrayList<File>, note: String, title: String) {
         if (workPages.isEmpty() || translationRunning) return
         translationRunning = true
+        MangaFoxRuntime.progressPercent = 0
+        MangaFoxRuntime.progressDetail = "تهيئة الترجمة"
         MangaFoxRuntime.status = "بدء استخراج النصوص وترجمتها..."
+        updateTranslationLens(0, "تهيئة الترجمة")
         if (note.isNotBlank()) MangaFoxRuntime.lastError = note
 
         try {
@@ -1037,11 +1300,15 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 try {
                     workPages.forEachIndexed { index, file ->
                         MangaFoxRuntime.status = "تحليل وترجمة المقطع ${index + 1} من ${workPages.size}..."
+                        updateTranslationLens((index * 100 / workPages.size).coerceIn(0, 99), "صورة ${index + 1} من ${workPages.size}")
                         val page = BitmapFactory.decodeFile(file.absolutePath)
                             ?: throw IllegalStateException("تعذر قراءة المقطع ${index + 1}")
                         var translated: Bitmap? = null
                         try {
-                            val outputBitmap = translateBitmap(page)
+                            val outputBitmap = translateBitmap(page) { fraction, detail ->
+                                val aggregate = (((index + fraction.coerceIn(0f, 1f)) / workPages.size) * 100f).toInt().coerceIn(0, 99)
+                                updateTranslationLens(aggregate, "${index + 1}/${workPages.size} · $detail")
+                            }
                             translated = outputBitmap
                             val outputFile = File(cacheDir, "mfox_result_${System.currentTimeMillis()}_$index.jpg")
                             FileOutputStream(outputFile).use { stream ->
@@ -1050,6 +1317,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                                 }
                             }
                             translatedFiles.add(outputFile.absolutePath)
+                            updateTranslationLens((((index + 1).toFloat() / workPages.size) * 100f).toInt().coerceIn(0, 99), "اكتملت الصورة ${index + 1} من ${workPages.size}")
                         } finally {
                             if (!page.isRecycled) page.recycle()
                             translated?.let { if (!it.isRecycled) it.recycle() }
@@ -1062,8 +1330,12 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     MangaFoxRuntime.resultTitle = title
                     MangaFoxRuntime.status = "اكتملت الترجمة: ${translatedFiles.size} مقطع"
                     MangaFoxRuntime.lastError = note
+                    MangaFoxRuntime.progressPercent = 100
+                    MangaFoxRuntime.progressDetail = "اكتملت الترجمة"
                     mainHandler.post {
                         translationRunning = false
+                        updateTranslationLens(100, "اكتملت الترجمة")
+                        mainHandler.postDelayed({ if (!translationRunning) resetLensProgress() }, 5000L)
                         if (instance !== this@MangaFoxAccessibilityService) closeRecognitionResources()
                         val notified = notifyResultsReady()
                         toast(if (notified) "اكتملت الترجمة العربية. اضغط إشعار Manga Fox لعرض الفصل" else "اكتملت الترجمة. افتح Manga Fox ثم اختر عرض آخر نتيجة مترجمة")
@@ -1073,8 +1345,11 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     translatedFiles.forEach { runCatching { File(it).delete() } }
                     MangaFoxRuntime.lastError = "حدث خطأ أثناء الترجمة: ${e.localizedMessage ?: "خطأ غير معروف"}"
                     MangaFoxRuntime.status = "تعذرت الترجمة"
+                    MangaFoxRuntime.progressDetail = "تعذرت الترجمة"
                     mainHandler.post {
                         translationRunning = false
+                        updateTranslationLens(-1, "تعذرت الترجمة")
+                        mainHandler.postDelayed({ resetLensProgress() }, 4000L)
                         if (instance !== this@MangaFoxAccessibilityService) closeRecognitionResources()
                         toast(MangaFoxRuntime.lastError)
                     }
@@ -1103,9 +1378,11 @@ class MangaFoxAccessibilityService : AccessibilityService() {
 
     private data class TranslationLine(val bounds: Rect, val translated: String)
 
-    private fun translateBitmap(source: Bitmap): Bitmap {
+    private fun translateBitmap(source: Bitmap, onProgress: (Float, String) -> Unit = { _, _ -> }): Bitmap {
         val input = InputImage.fromBitmap(source, 0)
+        onProgress(0.04f, "فحص الصورة")
         var best: Text? = runCatching { Tasks.await(latinRecognizer.process(input)) }.getOrNull()
+        onProgress(0.18f, "التعرف على النصوص")
         fun hasEnoughReadableText(result: Text?): Boolean {
             val value = result?.text.orEmpty()
             return value.length >= 24 && value.count { it.isLetter() } >= 16
@@ -1115,18 +1392,25 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         if (!hasEnoughReadableText(best)) {
             val candidate = runCatching { Tasks.await(japaneseRecognizer.process(input)) }.getOrNull()
             if (candidate != null && candidate.text.length > (best?.text?.length ?: 0)) best = candidate
+            onProgress(0.25f, "فحص النص الياباني")
         }
         if (!hasEnoughReadableText(best)) {
             val candidate = runCatching { Tasks.await(koreanRecognizer.process(input)) }.getOrNull()
             if (candidate != null && candidate.text.length > (best?.text?.length ?: 0)) best = candidate
+            onProgress(0.30f, "فحص النص الكوري")
         }
         if (!hasEnoughReadableText(best)) {
             val candidate = runCatching { Tasks.await(chineseRecognizer.process(input)) }.getOrNull()
             if (candidate != null && candidate.text.length > (best?.text?.length ?: 0)) best = candidate
+            onProgress(0.34f, "فحص النص الصيني")
         }
         val lines = best?.textBlocks?.flatMap { it.lines }?.filter { it.text.isNotBlank() }.orEmpty()
-        if (lines.isEmpty()) return source.copy(Bitmap.Config.ARGB_8888, true)
-            ?: throw IllegalStateException("تعذر نسخ الصورة للمعالجة")
+        if (lines.isEmpty()) {
+            onProgress(1f, "لا يوجد نص قابل للترجمة")
+            return source.copy(Bitmap.Config.ARGB_8888, true)
+                ?: throw IllegalStateException("تعذر نسخ الصورة للمعالجة")
+        }
+        onProgress(0.40f, "اكتشاف لغة النص")
 
         val joinedText = lines.joinToString(" ") { it.text }.take(2500)
         val detected = runCatching { Tasks.await(languageIdentifier.identifyLanguage(joinedText)) }.getOrDefault("en")
@@ -1141,20 +1425,30 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val translator: Translator = Translation.getClient(options)
         val translatedLines = ArrayList<TranslationLine>()
         try {
+            onProgress(0.48f, "تجهيز نموذج الترجمة")
             Tasks.await(translator.downloadModelIfNeeded(DownloadConditions.Builder().build()))
-            lines.forEach { line ->
+            val translatableLines = lines.filter { it.boundingBox != null }
+            translatableLines.forEachIndexed { lineIndex, line ->
                 val bounds = line.boundingBox
                 if (bounds != null) {
                     val translated = runCatching { Tasks.await(translator.translate(line.text)) }.getOrDefault(line.text)
                     translatedLines.add(TranslationLine(Rect(bounds), translated))
                 }
+                val fraction = if (translatableLines.isEmpty()) 0.95f else 0.52f + (0.45f * (lineIndex + 1) / translatableLines.size)
+                onProgress(fraction, "ترجمة النص ${lineIndex + 1}/${translatableLines.size}")
             }
         } finally {
             translator.close()
         }
-        if (translatedLines.isEmpty()) return source.copy(Bitmap.Config.ARGB_8888, true)
-            ?: throw IllegalStateException("تعذر نسخ الصورة للمعالجة")
-        return drawTranslatedLines(source, translatedLines)
+        if (translatedLines.isEmpty()) {
+            onProgress(1f, "اكتملت الصورة")
+            return source.copy(Bitmap.Config.ARGB_8888, true)
+                ?: throw IllegalStateException("تعذر نسخ الصورة للمعالجة")
+        }
+        onProgress(0.98f, "تنسيق النص العربي")
+        val rendered = drawTranslatedLines(source, translatedLines)
+        onProgress(1f, "اكتملت الصورة")
+        return rendered
     }
 
     private fun drawTranslatedLines(source: Bitmap, translatedLines: List<TranslationLine>): Bitmap {
@@ -1232,12 +1526,12 @@ class MangaFoxAccessibilityService : AccessibilityService() {
 
     private fun buildArabicLayout(value: String, width: Int, size: Float): android.text.StaticLayout {
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        val family = prefs.getString(PREF_FONT_FAMILY, "sans-serif") ?: "sans-serif"
-        val style = if (prefs.getBoolean(PREF_FONT_BOLD, true)) Typeface.BOLD else Typeface.NORMAL
         val paint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(20, 20, 22)
             textSize = size
-            typeface = Typeface.create(family, style)
+            typeface = resolveArabicTypeface(prefs)
+            style = Paint.Style.FILL_AND_STROKE
+            strokeWidth = prefs.getInt(PREF_FONT_THICKNESS, 2).coerceIn(0, 10) / 10f
         }
         return android.text.StaticLayout.Builder.obtain(value, 0, value.length, paint, width)
             .setAlignment(android.text.Layout.Alignment.ALIGN_CENTER)
@@ -1249,6 +1543,42 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     private fun thirtyPx(): Float = 30f * resources.displayMetrics.density
+
+    private fun updateTranslationLens(percent: Int, detail: String) {
+        if (percent >= 0) MangaFoxRuntime.progressPercent = percent.coerceIn(0, 100)
+        MangaFoxRuntime.progressDetail = detail
+        if (percent >= 0) MangaFoxRuntime.status = "ترجمة الصور: ${percent.coerceIn(0, 100)}% · $detail"
+        mainHandler.post {
+            val view = bubble ?: return@post
+            val current = if (translationRunning) MangaFoxRuntime.progressPercent else if (percent >= 100) 100 else percent
+            view.text = when {
+                percent < 0 -> "!"
+                translationRunning -> "${current.coerceIn(0, 99)}%"
+                current >= 100 -> "✓"
+                else -> "狐"
+            }
+            view.textSize = if (translationRunning) 13f else 25f
+            view.contentDescription = if (translationRunning) {
+                "Manga Fox: ترجمة الصور ${current}%، $detail"
+            } else if (percent < 0) {
+                "Manga Fox: حدث خطأ أثناء الترجمة"
+            } else {
+                "Manga Fox Translator. اضغط لترجمة الجزء، واضغط مطولاً لترجمة الفصل"
+            }
+            val params = bubbleParams
+            if (bubbleWasAdded && params != null) runCatching { windowManager.updateViewLayout(view, params) }
+        }
+    }
+
+    private fun resetLensProgress() {
+        mainHandler.post {
+            bubble?.apply {
+                text = "狐"
+                textSize = ((getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getInt(PREF_LENS_SIZE, 58)) * 0.40f).coerceIn(18f, 38f)
+                contentDescription = "Manga Fox Translator. اضغط لترجمة الجزء، واضغط مطولاً لترجمة الفصل"
+            }
+        }
+    }
 
     fun applyLensSettings() {
         val view = bubble ?: return
@@ -1335,6 +1665,11 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 android.view.MotionEvent.ACTION_CANCEL -> true
                 else -> false
             }
+        }
+        if (translationRunning) {
+            view.text = "${MangaFoxRuntime.progressPercent.coerceIn(0, 99)}%"
+            view.textSize = 13f
+            view.contentDescription = "Manga Fox: ترجمة الصور ${MangaFoxRuntime.progressPercent}%"
         }
         bubble = view
         bubbleParams = params
