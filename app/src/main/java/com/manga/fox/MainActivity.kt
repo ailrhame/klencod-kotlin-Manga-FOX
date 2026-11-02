@@ -88,7 +88,6 @@ private const val PREF_FONT_FAMILY = "font_family"
 private const val PREF_FONT_BOLD = "font_bold"
 private const val PREF_FONT_FILE = "font_file_path"
 private const val PREF_FONT_LABEL = "font_file_label"
-private const val PREF_FONT_THICKNESS = "font_thickness"
 private const val REQUEST_PICK_FONT = 713
 private const val REQUEST_SAVE_PDF = 714
 private const val PREF_LENS_SIZE = "lens_size_dp"
@@ -102,6 +101,85 @@ private const val PREF_LEARNED_TRANSLATIONS = "learned_translation_dictionary"
 private const val MAX_CAPTURE_FRAMES = 120
 
 object MangaFoxRuntime {
+    private const val SESSION_MANIFEST = "mfox_session_v1.json"
+
+    @Synchronized fun persist(context: Context) {
+        runCatching {
+            val root = org.json.JSONObject()
+                .put("title", resultTitle)
+                .put("quality", qualitySummary)
+                .put("sources", org.json.JSONArray(sourcePages))
+                .put("results", org.json.JSONArray(resultPages))
+                .put("layers", org.json.JSONArray(translationLayerFiles))
+            val target = File(context.filesDir, SESSION_MANIFEST)
+            val temp = File(context.filesDir, "$SESSION_MANIFEST.tmp")
+            temp.writeText(root.toString(), Charsets.UTF_8)
+            if (!temp.renameTo(target)) {
+                temp.copyTo(target, overwrite = true)
+                temp.delete()
+            }
+        }
+    }
+
+    @Synchronized fun restore(context: Context) {
+        runCatching {
+            val manifest = File(context.filesDir, SESSION_MANIFEST)
+            if (!manifest.isFile) {
+                fun indexed(files: List<File>, prefix: String): List<File> = files
+                    .filter { it.isFile && it.name.startsWith(prefix) && it.length() > 0L }
+                    .sortedBy { it.name.substringAfterLast('_').substringBefore('.').toIntOrNull() ?: Int.MAX_VALUE }
+                val legacyResults = indexed(
+                    (context.filesDir.listFiles()?.toList().orEmpty() + context.cacheDir.listFiles()?.toList().orEmpty()),
+                    "mfox_result_"
+                )
+                val legacySources = indexed(context.filesDir.listFiles()?.toList().orEmpty(), "mfox_source_")
+                val legacyLayers = indexed(context.filesDir.listFiles()?.toList().orEmpty(), "mfox_layers_")
+                val count = minOf(legacyResults.size, legacySources.size)
+                if (count > 0) {
+                    resultPages = legacyResults.take(count).map { it.absolutePath }
+                    sourcePages = legacySources.take(count).map { it.absolutePath }
+                    translationLayerFiles = (0 until count).map { legacyLayers.getOrNull(it)?.absolutePath.orEmpty() }
+                    resultTitle = "الفصل السابق"
+                    persist(context)
+                }
+                return
+            }
+            val root = org.json.JSONObject(manifest.readText(Charsets.UTF_8))
+            // Keep positional alignment: an empty layer path for page 2 must not
+            // shift page 3's layer file into page 2 after process restoration.
+            fun stringList(key: String): List<String> {
+                val array = root.optJSONArray(key) ?: return emptyList()
+                return (0 until array.length()).map { index -> array.optString(index, "") }
+            }
+            val sources = stringList("sources")
+            val results = stringList("results")
+            val layers = stringList("layers")
+            val count = minOf(sources.size, results.size)
+            sourcePages = sources.take(count)
+            resultPages = results.take(count)
+            translationLayerFiles = (0 until count).map { layers.getOrNull(it).orEmpty() }
+            resultTitle = root.optString("title", "الفصل المترجم")
+            qualitySummary = root.optString("quality", qualitySummary)
+            if (resultPages.none { File(it).isFile }) {
+                sourcePages = emptyList()
+                resultPages = emptyList()
+                translationLayerFiles = emptyList()
+            }
+        }
+    }
+
+    @Synchronized fun removePage(context: Context, index: Int) {
+        if (index !in resultPages.indices) return
+        val removed = listOfNotNull(
+            resultPages.getOrNull(index), sourcePages.getOrNull(index), translationLayerFiles.getOrNull(index)
+        )
+        resultPages = resultPages.toMutableList().also { it.removeAt(index) }
+        if (index in sourcePages.indices) sourcePages = sourcePages.toMutableList().also { it.removeAt(index) }
+        if (index in translationLayerFiles.indices) translationLayerFiles = translationLayerFiles.toMutableList().also { it.removeAt(index) }
+        removed.forEach { path -> runCatching { File(path).delete() } }
+        persist(context)
+    }
+
     @Volatile var status: String = "جاهز للترجمة"
     @Volatile var resultPages: List<String> = emptyList()
     @Volatile var sourcePages: List<String> = emptyList()
@@ -150,6 +228,7 @@ class MainActivity : android.app.Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        MangaFoxRuntime.restore(this)
         applySystemBars()
         handleIntent(intent)
         // Notification permission is requested from the onboarding checklist so the user sees why it is needed.
@@ -498,8 +577,8 @@ class MainActivity : android.app.Activity() {
     private fun addSettingsCard(root: LinearLayout) {
         val settingsCard = card()
         settingsCard.addView(text("إعدادات القراءة والترجمة", 18f, Color.WHITE, true))
-        settingsCard.addView(text("عاين شكل الحروف مباشرة، وغيّر الحجم والسماكة ونوع الخط. يمكنك تنزيل خطوط عربية أو استيراد ملف TTF / OTF من هاتفك.", 12f, Color.LTGRAY))
-        settingsCard.addView(text("ملاحظة: النتائج المحفوظة كصور لا تتغير تلقائياً؛ بعد تعديل الخط افتح النتيجة واضغط «إعادة تطبيق الخط والحجم» لإعادة إخراجها.", 11f, gold))
+        settingsCard.addView(text("عاين شكل الحروف مباشرة، وغيّر الحجم ونوع الخط ووزنه الحقيقي عبر نمط الخط. يمكنك تنزيل خطوط عربية أو استيراد ملف TTF / OTF من هاتفك.", 12f, Color.LTGRAY))
+        settingsCard.addView(text("ملاحظة: بعد تعديل الخط افتح النتيجة واضغط «إعادة تطبيق الخط والحجم» لإعادة إخراجها من الطبقات دون تشغيل OCR.", 11f, gold))
 
         val previewPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -533,14 +612,6 @@ class MainActivity : android.app.Activity() {
             preferences.edit().putInt(PREF_FONT_SIZE, value).apply()
             updateFontPreview()
         }
-        addSettingSlider(
-            settingsCard, "سماكة الحروف في المعاينة والترجمة", 0, 10,
-            preferences.getInt(PREF_FONT_THICKNESS, 2), " / 10"
-        ) { value ->
-            preferences.edit().putInt(PREF_FONT_THICKNESS, value).apply()
-            updateFontPreview()
-        }
-
         val fontFamilies = listOf(
             "sans-serif" to "نسخي حديث",
             "serif" to "تقليدي",
@@ -786,8 +857,8 @@ class MainActivity : android.app.Activity() {
         val size = prefs.getInt(PREF_FONT_SIZE, 22).coerceIn(10, 72)
         preview.textSize = size.toFloat()
         preview.typeface = resolveArabicTypeface(prefs)
-        preview.paint.style = Paint.Style.FILL_AND_STROKE
-        preview.paint.strokeWidth = prefs.getInt(PREF_FONT_THICKNESS, 2).coerceIn(0, 10) / 10f
+        preview.paint.style = Paint.Style.FILL
+        preview.paint.strokeWidth = 0f
         preview.invalidate()
         fontStatusText?.text = prefs.getString(PREF_FONT_LABEL, null)?.let { "الخط المحدد: $it" }
             ?: "الخط الحالي: ${prefs.getString(PREF_FONT_FAMILY, "sans-serif")}"
@@ -1133,8 +1204,8 @@ class MainActivity : android.app.Activity() {
         root.addView(actionButton("تنزيل النتيجة كملف PDF", true) { exportResultsAsPdf() }, matchWrap(dp(8)))
         root.addView(actionButton("تطبيق الخط والحجم الجديدين دون إعادة OCR", true) {
             val service = MangaFoxAccessibilityService.instance
-            if (MangaFoxRuntime.sourcePages.isEmpty() || MangaFoxRuntime.translationLayerFiles.isEmpty()) {
-                toast("طبقات الترجمة غير متوفرة لهذه النتيجة؛ أعد ترجمة الفصل أولاً")
+            if (MangaFoxRuntime.sourcePages.isEmpty()) {
+                toast("الصور الأصلية غير متوفرة لهذه النتيجة؛ لا يمكن إعادة التنسيق")
             } else if (service == null) {
                 toast("فعّل خدمة Manga Fox لإعادة تنسيق الطبقات")
             } else {
@@ -1215,11 +1286,20 @@ class MainActivity : android.app.Activity() {
                         openRegionSelection(originalPath, filePath)
                     }, matchWrap(dp(6)))
                 }
-                if (MangaFoxRuntime.translationLayerFiles.getOrNull(index)?.let { File(it).isFile } == true) {
-                    root.addView(actionButton("تعديل ترجمة فقاعات هذا الجزء دون OCR", false) {
-                        editTranslationLayer(index)
-                    }, matchWrap(dp(8)))
-                }
+                root.addView(actionButton("إدارة الفقاعات والنصوص والطبقات", false) {
+                    editTranslationLayer(index)
+                }, matchWrap(dp(8)))
+                root.addView(actionButton("حذف هذه الصورة من الفصل", false) {
+                    AlertDialog.Builder(this)
+                        .setTitle("حذف الصورة ${index + 1}؟")
+                        .setMessage("سيتم حذف الصورة المترجمة وأصلها وطبقاتها من هذا الفصل. لا يمكن التراجع عن ذلك.")
+                        .setNegativeButton("إلغاء", null)
+                        .setPositiveButton("حذف الصورة") { _, _ ->
+                            MangaFoxRuntime.removePage(this, index)
+                            showResults()
+                            toast("تم حذف الصورة من الفصل")
+                        }.show()
+                }, matchWrap(dp(12)))
             }
             scroll.setOnScrollChangeListener { _, _, _, _, _ -> updateVisiblePageImages(pageViews) }
             scroll.post { updateVisiblePageImages(pageViews) }
@@ -1228,69 +1308,247 @@ class MainActivity : android.app.Activity() {
         setContentView(scroll)
     }
 
-    private fun editTranslationLayer(pageIndex: Int) {
-        val path = MangaFoxRuntime.translationLayerFiles.getOrNull(pageIndex)
-        val file = path?.let { File(it) }
-        if (file == null || !file.isFile) {
-            toast("طبقات هذا الجزء غير متوفرة")
-            return
-        }
-        val layers = runCatching { org.json.JSONArray(file.readText(Charsets.UTF_8)) }.getOrNull()
-        if (layers == null || layers.length() == 0) {
-            toast("لم تُحفظ فقاعات مترجمة لهذا الجزء")
-            return
-        }
-        val labels = Array(layers.length()) { index ->
-            val item = layers.optJSONObject(index)
-            val source = item?.optString("source").orEmpty().take(46)
-            val translated = item?.optString("translated").orEmpty().take(46)
-            "${index + 1}. $source  ←  $translated"
-        }
-        AlertDialog.Builder(this)
-            .setTitle("اختر فقاعة لتعديل ترجمتها")
-            .setItems(labels) { _, selected ->
-                val item = layers.optJSONObject(selected) ?: return@setItems
-                val edit = EditText(this).apply {
-                    setText(item.optString("translated"))
-                    hint = "اكتب الترجمة العربية"
-                    minLines = 2
-                    textSize = 16f
-                    setPadding(dp(10), dp(8), dp(10), dp(8))
-                }
-                AlertDialog.Builder(this)
-                    .setTitle("تعديل الفقاعة ${selected + 1}")
-                    .setMessage("النص الأصلي: ${item.optString("source")}")
-                    .setView(edit)
-                    .setNegativeButton("إلغاء", null)
-                    .setPositiveButton("حفظ وتحديث الصورة") { _, _ ->
-                        val corrected = edit.text.toString().trim()
-                        if (corrected.isBlank()) {
-                            toast("لا يمكن حفظ ترجمة فارغة")
-                        } else {
-                            item.put("translated", corrected)
-                            runCatching {
-                                file.writeText(layers.toString(), Charsets.UTF_8)
-                                val sourceText = item.optString("source").trim()
-                                if (sourceText.isNotBlank()) {
-                                    val dictionary = runCatching {
-                                        org.json.JSONObject(preferences.getString(PREF_LEARNED_TRANSLATIONS, "{}") ?: "{}")
-                                    }.getOrElse { org.json.JSONObject() }
-                                    dictionary.put(sourceText, corrected)
-                                    preferences.edit().putString(PREF_LEARNED_TRANSLATIONS, dictionary.toString()).apply()
-                                }
-                            }
-                                .onSuccess {
-                                    val service = MangaFoxAccessibilityService.instance
-                                    if (service == null) toast("تم حفظ التصحيح في القاموس؛ فعّل الخدمة لإعادة رسمه")
-                                    else service.rerenderLastResultsFromLayers { showResults() }
-                                }
-                                .onFailure { toast("تعذر حفظ التصحيح: ${it.localizedMessage ?: "خطأ"}") }
-                        }
-                    }.show()
+    private fun layerFileForPage(pageIndex: Int): File? {
+        if (pageIndex !in MangaFoxRuntime.resultPages.indices) return null
+        val current = MangaFoxRuntime.translationLayerFiles.getOrNull(pageIndex)
+            ?.takeIf { it.isNotBlank() }?.let { path -> File(path) }?.takeIf { it.isFile }
+        if (current != null) return current
+        val created = File(filesDir, "mfox_layers_editor_${System.currentTimeMillis()}_$pageIndex.json")
+        val marker = org.json.JSONArray().put(org.json.JSONObject().put("_mfoxKeepFlattenedBase", true))
+        runCatching { created.writeText(marker.toString(), Charsets.UTF_8) }.getOrElse { return null }
+        val updated = MangaFoxRuntime.translationLayerFiles.toMutableList()
+        while (updated.size < MangaFoxRuntime.resultPages.size) updated.add("")
+        updated[pageIndex] = created.absolutePath
+        MangaFoxRuntime.translationLayerFiles = updated
+        MangaFoxRuntime.persist(this)
+        return created
+    }
+
+    private fun readLayerArray(pageIndex: Int): Pair<File, org.json.JSONArray>? {
+        val file = layerFileForPage(pageIndex) ?: return null
+        val array = runCatching { org.json.JSONArray(file.readText(Charsets.UTF_8)) }.getOrNull() ?: return null
+        return file to array
+    }
+
+    private fun saveLayerChanges(file: File, layers: org.json.JSONArray, refresh: Boolean = true) {
+        runCatching {
+            val temp = File(file.parentFile, file.name + ".tmp")
+            temp.writeText(layers.toString(), Charsets.UTF_8)
+            if (!temp.renameTo(file)) {
+                temp.copyTo(file, overwrite = true)
+                temp.delete()
             }
+            MangaFoxRuntime.persist(this)
+        }.onSuccess {
+            if (refresh) {
+                val service = MangaFoxAccessibilityService.instance
+                if (service == null) toast("تم حفظ الطبقة. افتح الخدمة لإعادة رسم الصورة")
+                else service.rerenderLastResultsFromLayers { showResults() }
+            }
+        }.onFailure { toast("تعذر حفظ الطبقة: ${it.localizedMessage ?: "خطأ في الملف"}") }
+    }
+
+    private fun editTranslationLayer(pageIndex: Int) {
+        val pair = readLayerArray(pageIndex)
+        if (pair == null) {
+            toast("تعذر فتح طبقات هذا الجزء")
+            return
+        }
+        val (file, layers) = pair
+        val visibleIndexes = (0 until layers.length()).filter { index ->
+            layers.optJSONObject(index)?.optBoolean("_mfoxKeepFlattenedBase", false) != true
+        }
+        val labels = visibleIndexes.map { index ->
+            val item = layers.optJSONObject(index)
+            val translated = item?.optString("translated").orEmpty().take(50)
+            val source = item?.optString("source").orEmpty().take(35)
+            val mode = when {
+                item?.optBoolean("eraseOnly", false) == true -> " · مسح"
+                item?.optBoolean("vertical", false) == true -> " · عمودي"
+                else -> ""
+            }
+            "${index + 1}. ${translated.ifBlank { source.ifBlank { "طبقة يدوية" } }}$mode"
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("إدارة طبقات الجزء ${pageIndex + 1}")
+            .setItems(labels) { _, selected ->
+                val actualIndex = visibleIndexes.getOrNull(selected) ?: return@setItems
+                val item = layers.optJSONObject(actualIndex) ?: return@setItems
+                val actions = arrayOf(
+                    "تعديل النص العربي",
+                    if (item.optBoolean("vertical", false)) "تحويل إلى أفقي" else "عرض العربية عمودياً من الأعلى للأسفل",
+                    "إخفاء النص الأصلي داخل المنطقة (مسح)",
+                    "تغيير موضع وحجم المنطقة",
+                    "تبديل شكل الفقاعة (بيضاوي / مستطيل)",
+                    "حذف هذه الطبقة"
+                )
+                AlertDialog.Builder(this)
+                    .setTitle("الطبقة ${actualIndex + 1}")
+                    .setItems(actions) { _, action ->
+                        when (action) {
+                            0 -> {
+                                val edit = EditText(this).apply {
+                                    setText(item.optString("translated"))
+                                    hint = "اكتب الترجمة العربية"
+                                    minLines = 2
+                                    textSize = 16f
+                                    setPadding(dp(10), dp(8), dp(10), dp(8))
+                                }
+                                AlertDialog.Builder(this).setTitle("تعديل النص")
+                                    .setMessage("النص الأصلي: ${item.optString("source")}")
+                                    .setView(edit).setNegativeButton("إلغاء", null)
+                                    .setPositiveButton("حفظ") { _, _ ->
+                                        val corrected = edit.text.toString().trim()
+                                        if (corrected.isBlank()) {
+                                            toast("النص فارغ؛ استخدم خيار المسح بدلاً من ذلك")
+                                        } else {
+                                            item.put("translated", corrected).put("eraseOnly", false)
+                                            val sourceText = item.optString("source").trim()
+                                            if (sourceText.isNotBlank()) {
+                                                val dictionary = runCatching {
+                                                    org.json.JSONObject(preferences.getString(PREF_LEARNED_TRANSLATIONS, "{}") ?: "{}")
+                                                }.getOrElse { org.json.JSONObject() }
+                                                dictionary.put(normalizeDictionaryKey(sourceText), corrected)
+                                                preferences.edit().putString(PREF_LEARNED_TRANSLATIONS, dictionary.toString()).apply()
+                                            }
+                                            saveLayerChanges(file, layers)
+                                        }
+                                    }.show()
+                            }
+                            1 -> {
+                                item.put("vertical", !item.optBoolean("vertical", false))
+                                saveLayerChanges(file, layers)
+                            }
+                            2 -> {
+                                AlertDialog.Builder(this).setTitle("مسح النص داخل الفقاعة؟")
+                                    .setMessage("سيُغطّى النص الأصلي داخل المستطيل المحدد بلون قريب من الخلفية، دون حذف بقية الصورة.")
+                                    .setNegativeButton("إلغاء", null)
+                                    .setPositiveButton("مسح النص") { _, _ ->
+                                        item.put("eraseOnly", true).put("translated", "")
+                                        saveLayerChanges(file, layers)
+                                    }.show()
+                            }
+                            3 -> openLayerRegionSelection(pageIndex, actualIndex, false)
+                            4 -> {
+                                item.put("shape", if (item.optString("shape", "round") == "oval") "rect" else "oval")
+                                saveLayerChanges(file, layers)
+                            }
+                            5 -> AlertDialog.Builder(this).setTitle("حذف الطبقة؟")
+                                .setMessage("سيتم حذف هذه الطبقة من قائمة التعديلات. لحذف النص الأصلي من الصورة استخدم أداة المسح.")
+                                .setNegativeButton("إلغاء", null)
+                                .setPositiveButton("حذف") { _, _ ->
+                                    val updated = org.json.JSONArray()
+                                    for (i in 0 until layers.length()) if (i != actualIndex) updated.put(layers.optJSONObject(i))
+                                    saveLayerChanges(file, updated)
+                                }.show()
+                        }
+                    }.setNegativeButton("إغلاق", null).show()
+            }
+            .setPositiveButton("إضافة فقاعة / مستطيل") { _, _ -> openLayerRegionSelection(pageIndex, null, false) }
+            .setNeutralButton("مسح نص من الصورة") { _, _ -> openLayerRegionSelection(pageIndex, null, true) }
             .setNegativeButton("إغلاق", null)
             .show()
     }
+
+    /** Selects an editable rectangle on the original page, then adds an overlay/mask or resizes one. */
+    private fun openLayerRegionSelection(pageIndex: Int, layerIndex: Int?, eraseOnly: Boolean) {
+        val sourcePath = MangaFoxRuntime.sourcePages.getOrNull(pageIndex)
+        val original = sourcePath?.let { BitmapFactory.decodeFile(it) }
+        if (original == null) {
+            toast("الصورة الأصلية غير متوفرة")
+            return
+        }
+        val maxWidth = min(resources.displayMetrics.widthPixels - dp(56), dp(360)).coerceAtLeast(dp(220))
+        var viewWidth = maxWidth
+        var viewHeight = (original.height * (viewWidth.toFloat() / original.width)).toInt().coerceAtLeast(dp(180))
+        if (viewHeight > dp(620)) {
+            viewHeight = dp(620)
+            viewWidth = (original.width * (viewHeight.toFloat() / original.height)).toInt().coerceAtLeast(dp(180))
+        }
+        val image = ImageView(this).apply { setImageBitmap(original); scaleType = ImageView.ScaleType.FIT_XY; setBackgroundColor(Color.BLACK) }
+        val selector = RegionSelectionView(this)
+        val frame = FrameLayout(this).apply {
+            addView(image, FrameLayout.LayoutParams(viewWidth, viewHeight))
+            addView(selector, FrameLayout.LayoutParams(viewWidth, viewHeight))
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            addView(text("اسحب لتحديد حدود الفقاعة أو المستطيل. يمكنك إعادة السحب لتعديل الحجم والموضع.", 12f, Color.LTGRAY), matchWrap(dp(8)))
+            addView(frame, LinearLayout.LayoutParams(viewWidth, viewHeight))
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(if (layerIndex != null) "تغيير موضع وحجم الطبقة" else if (eraseOnly) "تحديد نص للمسح" else "إضافة فقاعة أو مستطيل")
+            .setView(container).setNegativeButton("إلغاء", null)
+            .setPositiveButton("متابعة", null).create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val rect = selector.toSourceRect(original.width, original.height)
+                if (rect == null || rect.width() < 8 || rect.height() < 8) {
+                    toast("حدد منطقة أكبر قليلاً")
+                    return@setOnClickListener
+                }
+                dialog.dismiss()
+                val pair = readLayerArray(pageIndex)
+                if (pair == null) {
+                    toast("تعذر فتح ملف الطبقات")
+                    return@setOnClickListener
+                }
+                val (file, layers) = pair
+                if (layerIndex != null) {
+                    val item = layers.optJSONObject(layerIndex)
+                    if (item == null) return@setOnClickListener
+                    item.put("left", rect.left).put("top", rect.top).put("right", rect.right).put("bottom", rect.bottom)
+                    saveLayerChanges(file, layers)
+                } else if (eraseOnly) {
+                    layers.put(org.json.JSONObject()
+                        .put("left", rect.left).put("top", rect.top).put("right", rect.right).put("bottom", rect.bottom)
+                        .put("source", "").put("translated", "").put("language", "manual")
+                        .put("vertical", false).put("eraseOnly", true).put("shape", "rect"))
+                    saveLayerChanges(file, layers)
+                } else {
+                    val input = EditText(this).apply {
+                        hint = "النص العربي داخل المنطقة"
+                        minLines = 2
+                        textSize = 16f
+                    }
+                    val vertical = CheckBox(this).apply { text = "عرض النص العربي عمودياً من الأعلى إلى الأسفل" }
+                    val oval = CheckBox(this).apply { text = "شكل بيضاوي (فقاعة)؛ اتركه دون تحديد للمستطيل" }
+                    val content = LinearLayout(this).apply {
+                        orientation = LinearLayout.VERTICAL
+                        setPadding(dp(16), dp(8), dp(16), dp(4))
+                        addView(input, matchWrap(dp(8)))
+                        addView(vertical, matchWrap(dp(4)))
+                        addView(oval, matchWrap())
+                    }
+                    AlertDialog.Builder(this).setTitle("محتوى الطبقة الجديدة")
+                        .setView(content).setNegativeButton("إلغاء", null)
+                        .setPositiveButton("إضافة وحفظ") { _, _ ->
+                            val value = input.text.toString().trim()
+                            if (value.isBlank()) {
+                                toast("اكتب نصاً أو اختر مسح النص من الصورة")
+                            } else {
+                                layers.put(org.json.JSONObject()
+                                    .put("left", rect.left).put("top", rect.top).put("right", rect.right).put("bottom", rect.bottom)
+                                    .put("source", "").put("translated", value).put("language", "manual")
+                                    .put("vertical", vertical.isChecked).put("eraseOnly", false)
+                                    .put("shape", if (oval.isChecked) "oval" else "rect"))
+                                saveLayerChanges(file, layers)
+                            }
+                        }.show()
+                }
+            }
+        }
+        dialog.setOnDismissListener {
+            image.setImageDrawable(null)
+            if (!original.isRecycled) original.recycle()
+        }
+        dialog.show()
+    }
+
+    private fun normalizeDictionaryKey(source: String): String =
+        source.lowercase(java.util.Locale.ROOT).filter { it.isLetterOrDigit() }
 
     private fun updateVisiblePageImages(pages: List<ZoomableImageView>) {
         val visibleBounds = android.graphics.Rect()
@@ -1298,8 +1556,6 @@ class MainActivity : android.app.Activity() {
             if (page.getLocalVisibleRect(visibleBounds)) page.loadPage() else page.releasePage()
         }
     }
-
-    private fun refreshStatus() = refreshHomeIndicators()
 
     private fun isAccessibilityEnabled(): Boolean {
         val enabled = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
@@ -1588,7 +1844,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private val languageIdentifierDelegate = lazy { LanguageIdentification.getClient() }
     private val languageIdentifier by languageIdentifierDelegate
     private val translatorCache = LinkedHashMap<String, Translator>()
-    @Volatile private var lastOcrTranslationLines: List<TranslationLine> = emptyList()
+    // Each worker thread owns its OCR output. A crop retry can never overwrite another page's layer list.
+    private val lastOcrTranslationLines = ThreadLocal.withInitial<List<TranslationLine>> { emptyList() }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -2130,44 +2387,63 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 translatedCrop = translateBitmap(crop!!) { fraction, detail ->
                     updateTranslationLens((fraction * 95f).toInt(), "منطقة محددة · $detail")
                 }
-                // Keep the manually retried region in the editable layer file as well.
-                runCatching {
-                    val pageIndex = MangaFoxRuntime.resultPages.indexOfFirst {
-                        File(it).absolutePath == File(resultPath).absolutePath
-                    }
-                    val layerPath = MangaFoxRuntime.translationLayerFiles.getOrNull(pageIndex)
-                    val layerFile = layerPath?.let { File(it) }
-                    if (pageIndex >= 0 && layerFile != null && layerFile.isFile) {
-                        val saved = org.json.JSONArray(layerFile.readText(Charsets.UTF_8))
-                        val refreshed = ArrayList<org.json.JSONObject>()
-                        for (i in 0 until saved.length()) {
-                            val record = saved.optJSONObject(i) ?: continue
-                            val oldRect = Rect(record.optInt("left"), record.optInt("top"), record.optInt("right"), record.optInt("bottom"))
-                            val replaced = lastOcrTranslationLines.any { line ->
-                                val newRect = Rect(line.bounds).apply { offset(safe.left, safe.top) }
-                                val overlap = Rect(oldRect)
-                                if (!overlap.intersect(newRect)) false
-                                else {
-                                    val intersection = overlap.width().toFloat() * overlap.height()
-                                    val union = oldRect.width().toFloat() * oldRect.height() + newRect.width().toFloat() * newRect.height() - intersection
-                                    union > 0f && intersection / union > 0.5f
-                                }
-                            }
-                            if (!replaced) refreshed.add(record)
-                        }
-                        lastOcrTranslationLines.forEach { line ->
-                            val rect = Rect(line.bounds).apply { offset(safe.left, safe.top) }
-                            refreshed.add(org.json.JSONObject()
-                                .put("left", rect.left).put("top", rect.top)
-                                .put("right", rect.right).put("bottom", rect.bottom)
-                                .put("source", line.sourceText).put("translated", line.translated)
-                                .put("language", line.language))
-                        }
-                        val outputLayers = org.json.JSONArray()
-                        refreshed.forEach { outputLayers.put(it) }
-                        layerFile.writeText(outputLayers.toString(), Charsets.UTF_8)
-                    }
+                if (lastOcrTranslationLines.get().isEmpty()) {
+                    throw IllegalStateException("لم يُكتشف نص قابل للترجمة داخل المنطقة المحددة")
                 }
+                // The layer update is mandatory: never report success while only the JPG was changed.
+                val pageIndex = MangaFoxRuntime.resultPages.indexOfFirst {
+                    File(it).absolutePath == File(resultPath).absolutePath
+                }
+                if (pageIndex < 0) throw IllegalStateException("تعذر ربط المنطقة بالصفحة الأصلية")
+                while (MangaFoxRuntime.translationLayerFiles.size < MangaFoxRuntime.resultPages.size) {
+                    MangaFoxRuntime.translationLayerFiles = MangaFoxRuntime.translationLayerFiles + ""
+                }
+                val layerPath = MangaFoxRuntime.translationLayerFiles.getOrNull(pageIndex)
+                val layerFile = layerPath?.takeIf { it.isNotBlank() }?.let { File(it) }
+                    ?.takeIf { it.isFile }
+                    ?: File(filesDir, "mfox_layers_manual_${System.currentTimeMillis()}_$pageIndex.json")
+                val saved = if (layerFile.isFile) {
+                    org.json.JSONArray(layerFile.readText(Charsets.UTF_8))
+                } else {
+                    org.json.JSONArray().put(org.json.JSONObject().put("_mfoxKeepFlattenedBase", true))
+                }
+                val refreshed = ArrayList<org.json.JSONObject>()
+                for (i in 0 until saved.length()) {
+                    val record = saved.optJSONObject(i) ?: continue
+                    val oldRect = Rect(record.optInt("left"), record.optInt("top"), record.optInt("right"), record.optInt("bottom"))
+                    val replaced = lastOcrTranslationLines.get().any { line ->
+                        val newRect = Rect(line.bounds).apply { offset(safe.left, safe.top) }
+                        val overlap = Rect(oldRect)
+                        if (!overlap.intersect(newRect)) false else {
+                            val intersection = overlap.width().toFloat() * overlap.height()
+                            val union = oldRect.width().toFloat() * oldRect.height() + newRect.width().toFloat() * newRect.height() - intersection
+                            val smaller = min(oldRect.width() * oldRect.height(), newRect.width() * newRect.height()).coerceAtLeast(1)
+                            union > 0f && (intersection / union > 0.28f || intersection / smaller > 0.58f)
+                        }
+                    }
+                    if (!replaced) refreshed.add(record)
+                }
+                lastOcrTranslationLines.get().forEach { line ->
+                    val rect = Rect(line.bounds).apply { offset(safe.left, safe.top) }
+                    refreshed.add(org.json.JSONObject()
+                        .put("left", rect.left).put("top", rect.top)
+                        .put("right", rect.right).put("bottom", rect.bottom)
+                        .put("source", line.sourceText).put("translated", line.translated)
+                        .put("language", line.language).put("vertical", line.vertical)
+                        .put("eraseOnly", line.eraseOnly).put("shape", line.shape))
+                }
+                val outputLayers = org.json.JSONArray()
+                refreshed.forEach { outputLayers.put(it) }
+                val layerTemp = File(layerFile.parentFile, layerFile.name + ".tmp")
+                layerTemp.writeText(outputLayers.toString(), Charsets.UTF_8)
+                if (!layerTemp.renameTo(layerFile)) {
+                    layerTemp.copyTo(layerFile, overwrite = true)
+                    layerTemp.delete()
+                }
+                MangaFoxRuntime.translationLayerFiles = MangaFoxRuntime.translationLayerFiles.toMutableList().also {
+                    it[pageIndex] = layerFile.absolutePath
+                }
+                MangaFoxRuntime.persist(this@MangaFoxAccessibilityService)
                 output = BitmapFactory.decodeFile(resultPath) ?: original!!.copy(Bitmap.Config.ARGB_8888, true)
                 Canvas(output!!).drawBitmap(translatedCrop!!, safe.left.toFloat(), safe.top.toFloat(), Paint(Paint.ANTI_ALIAS_FLAG))
                 val target = File(resultPath)
@@ -2179,6 +2455,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     temp.copyTo(target, overwrite = true)
                     temp.delete()
                 }
+                MangaFoxRuntime.persist(this@MangaFoxAccessibilityService)
                 mainHandler.post {
                     translationRunning = false
                     MangaFoxRuntime.progressPercent = 100
@@ -2208,11 +2485,26 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val sources = MangaFoxRuntime.sourcePages.map { File(it) }
         val targets = MangaFoxRuntime.resultPages.map { File(it) }
         val layers = MangaFoxRuntime.translationLayerFiles.map { File(it) }
-        if (sources.isEmpty() || sources.size != targets.size || sources.size != layers.size ||
-            sources.any { !it.isFile } || targets.any { !it.isFile } || layers.any { !it.isFile }) {
-            toast("طبقات الترجمة أو الصور الأصلية غير مكتملة؛ أعد ترجمة الفصل")
+        if (sources.isEmpty() || sources.size != targets.size ||
+            sources.any { !it.isFile } || targets.any { !it.isFile }) {
+            toast("الصور الأصلية أو النتائج غير مكتملة؛ لا يمكن إعادة التنسيق")
             return
         }
+        // A missing layer file is recoverable: create an empty editable layer for that page.
+        val normalizedLayers = ArrayList<String>(sources.size)
+        sources.indices.forEach { index ->
+            val existing = layers.getOrNull(index)?.takeIf { it.isNotBlank() }?.let { path -> File(path) }
+            val usable = existing?.takeIf { it.isFile }
+                ?: File(filesDir, "mfox_layers_recovered_${System.currentTimeMillis()}_$index.json").apply {
+                    val marker = org.json.JSONArray().put(
+                        org.json.JSONObject().put("_mfoxKeepFlattenedBase", true)
+                    )
+                    writeText(marker.toString(), Charsets.UTF_8)
+                }
+            normalizedLayers.add(usable.absolutePath)
+        }
+        MangaFoxRuntime.translationLayerFiles = normalizedLayers
+        MangaFoxRuntime.persist(this)
         translationRunning = true
         MangaFoxRuntime.progressPercent = 0
         MangaFoxRuntime.progressDetail = "إعادة تنسيق الطبقات المحفوظة دون OCR"
@@ -2223,9 +2515,11 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     var original: Bitmap? = null
                     var rendered: Bitmap? = null
                     try {
-                        original = BitmapFactory.decodeFile(sources[index].absolutePath)
-                            ?: throw IllegalStateException("تعذر قراءة الصورة الأصلية ${index + 1}")
-                        val json = org.json.JSONArray(layers[index].readText(Charsets.UTF_8))
+                        val json = org.json.JSONArray(File(normalizedLayers[index]).readText(Charsets.UTF_8))
+                        val keepFlattenedBase = json.length() == 0 || json.optJSONObject(0)?.optBoolean("_mfoxKeepFlattenedBase", false) == true
+                        val basePath = if (keepFlattenedBase) targets[index].absolutePath else sources[index].absolutePath
+                        original = BitmapFactory.decodeFile(basePath)
+                            ?: throw IllegalStateException("تعذر قراءة الصورة الأساسية ${index + 1}")
                         val records = ArrayList<TranslationLine>(json.length())
                         for (recordIndex in 0 until json.length()) {
                             val item = json.optJSONObject(recordIndex) ?: continue
@@ -2236,7 +2530,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                             if (rect.width() > 0 && rect.height() > 0) {
                                 records.add(TranslationLine(
                                     rect, item.optString("translated"),
-                                    item.optString("source"), item.optString("language", "und")
+                                    item.optString("source"), item.optString("language", "und"),
+                                    item.optBoolean("vertical", false),
+                                    item.optBoolean("eraseOnly", false),
+                                    item.optString("shape", "round")
                                 ))
                             }
                         }
@@ -2264,6 +2561,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     MangaFoxRuntime.progressPercent = 100
                     MangaFoxRuntime.progressDetail = "تم تطبيق إعدادات الخط دون تشغيل OCR"
                     MangaFoxRuntime.status = MangaFoxRuntime.progressDetail
+                    MangaFoxRuntime.persist(this@MangaFoxAccessibilityService)
                     updateTranslationLens(100, MangaFoxRuntime.progressDetail)
                     mainHandler.postDelayed({ if (!translationRunning) resetLensProgress() }, 3500L)
                     notifyResultsReady()
@@ -2377,18 +2675,19 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                             translated = outputBitmap
                             val layerFile = File(filesDir, "mfox_layers_${System.currentTimeMillis()}_$index.json")
                             val layerArray = org.json.JSONArray()
-                            lastOcrTranslationLines.forEach { line ->
+                            lastOcrTranslationLines.get().forEach { line ->
                                 layerArray.put(org.json.JSONObject()
                                     .put("left", line.bounds.left).put("top", line.bounds.top)
                                     .put("right", line.bounds.right).put("bottom", line.bounds.bottom)
                                     .put("source", line.sourceText).put("translated", line.translated)
-                                    .put("language", line.language))
+                                    .put("language", line.language).put("vertical", line.vertical)
+                                    .put("eraseOnly", line.eraseOnly).put("shape", line.shape))
                             }
                             FileOutputStream(layerFile).use { stream ->
                                 stream.write(layerArray.toString().toByteArray(Charsets.UTF_8))
                             }
                             newLayerFiles.add(layerFile.absolutePath)
-                            val outputFile = File(cacheDir, "mfox_result_${System.currentTimeMillis()}_$index.jpg")
+                            val outputFile = File(filesDir, "mfox_result_${System.currentTimeMillis()}_$index.jpg")
                             FileOutputStream(outputFile).use { stream ->
                                 if (!outputBitmap.compress(Bitmap.CompressFormat.JPEG, 96, stream)) {
                                     throw IllegalStateException("تعذر حفظ نتيجة المقطع ${index + 1}")
@@ -2420,6 +2719,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     MangaFoxRuntime.qualitySummary = "اكتُشف ${MangaFoxRuntime.detectedBlocks} · تُرجم ${MangaFoxRuntime.translatedBlocks} · فشل ${MangaFoxRuntime.failedBlocks} · تُرك ${MangaFoxRuntime.skippedBlocks}"
                     MangaFoxRuntime.status = "اكتملت الترجمة: ${translatedFiles.size} صورة مدمجة · ${MangaFoxRuntime.qualitySummary}"
                     MangaFoxRuntime.lastError = note
+                    MangaFoxRuntime.persist(this@MangaFoxAccessibilityService)
                     MangaFoxRuntime.progressPercent = 100
                     MangaFoxRuntime.progressDetail = "اكتملت الترجمة"
                     mainHandler.post {
@@ -2472,7 +2772,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val bounds: Rect,
         val translated: String,
         val sourceText: String = "",
-        val language: String = "und"
+        val language: String = "und",
+        val vertical: Boolean = false,
+        val eraseOnly: Boolean = false,
+        val shape: String = "round"
     )
     private data class OcrCandidate(val bounds: Rect?, val text: String, val engineLanguage: String)
     private data class BlockForTranslation(val bounds: Rect, val text: String, val language: String)
@@ -2534,7 +2837,15 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 return@forEach
             }
             val overlapIndex = merged.indexOfFirst { existing ->
-                existing.bounds?.let { intersectionOverUnion(it, bounds) > 0.50f } == true
+                val other = existing.bounds ?: return@indexOfFirst false
+                val left = max(other.left, bounds.left)
+                val top = max(other.top, bounds.top)
+                val right = min(other.right, bounds.right)
+                val bottom = min(other.bottom, bounds.bottom)
+                val intersection = max(0, right - left) * max(0, bottom - top)
+                val smallerArea = min(other.width() * other.height(), bounds.width() * bounds.height()).coerceAtLeast(1)
+                val containedOverlap = intersection.toFloat() / smallerArea.toFloat()
+                intersectionOverUnion(other, bounds) > 0.28f || containedOverlap > 0.58f
             }
             if (overlapIndex < 0) merged.add(candidate)
             else {
@@ -2573,10 +2884,15 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         // Percentile histogram stretch improves faded lettering without allocating
         // a second full-size pixel buffer (only one scanline is kept in memory).
         val histogram = IntArray(256)
-        val row = IntArray(width)
-        for (y in 0 until height) {
-            gray.getPixels(row, 0, width, 0, y, width, 1)
-            for (pixel in row) histogram[Color.red(pixel).coerceIn(0, 255)]++
+        // Work in 96-row bands: far fewer Bitmap JNI calls than one row at a time,
+        // while avoiding a second full-resolution IntArray that could cost 70+ MB.
+        val bandHeight = min(96, height).coerceAtLeast(1)
+        val band = IntArray(width * bandHeight)
+        for (top in 0 until height step bandHeight) {
+            val rows = min(bandHeight, height - top)
+            gray.getPixels(band, 0, width, 0, top, width, rows)
+            val used = width * rows
+            for (i in 0 until used) histogram[Color.red(band[i]).coerceIn(0, 255)]++
         }
         val totalPixels = width * height
         val lowTarget = (totalPixels * 0.01f).toInt()
@@ -2595,13 +2911,15 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
         if (high > low + 2) {
             val range = (high - low).toFloat()
-            for (y in 0 until height) {
-                gray.getPixels(row, 0, width, 0, y, width, 1)
-                for (x in row.indices) {
-                    val value = ((Color.red(row[x]) - low) * 255f / range).roundToInt().coerceIn(0, 255)
-                    row[x] = Color.rgb(value, value, value)
+            for (top in 0 until height step bandHeight) {
+                val rows = min(bandHeight, height - top)
+                gray.getPixels(band, 0, width, 0, top, width, rows)
+                val used = width * rows
+                for (i in 0 until used) {
+                    val value = ((Color.red(band[i]) - low) * 255f / range).roundToInt().coerceIn(0, 255)
+                    band[i] = Color.rgb(value, value, value)
                 }
-                gray.setPixels(row, 0, width, 0, y, width, 1)
+                gray.setPixels(band, 0, width, 0, top, width, rows)
             }
         }
         return gray to scale
@@ -2623,14 +2941,14 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             val total = sampleWidth * sampleHeight
             val visited = BooleanArray(total)
             val queue = IntArray(total)
+            val pixels = IntArray(total)
+            sample.getPixels(pixels, 0, sampleWidth, 0, 0, sampleWidth, sampleHeight)
             val regions = ArrayList<Pair<Int, Rect>>()
             val minArea = max(24, (total * 0.00045f).toInt())
             val maxArea = (total * 0.22f).toInt()
 
             fun isBright(index: Int): Boolean {
-                val x = index % sampleWidth
-                val y = index / sampleWidth
-                val color = sample.getPixel(x, y)
+                val color = pixels[index]
                 return (Color.red(color) * 30 + Color.green(color) * 59 + Color.blue(color) * 11) / 100 >= 218
             }
 
@@ -2646,7 +2964,6 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 var maxX = -1
                 var maxY = -1
                 var area = 0
-                var touchesEdge = false
                 while (head < tail) {
                     val index = queue[head++]
                     val x = index % sampleWidth
@@ -2656,7 +2973,6 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     if (x > maxX) maxX = x
                     if (y < minY) minY = y
                     if (y > maxY) maxY = y
-                    if (x <= 0 || y <= 0 || x >= sampleWidth - 1 || y >= sampleHeight - 1) touchesEdge = true
 
                     val left = if (x > 0) index - 1 else -1
                     val right = if (x < sampleWidth - 1) index + 1 else -1
@@ -2667,12 +2983,13 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     if (up >= 0 && !visited[up]) { visited[up] = true; if (isBright(up)) queue[tail++] = up }
                     if (down >= 0 && !visited[down]) { visited[down] = true; if (isBright(down)) queue[tail++] = down }
                 }
-                if (touchesEdge || area < minArea || area > maxArea) continue
+                // Edge-touching regions are valid: manga bubbles are often clipped by a page edge.
+                if (area < minArea || area > maxArea) continue
                 val width = maxX - minX + 1
                 val height = maxY - minY + 1
                 if (width < 14 || height < 10) continue
                 val ratio = width.toFloat() / height.toFloat()
-                if (ratio !in 0.28f..4.6f) continue
+                if (ratio !in 0.18f..6.0f) continue
                 val padX = max(3, width / 14)
                 val padY = max(3, height / 14)
                 val left = (minX - padX).coerceAtLeast(0)
@@ -2689,9 +3006,18 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             }
             val selected = ArrayList<Rect>()
             regions.sortedByDescending { it.first }.forEach { (_, rect) ->
-                if (selected.none { intersectionOverUnion(it, rect) > 0.55f }) selected.add(rect)
+                val overlapsExisting = selected.any { previous ->
+                    val left = max(previous.left, rect.left)
+                    val top = max(previous.top, rect.top)
+                    val right = min(previous.right, rect.right)
+                    val bottom = min(previous.bottom, rect.bottom)
+                    val intersection = max(0, right - left) * max(0, bottom - top)
+                    val smaller = min(previous.width() * previous.height(), rect.width() * rect.height()).coerceAtLeast(1)
+                    intersectionOverUnion(previous, rect) > 0.40f || intersection.toFloat() / smaller > 0.70f
+                }
+                if (!overlapsExisting) selected.add(rect)
             }
-            return selected.take(6)
+            return selected.take(14)
         } finally {
             if (!sample.isRecycled && sample !== source) sample.recycle()
         }
@@ -2821,9 +3147,18 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         MangaFoxRuntime.qualitySummary = "اكتُشف ${MangaFoxRuntime.detectedBlocks} · تُرجم ${MangaFoxRuntime.translatedBlocks} · فشل ${MangaFoxRuntime.failedBlocks} · تُرك ${MangaFoxRuntime.skippedBlocks}"
     }
 
+    private fun normalizeDictionaryKey(source: String): String =
+        source.lowercase(java.util.Locale.ROOT).filter { it.isLetterOrDigit() }
+
     private fun learnedTranslationFor(source: String): String? {
         val raw = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(PREF_LEARNED_TRANSLATIONS, "{}") ?: "{}"
-        return runCatching { org.json.JSONObject(raw).optString(source.trim()).takeIf { it.isNotBlank() } }.getOrNull()
+        return runCatching {
+            val dictionary = org.json.JSONObject(raw)
+            val key = normalizeDictionaryKey(source)
+            dictionary.optString(key).takeIf { it.isNotBlank() }
+                ?: dictionary.keys().asSequence().firstOrNull { normalizeDictionaryKey(it) == key }
+                    ?.let { dictionary.optString(it).takeIf { value -> value.isNotBlank() } }
+        }.getOrNull()
     }
 
     private fun dictionarySfxTranslation(source: String): String? {
@@ -2872,7 +3207,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     private fun translateBitmap(source: Bitmap, onProgress: (Float, String) -> Unit = { _, _ -> }): Bitmap {
-        lastOcrTranslationLines = emptyList()
+        lastOcrTranslationLines.set(emptyList())
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val forcedLanguage = prefs.getString(PREF_SOURCE_LANGUAGE, "auto") ?: "auto"
         onProgress(0.03f, "تهيئة التعرف على النص")
@@ -2912,7 +3247,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
         val preBubbleMerge = mergeOcrCandidates(allCandidates)
         val preBubbleChars = preBubbleMerge.sumOf { it.text.count { character -> character.isLetterOrDigit() } }
-        if (preBubbleMerge.size < 3 || preBubbleChars < 30) {
+        val tallSparsePage = source.height >= 2400 && source.height > source.width * 2 && preBubbleMerge.size < 12
+        val lowCoveragePage = preBubbleChars < 120 && preBubbleMerge.size < 8
+        if (preBubbleMerge.size < 5 || preBubbleChars < 80 || tallSparsePage || lowCoveragePage) {
             onProgress(0.355f, "فحص مناطق الفقاعات الفاتحة وإعادة OCR لكل منطقة")
             allCandidates.addAll(recognizeBubbleRegions(source, engines) { fraction, detail ->
                 onProgress(fraction, detail)
@@ -2999,7 +3336,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     failedCount++
                     failedSamples.add(item.text.take(100))
                 } else {
-                    translatedBlocks.add(TranslationLine(Rect(item.bounds), translated, item.text, item.language))
+                    translatedBlocks.add(TranslationLine(
+                        Rect(item.bounds), translated, item.text, item.language,
+                        vertical = item.bounds.height() > item.bounds.width() * 1.35f
+                    ))
                 }
             } catch (_: Exception) {
                 failedCount++
@@ -3013,9 +3353,12 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             return source.copy(Bitmap.Config.ARGB_8888, true)
                 ?: throw IllegalStateException("تعذر نسخ الصورة للمعالجة")
         }
-        lastOcrTranslationLines = translatedBlocks.map {
-            TranslationLine(Rect(it.bounds), it.translated, it.sourceText, it.language)
-        }
+        lastOcrTranslationLines.set(translatedBlocks.map {
+            TranslationLine(
+                Rect(it.bounds), it.translated, it.sourceText, it.language,
+                vertical = it.bounds.height() > it.bounds.width() * 1.35f
+            )
+        })
         onProgress(0.98f, "إخراج النص العربي بجودة عالية")
         val rendered = drawTranslatedLines(source, translatedBlocks)
         onProgress(1f, "اكتملت الصورة · ${translatedBlocks.size} مترجمة · $failedCount فاشلة · $skippedCount متروكة")
@@ -3027,22 +3370,43 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             ?: throw IllegalStateException("تعذر إنشاء صورة الترجمة")
         val canvas = Canvas(output)
         val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-        translatedLines.forEach { item ->
-            val rect = Rect(item.bounds).apply {
-                val margin = max(3, height() / 10)
+        val renderItems = translatedLines.mapNotNull { item ->
+            val textRect = Rect(item.bounds).apply {
+                left = left.coerceIn(0, output.width)
+                top = top.coerceIn(0, output.height)
+                right = right.coerceIn(0, output.width)
+                bottom = bottom.coerceIn(0, output.height)
+            }
+            if (textRect.width() < 8 || textRect.height() < 8) null else item to textRect
+        }
+        // Pass 1: erase every source text region first. This avoids a later bubble's
+        // background rectangle overwriting Arabic text drawn for an earlier bubble.
+        renderItems.forEach { (item, textRect) ->
+            val margin = max(2, min(textRect.width(), textRect.height()) / 30)
+            val fillRect = Rect(textRect).apply {
                 inset(-margin, -margin)
                 left = left.coerceAtLeast(0)
                 top = top.coerceAtLeast(0)
                 right = right.coerceAtMost(output.width)
                 bottom = bottom.coerceAtMost(output.height)
             }
-            if (rect.width() < 8 || rect.height() < 8) return@forEach
-            backgroundPaint.color = sampleBubbleColor(source, rect)
-            canvas.drawRoundRect(
-                rect.left.toFloat(), rect.top.toFloat(), rect.right.toFloat(), rect.bottom.toFloat(),
-                5f, 5f, backgroundPaint
-            )
-            drawArabicText(canvas, item.translated, rect)
+            backgroundPaint.color = sampleBubbleColor(source, fillRect)
+            val bounds = RectF(fillRect)
+            when (item.shape) {
+                "oval" -> canvas.drawOval(bounds, backgroundPaint)
+                "rect" -> canvas.drawRect(bounds, backgroundPaint)
+                else -> canvas.drawRoundRect(bounds, 5f, 5f, backgroundPaint)
+            }
+        }
+        // Pass 2: draw text only after all backgrounds are ready; clipping keeps
+        // long words/layouts from spilling into neighboring bubbles.
+        renderItems.forEach { (item, textRect) ->
+            if (!item.eraseOnly && item.translated.isNotBlank()) {
+                canvas.save()
+                canvas.clipRect(textRect)
+                drawArabicText(canvas, item.translated, textRect, item.vertical)
+                canvas.restore()
+            }
         }
         return output
     }
@@ -3074,7 +3438,11 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         )
     }
 
-    private fun drawArabicText(canvas: Canvas, text: String, rect: Rect) {
+    private fun drawArabicText(canvas: Canvas, text: String, rect: Rect, vertical: Boolean = false) {
+        if (vertical) {
+            drawArabicTextTopToBottom(canvas, text, rect)
+            return
+        }
         val horizontalPadding = max(4, rect.width() / 20)
         val maxWidth = (rect.width() - horizontalPadding * 2).coerceAtLeast(12)
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -3095,14 +3463,59 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         canvas.restore()
     }
 
+    /** Stacks Arabic words from top to bottom while preserving each word's connected shaping. */
+    private fun drawArabicTextTopToBottom(canvas: Canvas, value: String, rect: Rect) {
+        val words = value.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (words.isEmpty()) return
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val maxWidth = (rect.width() - 8).coerceAtLeast(10)
+        val maxHeight = (rect.height() - 8).coerceAtLeast(10)
+        val paint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(20, 20, 22)
+            typeface = resolveArabicTypeface(prefs)
+            textSize = min(
+                prefs.getInt(PREF_FONT_SIZE, 22).coerceIn(10, 72) * resources.displayMetrics.density,
+                min(maxWidth * 0.92f, maxHeight / words.size.coerceAtLeast(1) * 0.72f)
+            )
+            style = Paint.Style.FILL
+        }
+        val fitting = words.map { word ->
+            val width = paint.measureText(word)
+            if (width > maxWidth) {
+                android.text.StaticLayout.Builder.obtain(word, 0, word.length, paint, maxWidth)
+                    .setAlignment(android.text.Layout.Alignment.ALIGN_CENTER)
+                    .setTextDirection(android.text.TextDirectionHeuristics.RTL)
+                    .setIncludePad(false).build()
+            } else null
+        }
+        val lineHeights = words.indices.map { index -> fitting[index]?.height ?: (paint.fontMetrics.descent - paint.fontMetrics.ascent).toInt().coerceAtLeast(1) }
+        val spacing = max(1, (maxHeight - lineHeights.sum()) / (words.size + 1))
+        var y = rect.top + spacing.toFloat()
+        canvas.save()
+        words.forEachIndexed { index, word ->
+            val layout = fitting[index]
+            if (layout != null) {
+                canvas.save()
+                canvas.translate(rect.left + (rect.width() - layout.width) / 2f, y)
+                layout.draw(canvas)
+                canvas.restore()
+            } else {
+                val x = rect.centerX().toFloat() - paint.measureText(word) / 2f
+                canvas.drawText(word, x, y - paint.fontMetrics.ascent, paint)
+            }
+            y += lineHeights[index] + spacing
+        }
+        canvas.restore()
+    }
+
     private fun buildArabicLayout(value: String, width: Int, size: Float): android.text.StaticLayout {
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val paint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(20, 20, 22)
             textSize = size
             typeface = resolveArabicTypeface(prefs)
-            style = Paint.Style.FILL_AND_STROKE
-            strokeWidth = prefs.getInt(PREF_FONT_THICKNESS, 2).coerceIn(0, 10) / 10f
+            style = Paint.Style.FILL
+            strokeWidth = 0f
         }
         return android.text.StaticLayout.Builder.obtain(value, 0, value.length, paint, width)
             .setAlignment(android.text.Layout.Alignment.ALIGN_CENTER)
@@ -3111,8 +3524,6 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             .setBreakStrategy(android.text.Layout.BREAK_STRATEGY_SIMPLE)
             .build()
     }
-
-    private fun thirtyPx(): Float = 30f * resources.displayMetrics.density
 
     private fun updateTranslationLens(percent: Int, detail: String) {
         if (percent >= 0) MangaFoxRuntime.progressPercent = percent.coerceIn(0, 100)
@@ -3184,19 +3595,6 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         // remove/recreate an already attached view, otherwise the lens visibly flickers.
         if (bubbleWasAdded && bubble != null) return
         showFloatingBubble()
-    }
-
-    fun rebuildFloatingLenses() {
-        if (!this::windowManager.isInitialized) return
-        removeFloatingBubble()
-        bubble = null
-        bubbleParams = null
-        bubbleWasAdded = false
-        refreshLensAppFilter()
-    }
-
-    fun ensureFloatingBubble() {
-        if (Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)) refreshLensAppFilter()
     }
 
     private fun showFloatingBubble() {
