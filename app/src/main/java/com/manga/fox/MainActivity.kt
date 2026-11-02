@@ -2493,7 +2493,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         // A missing layer file is recoverable: create an empty editable layer for that page.
         val normalizedLayers = ArrayList<String>(sources.size)
         sources.indices.forEach { index ->
-            val existing = layers.getOrNull(index)?.takeIf { it.isNotBlank() }?.let { path -> File(path) }
+            // `layers` already contains File objects; do not treat an entry as a String path.
+            val existing: File? = layers.getOrNull(index)
             val usable = existing?.takeIf { it.isFile }
                 ?: File(filesDir, "mfox_layers_recovered_${System.currentTimeMillis()}_$index.json").apply {
                     val marker = org.json.JSONArray().put(
