@@ -115,6 +115,8 @@ object MangaFoxRuntime {
     @Volatile var skippedBlocks: Int = 0
     @Volatile var qualitySummary: String = "لم تبدأ ترجمة بعد"
     @Volatile var failedBlockSamples: List<String> = emptyList()
+    // Per-page OCR/translation layers are stored separately from the rendered JPG.
+    @Volatile var translationLayerFiles: List<String> = emptyList()
 }
 
 class MainActivity : android.app.Activity() {
@@ -425,7 +427,11 @@ class MainActivity : android.app.Activity() {
         library.addView(actionButton("تصدير آخر نتيجة إلى PDF", false) {
             if (MangaFoxRuntime.resultPages.isEmpty()) toast("لا توجد نتيجة لتصديرها") else exportResultsAsPdf()
         }, matchWrap(dp(6)))
-        library.addView(actionButton("إعادة ترجمة الصور الأصلية", false) {
+        library.addView(actionButton("تحديث الخط والحجم دون OCR", false) {
+            val service = MangaFoxAccessibilityService.instance
+            if (service == null) toast("خدمة Manga Fox غير متصلة") else service.rerenderLastResultsFromLayers { showResults() }
+        }, matchWrap(dp(6)))
+        library.addView(actionButton("إعادة OCR والترجمة من الصور الأصلية", false) {
             MangaFoxAccessibilityService.instance?.retranslateLastResults()
                 ?: toast("خدمة Manga Fox غير متصلة")
         }, matchWrap(dp(6)))
@@ -1125,16 +1131,19 @@ class MainActivity : android.app.Activity() {
         }, matchWrap())
         root.addView(actionButton("العودة إلى الرئيسية", false) { showHome() }, matchWrap(dp(10)))
         root.addView(actionButton("تنزيل النتيجة كملف PDF", true) { exportResultsAsPdf() }, matchWrap(dp(8)))
-        root.addView(actionButton("إعادة تطبيق الخط والحجم المختار على هذه الترجمة", true) {
+        root.addView(actionButton("تطبيق الخط والحجم الجديدين دون إعادة OCR", true) {
             val service = MangaFoxAccessibilityService.instance
-            if (MangaFoxRuntime.sourcePages.isEmpty()) {
-                toast("لا توجد صور أصلية محفوظة لهذه النتيجة. ترجم الفصل مجدداً بعد تحديث النسخة.")
+            if (MangaFoxRuntime.sourcePages.isEmpty() || MangaFoxRuntime.translationLayerFiles.isEmpty()) {
+                toast("طبقات الترجمة غير متوفرة لهذه النتيجة؛ أعد ترجمة الفصل أولاً")
             } else if (service == null) {
-                toast("فعّل خدمة Manga Fox لإعادة تنسيق الترجمة")
+                toast("فعّل خدمة Manga Fox لإعادة تنسيق الطبقات")
             } else {
-                service.retranslateLastResults()
-                toast("بدأت إعادة تنسيق الصور بالخط والحجم الحاليين")
+                service.rerenderLastResultsFromLayers { showResults() }
             }
+        }, matchWrap(dp(8)))
+        root.addView(actionButton("إعادة OCR وترجمة الصور الأصلية من جديد", false) {
+            MangaFoxAccessibilityService.instance?.retranslateLastResults()
+                ?: toast("فعّل خدمة Manga Fox لإعادة المعالجة")
         }, matchWrap(dp(8)))
         root.addView(text("تقرير جودة OCR والترجمة", 15f, gold, true), matchWrap())
         root.addView(text("${MangaFoxRuntime.qualitySummary}\nالكتل التي فشلت لا تُرسم كنص أصلي على أنها ترجمة؛ تبقى الصورة كما هي ويظهر سبب الفشل في هذه القائمة.", 12f, Color.LTGRAY), matchWrap(dp(6)))
@@ -1204,6 +1213,11 @@ class MainActivity : android.app.Activity() {
                 if (originalPath != null) {
                     root.addView(actionButton("إعادة OCR لمنطقة من هذا الجزء", false) {
                         openRegionSelection(originalPath, filePath)
+                    }, matchWrap(dp(6)))
+                }
+                if (MangaFoxRuntime.translationLayerFiles.getOrNull(index)?.let { File(it).isFile } == true) {
+                    root.addView(actionButton("تعديل ترجمة فقاعات هذا الجزء دون OCR", false) {
+                        editTranslationLayer(index)
                     }, matchWrap(dp(8)))
                 }
             }
@@ -1212,6 +1226,70 @@ class MainActivity : android.app.Activity() {
         }
         scroll.addView(root)
         setContentView(scroll)
+    }
+
+    private fun editTranslationLayer(pageIndex: Int) {
+        val path = MangaFoxRuntime.translationLayerFiles.getOrNull(pageIndex)
+        val file = path?.let { File(it) }
+        if (file == null || !file.isFile) {
+            toast("طبقات هذا الجزء غير متوفرة")
+            return
+        }
+        val layers = runCatching { org.json.JSONArray(file.readText(Charsets.UTF_8)) }.getOrNull()
+        if (layers == null || layers.length() == 0) {
+            toast("لم تُحفظ فقاعات مترجمة لهذا الجزء")
+            return
+        }
+        val labels = Array(layers.length()) { index ->
+            val item = layers.optJSONObject(index)
+            val source = item?.optString("source").orEmpty().take(46)
+            val translated = item?.optString("translated").orEmpty().take(46)
+            "${index + 1}. $source  ←  $translated"
+        }
+        AlertDialog.Builder(this)
+            .setTitle("اختر فقاعة لتعديل ترجمتها")
+            .setItems(labels) { _, selected ->
+                val item = layers.optJSONObject(selected) ?: return@setItems
+                val edit = EditText(this).apply {
+                    setText(item.optString("translated"))
+                    hint = "اكتب الترجمة العربية"
+                    minLines = 2
+                    textSize = 16f
+                    setPadding(dp(10), dp(8), dp(10), dp(8))
+                }
+                AlertDialog.Builder(this)
+                    .setTitle("تعديل الفقاعة ${selected + 1}")
+                    .setMessage("النص الأصلي: ${item.optString("source")}")
+                    .setView(edit)
+                    .setNegativeButton("إلغاء", null)
+                    .setPositiveButton("حفظ وتحديث الصورة") { _, _ ->
+                        val corrected = edit.text.toString().trim()
+                        if (corrected.isBlank()) {
+                            toast("لا يمكن حفظ ترجمة فارغة")
+                        } else {
+                            item.put("translated", corrected)
+                            runCatching {
+                                file.writeText(layers.toString(), Charsets.UTF_8)
+                                val sourceText = item.optString("source").trim()
+                                if (sourceText.isNotBlank()) {
+                                    val dictionary = runCatching {
+                                        org.json.JSONObject(preferences.getString(PREF_LEARNED_TRANSLATIONS, "{}") ?: "{}")
+                                    }.getOrElse { org.json.JSONObject() }
+                                    dictionary.put(sourceText, corrected)
+                                    preferences.edit().putString(PREF_LEARNED_TRANSLATIONS, dictionary.toString()).apply()
+                                }
+                            }
+                                .onSuccess {
+                                    val service = MangaFoxAccessibilityService.instance
+                                    if (service == null) toast("تم حفظ التصحيح في القاموس؛ فعّل الخدمة لإعادة رسمه")
+                                    else service.rerenderLastResultsFromLayers { showResults() }
+                                }
+                                .onFailure { toast("تعذر حفظ التصحيح: ${it.localizedMessage ?: "خطأ"}") }
+                        }
+                    }.show()
+            }
+            .setNegativeButton("إغلاق", null)
+            .show()
     }
 
     private fun updateVisiblePageImages(pages: List<ZoomableImageView>) {
@@ -1510,6 +1588,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private val languageIdentifierDelegate = lazy { LanguageIdentification.getClient() }
     private val languageIdentifier by languageIdentifierDelegate
     private val translatorCache = LinkedHashMap<String, Translator>()
+    @Volatile private var lastOcrTranslationLines: List<TranslationLine> = emptyList()
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -2051,6 +2130,44 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 translatedCrop = translateBitmap(crop!!) { fraction, detail ->
                     updateTranslationLens((fraction * 95f).toInt(), "منطقة محددة · $detail")
                 }
+                // Keep the manually retried region in the editable layer file as well.
+                runCatching {
+                    val pageIndex = MangaFoxRuntime.resultPages.indexOfFirst {
+                        File(it).absolutePath == File(resultPath).absolutePath
+                    }
+                    val layerPath = MangaFoxRuntime.translationLayerFiles.getOrNull(pageIndex)
+                    val layerFile = layerPath?.let { File(it) }
+                    if (pageIndex >= 0 && layerFile != null && layerFile.isFile) {
+                        val saved = org.json.JSONArray(layerFile.readText(Charsets.UTF_8))
+                        val refreshed = ArrayList<org.json.JSONObject>()
+                        for (i in 0 until saved.length()) {
+                            val record = saved.optJSONObject(i) ?: continue
+                            val oldRect = Rect(record.optInt("left"), record.optInt("top"), record.optInt("right"), record.optInt("bottom"))
+                            val replaced = lastOcrTranslationLines.any { line ->
+                                val newRect = Rect(line.bounds).apply { offset(safe.left, safe.top) }
+                                val overlap = Rect(oldRect)
+                                if (!overlap.intersect(newRect)) false
+                                else {
+                                    val intersection = overlap.width().toFloat() * overlap.height()
+                                    val union = oldRect.width().toFloat() * oldRect.height() + newRect.width().toFloat() * newRect.height() - intersection
+                                    union > 0f && intersection / union > 0.5f
+                                }
+                            }
+                            if (!replaced) refreshed.add(record)
+                        }
+                        lastOcrTranslationLines.forEach { line ->
+                            val rect = Rect(line.bounds).apply { offset(safe.left, safe.top) }
+                            refreshed.add(org.json.JSONObject()
+                                .put("left", rect.left).put("top", rect.top)
+                                .put("right", rect.right).put("bottom", rect.bottom)
+                                .put("source", line.sourceText).put("translated", line.translated)
+                                .put("language", line.language))
+                        }
+                        val outputLayers = org.json.JSONArray()
+                        refreshed.forEach { outputLayers.put(it) }
+                        layerFile.writeText(outputLayers.toString(), Charsets.UTF_8)
+                    }
+                }
                 output = BitmapFactory.decodeFile(resultPath) ?: original!!.copy(Bitmap.Config.ARGB_8888, true)
                 Canvas(output!!).drawBitmap(translatedCrop!!, safe.left.toFloat(), safe.top.toFloat(), Paint(Paint.ANTI_ALIAS_FLAG))
                 val target = File(resultPath)
@@ -2077,6 +2194,89 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             } finally {
                 listOf(original, crop, translatedCrop, output).forEach { bitmap ->
                     bitmap?.let { if (!it.isRecycled) it.recycle() }
+                }
+            }
+        }
+    }
+
+    /** Re-render saved per-bubble translation layers with the current font settings, without OCR. */
+    fun rerenderLastResultsFromLayers(onComplete: (() -> Unit)? = null) {
+        if (translationRunning || captureRunning) {
+            toast("انتظر انتهاء العملية الحالية")
+            return
+        }
+        val sources = MangaFoxRuntime.sourcePages.map { File(it) }
+        val targets = MangaFoxRuntime.resultPages.map { File(it) }
+        val layers = MangaFoxRuntime.translationLayerFiles.map { File(it) }
+        if (sources.isEmpty() || sources.size != targets.size || sources.size != layers.size ||
+            sources.any { !it.isFile } || targets.any { !it.isFile } || layers.any { !it.isFile }) {
+            toast("طبقات الترجمة أو الصور الأصلية غير مكتملة؛ أعد ترجمة الفصل")
+            return
+        }
+        translationRunning = true
+        MangaFoxRuntime.progressPercent = 0
+        MangaFoxRuntime.progressDetail = "إعادة تنسيق الطبقات المحفوظة دون OCR"
+        updateTranslationLens(0, MangaFoxRuntime.progressDetail)
+        worker.execute {
+            try {
+                sources.indices.forEach { index ->
+                    var original: Bitmap? = null
+                    var rendered: Bitmap? = null
+                    try {
+                        original = BitmapFactory.decodeFile(sources[index].absolutePath)
+                            ?: throw IllegalStateException("تعذر قراءة الصورة الأصلية ${index + 1}")
+                        val json = org.json.JSONArray(layers[index].readText(Charsets.UTF_8))
+                        val records = ArrayList<TranslationLine>(json.length())
+                        for (recordIndex in 0 until json.length()) {
+                            val item = json.optJSONObject(recordIndex) ?: continue
+                            val rect = Rect(
+                                item.optInt("left"), item.optInt("top"),
+                                item.optInt("right"), item.optInt("bottom")
+                            )
+                            if (rect.width() > 0 && rect.height() > 0) {
+                                records.add(TranslationLine(
+                                    rect, item.optString("translated"),
+                                    item.optString("source"), item.optString("language", "und")
+                                ))
+                            }
+                        }
+                        rendered = drawTranslatedLines(original!!, records)
+                        val target = targets[index]
+                        val temp = File(target.parentFile, target.nameWithoutExtension + "_layers.tmp.jpg")
+                        FileOutputStream(temp).use { stream ->
+                            if (!rendered!!.compress(Bitmap.CompressFormat.JPEG, 96, stream)) {
+                                throw IllegalStateException("تعذر حفظ تنسيق الصورة ${index + 1}")
+                            }
+                        }
+                        if (!temp.renameTo(target)) {
+                            temp.copyTo(target, overwrite = true)
+                            temp.delete()
+                        }
+                        val percent = (((index + 1).toFloat() / sources.size) * 100f).toInt()
+                        updateTranslationLens(percent.coerceAtMost(99), "إعادة تنسيق الطبقات ${index + 1}/${sources.size}")
+                    } finally {
+                        original?.let { if (!it.isRecycled) it.recycle() }
+                        rendered?.let { if (!it.isRecycled) it.recycle() }
+                    }
+                }
+                mainHandler.post {
+                    translationRunning = false
+                    MangaFoxRuntime.progressPercent = 100
+                    MangaFoxRuntime.progressDetail = "تم تطبيق إعدادات الخط دون تشغيل OCR"
+                    MangaFoxRuntime.status = MangaFoxRuntime.progressDetail
+                    updateTranslationLens(100, MangaFoxRuntime.progressDetail)
+                    mainHandler.postDelayed({ if (!translationRunning) resetLensProgress() }, 3500L)
+                    notifyResultsReady()
+                    toast("تم تحديث الخط والحجم دون إعادة OCR")
+                    onComplete?.invoke()
+                }
+            } catch (e: Exception) {
+                mainHandler.post {
+                    translationRunning = false
+                    MangaFoxRuntime.lastError = "تعذرت إعادة تنسيق الطبقات: ${e.localizedMessage ?: "خطأ غير معروف"}"
+                    MangaFoxRuntime.progressDetail = "تعذرت إعادة تنسيق الطبقات"
+                    updateTranslationLens(-1, MangaFoxRuntime.progressDetail)
+                    toast(MangaFoxRuntime.lastError)
                 }
             }
         }
@@ -2142,6 +2342,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             worker.execute {
                 val translatedFiles = ArrayList<String>()
                 val newSourceFiles = ArrayList<String>()
+                val newLayerFiles = ArrayList<String>()
                 val groupSize = if (preserveInputs) 1 else 2
                 val groups = workPages.chunked(groupSize)
                 try {
@@ -2174,6 +2375,19 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                                 updateTranslationLens(aggregate, "${index + 1}/${groups.size} · $detail")
                             }
                             translated = outputBitmap
+                            val layerFile = File(filesDir, "mfox_layers_${System.currentTimeMillis()}_$index.json")
+                            val layerArray = org.json.JSONArray()
+                            lastOcrTranslationLines.forEach { line ->
+                                layerArray.put(org.json.JSONObject()
+                                    .put("left", line.bounds.left).put("top", line.bounds.top)
+                                    .put("right", line.bounds.right).put("bottom", line.bounds.bottom)
+                                    .put("source", line.sourceText).put("translated", line.translated)
+                                    .put("language", line.language))
+                            }
+                            FileOutputStream(layerFile).use { stream ->
+                                stream.write(layerArray.toString().toByteArray(Charsets.UTF_8))
+                            }
+                            newLayerFiles.add(layerFile.absolutePath)
                             val outputFile = File(cacheDir, "mfox_result_${System.currentTimeMillis()}_$index.jpg")
                             FileOutputStream(outputFile).use { stream ->
                                 if (!outputBitmap.compress(Bitmap.CompressFormat.JPEG, 96, stream)) {
@@ -2192,8 +2406,11 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                         }
                     }
                     val oldFiles = MangaFoxRuntime.resultPages
+                    val oldLayers = MangaFoxRuntime.translationLayerFiles
                     MangaFoxRuntime.resultPages = translatedFiles
+                    MangaFoxRuntime.translationLayerFiles = newLayerFiles.toList()
                     oldFiles.forEach { runCatching { File(it).delete() } }
+                    oldLayers.forEach { runCatching { File(it).delete() } }
                     if (!preserveInputs) {
                         val oldSources = MangaFoxRuntime.sourcePages
                         MangaFoxRuntime.sourcePages = newSourceFiles.toList()
@@ -2216,6 +2433,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 } catch (e: Exception) {
                     if (!preserveInputs) workPages.forEach { runCatching { it.delete() } }
                     newSourceFiles.forEach { runCatching { File(it).delete() } }
+                    newLayerFiles.forEach { runCatching { File(it).delete() } }
                     translatedFiles.forEach { runCatching { File(it).delete() } }
                     MangaFoxRuntime.lastError = "حدث خطأ أثناء الترجمة: ${e.localizedMessage ?: "خطأ غير معروف"}"
                     MangaFoxRuntime.status = "تعذرت الترجمة"
@@ -2250,7 +2468,12 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         toast(message)
     }
 
-    private data class TranslationLine(val bounds: Rect, val translated: String)
+    private data class TranslationLine(
+        val bounds: Rect,
+        val translated: String,
+        val sourceText: String = "",
+        val language: String = "und"
+    )
     private data class OcrCandidate(val bounds: Rect?, val text: String, val engineLanguage: String)
     private data class BlockForTranslation(val bounds: Rect, val text: String, val language: String)
 
@@ -2346,7 +2569,169 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { colorFilter = ColorMatrixColorFilter(matrix) }
         Canvas(gray).drawBitmap(scaled, 0f, 0f, paint)
         if (!scaled.isRecycled) scaled.recycle()
+
+        // Percentile histogram stretch improves faded lettering without allocating
+        // a second full-size pixel buffer (only one scanline is kept in memory).
+        val histogram = IntArray(256)
+        val row = IntArray(width)
+        for (y in 0 until height) {
+            gray.getPixels(row, 0, width, 0, y, width, 1)
+            for (pixel in row) histogram[Color.red(pixel).coerceIn(0, 255)]++
+        }
+        val totalPixels = width * height
+        val lowTarget = (totalPixels * 0.01f).toInt()
+        val highTarget = (totalPixels * 0.99f).toInt()
+        var cumulative = 0
+        var low = 0
+        var high = 255
+        for (value in 0..255) {
+            cumulative += histogram[value]
+            if (cumulative >= lowTarget) { low = value; break }
+        }
+        cumulative = 0
+        for (value in 0..255) {
+            cumulative += histogram[value]
+            if (cumulative >= highTarget) { high = value; break }
+        }
+        if (high > low + 2) {
+            val range = (high - low).toFloat()
+            for (y in 0 until height) {
+                gray.getPixels(row, 0, width, 0, y, width, 1)
+                for (x in row.indices) {
+                    val value = ((Color.red(row[x]) - low) * 255f / range).roundToInt().coerceIn(0, 255)
+                    row[x] = Color.rgb(value, value, value)
+                }
+                gray.setPixels(row, 0, width, 0, y, width, 1)
+            }
+        }
         return gray to scale
+    }
+
+    /**
+     * Finds enclosed bright regions that resemble speech-balloon interiors.
+     * This is a lightweight heuristic (not a trained balloon detector): it runs
+     * on a bounded thumbnail and returns only compact, enclosed components.
+     */
+    private fun detectBrightBubbleRegions(source: Bitmap): List<Rect> {
+        val largest = max(source.width, source.height).coerceAtLeast(1)
+        val scale = min(1f, min(1000f / largest.toFloat(), kotlin.math.sqrt(900_000f / (source.width.toFloat() * source.height.toFloat()))))
+            .coerceAtLeast(0.01f)
+        val sampleWidth = (source.width * scale).roundToInt().coerceAtLeast(1)
+        val sampleHeight = (source.height * scale).roundToInt().coerceAtLeast(1)
+        val sample = Bitmap.createScaledBitmap(source, sampleWidth, sampleHeight, true)
+        try {
+            val total = sampleWidth * sampleHeight
+            val visited = BooleanArray(total)
+            val queue = IntArray(total)
+            val regions = ArrayList<Pair<Int, Rect>>()
+            val minArea = max(24, (total * 0.00045f).toInt())
+            val maxArea = (total * 0.22f).toInt()
+
+            fun isBright(index: Int): Boolean {
+                val x = index % sampleWidth
+                val y = index / sampleWidth
+                val color = sample.getPixel(x, y)
+                return (Color.red(color) * 30 + Color.green(color) * 59 + Color.blue(color) * 11) / 100 >= 218
+            }
+
+            for (start in 0 until total) {
+                if (visited[start]) continue
+                visited[start] = true
+                if (!isBright(start)) continue
+                var head = 0
+                var tail = 0
+                queue[tail++] = start
+                var minX = sampleWidth
+                var minY = sampleHeight
+                var maxX = -1
+                var maxY = -1
+                var area = 0
+                var touchesEdge = false
+                while (head < tail) {
+                    val index = queue[head++]
+                    val x = index % sampleWidth
+                    val y = index / sampleWidth
+                    area++
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                    if (x <= 0 || y <= 0 || x >= sampleWidth - 1 || y >= sampleHeight - 1) touchesEdge = true
+
+                    val left = if (x > 0) index - 1 else -1
+                    val right = if (x < sampleWidth - 1) index + 1 else -1
+                    val up = if (y > 0) index - sampleWidth else -1
+                    val down = if (y < sampleHeight - 1) index + sampleWidth else -1
+                    if (left >= 0 && !visited[left]) { visited[left] = true; if (isBright(left)) queue[tail++] = left }
+                    if (right >= 0 && !visited[right]) { visited[right] = true; if (isBright(right)) queue[tail++] = right }
+                    if (up >= 0 && !visited[up]) { visited[up] = true; if (isBright(up)) queue[tail++] = up }
+                    if (down >= 0 && !visited[down]) { visited[down] = true; if (isBright(down)) queue[tail++] = down }
+                }
+                if (touchesEdge || area < minArea || area > maxArea) continue
+                val width = maxX - minX + 1
+                val height = maxY - minY + 1
+                if (width < 14 || height < 10) continue
+                val ratio = width.toFloat() / height.toFloat()
+                if (ratio !in 0.28f..4.6f) continue
+                val padX = max(3, width / 14)
+                val padY = max(3, height / 14)
+                val left = (minX - padX).coerceAtLeast(0)
+                val top = (minY - padY).coerceAtLeast(0)
+                val right = (maxX + 1 + padX).coerceAtMost(sampleWidth)
+                val bottom = (maxY + 1 + padY).coerceAtMost(sampleHeight)
+                val mapped = Rect(
+                    (left / scale).roundToInt().coerceIn(0, source.width - 1),
+                    (top / scale).roundToInt().coerceIn(0, source.height - 1),
+                    (right / scale).roundToInt().coerceIn(1, source.width),
+                    (bottom / scale).roundToInt().coerceIn(1, source.height)
+                )
+                if (mapped.width() > 12 && mapped.height() > 12) regions.add(area to mapped)
+            }
+            val selected = ArrayList<Rect>()
+            regions.sortedByDescending { it.first }.forEach { (_, rect) ->
+                if (selected.none { intersectionOverUnion(it, rect) > 0.55f }) selected.add(rect)
+            }
+            return selected.take(6)
+        } finally {
+            if (!sample.isRecycled && sample !== source) sample.recycle()
+        }
+    }
+
+    private fun recognizeBubbleRegions(
+        source: Bitmap,
+        engines: List<Pair<String, TextRecognizer>>,
+        onProgress: (Float, String) -> Unit
+    ): List<OcrCandidate> {
+        val regions = detectBrightBubbleRegions(source)
+        if (regions.isEmpty()) return emptyList()
+        val found = ArrayList<OcrCandidate>()
+        regions.forEachIndexed { index, region ->
+            val regionMaxSide = max(region.width(), region.height()).toFloat().coerceAtLeast(1f)
+            // Enlarge small bubbles, but downscale oversized regions before allocation to cap memory.
+            val enlarge = if (regionMaxSide < 900f) {
+                min(1.8f, 1450f / regionMaxSide)
+            } else {
+                min(1f, 1600f / regionMaxSide)
+            }.coerceAtLeast(0.12f)
+            val transform = Matrix().apply { setScale(enlarge, enlarge) }
+            val crop = runCatching {
+                Bitmap.createBitmap(source, region.left, region.top, region.width(), region.height(), transform, true)
+            }.getOrNull() ?: return@forEachIndexed
+            try {
+                val input = InputImage.fromBitmap(crop, 0)
+                engines.forEach { engine ->
+                    val result = runCatching { Tasks.await(engine.second.process(input)) }.getOrNull()
+                    collectCandidates(result, engine.first, enlarge).forEach { candidate ->
+                        val shifted = candidate.bounds?.let { Rect(it).apply { offset(region.left, region.top) } }
+                        found.add(candidate.copy(bounds = shifted))
+                    }
+                }
+            } finally {
+                if (!crop.isRecycled) crop.recycle()
+            }
+            onProgress(0.36f, "إعادة OCR داخل الفقاعة ${index + 1}/${regions.size}")
+        }
+        return found
     }
 
     private fun rotatedJapaneseCandidates(source: Bitmap): List<OcrCandidate> {
@@ -2401,6 +2786,16 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val normalized = identified.lowercase().substringBefore('-')
         if (normalized in setOf("ja", "en", "ko", "zh")) return normalized
         return if (countChars(text) { it in '\u4E00'..'\u9FFF' } >= 2) "zh" else "en"
+    }
+
+    private fun correctLikelyOcrText(value: String, language: String): String {
+        var corrected = value.replace(' ', ' ').replace(Regex("\\s+"), " ").trim()
+        if (language == "en") {
+            corrected = corrected.replace(Regex("(?i)\\bl\\s*['’]m\\b"), "I'm")
+            corrected = corrected.replace(Regex("(?<=[A-Za-z])0(?=[A-Za-z])"), "O")
+            corrected = corrected.replace(Regex("(?<=[A-Za-z])1(?=[A-Za-z])"), "I")
+        }
+        return corrected
     }
 
     private fun cleanArabicTranslation(value: String): String {
@@ -2477,6 +2872,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     private fun translateBitmap(source: Bitmap, onProgress: (Float, String) -> Unit = { _, _ -> }): Bitmap {
+        lastOcrTranslationLines = emptyList()
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val forcedLanguage = prefs.getString(PREF_SOURCE_LANGUAGE, "auto") ?: "auto"
         onProgress(0.03f, "تهيئة التعرف على النص")
@@ -2514,6 +2910,14 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 try { allCandidates.addAll(recognizeAll(inverted, invertedScale)) } finally { inverted.recycle() }
             }
         }
+        val preBubbleMerge = mergeOcrCandidates(allCandidates)
+        val preBubbleChars = preBubbleMerge.sumOf { it.text.count { character -> character.isLetterOrDigit() } }
+        if (preBubbleMerge.size < 3 || preBubbleChars < 30) {
+            onProgress(0.355f, "فحص مناطق الفقاعات الفاتحة وإعادة OCR لكل منطقة")
+            allCandidates.addAll(recognizeBubbleRegions(source, engines) { fraction, detail ->
+                onProgress(fraction, detail)
+            })
+        }
         val beforeRotation = mergeOcrCandidates(allCandidates)
         val verticalJapanese = beforeRotation.any { candidate ->
             val b = candidate.bounds
@@ -2539,6 +2943,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
 
         onProgress(0.40f, "تحديد لغة كل كتلة نصية بصورة مستقلة")
         val blocks = ArrayList<BlockForTranslation>()
+        val failedSamples = ArrayList<String>()
         var skippedCount = 0
         candidates.forEach { candidate ->
             val code = languageForBlock(candidate.text, candidate.engineLanguage, forcedLanguage)
@@ -2549,35 +2954,36 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             val bounds = candidate.bounds
             if (bounds == null || bounds.width() < 3 || bounds.height() < 3) {
                 skippedCount++ // No safe rendering position was returned by any OCR engine.
+                if (candidate.text.isNotBlank()) failedSamples.add("بلا إحداثيات · ${candidate.text.take(90)}")
                 return@forEach
             }
             blocks.add(BlockForTranslation(Rect(bounds), candidate.text, code))
         }
         if (blocks.isEmpty()) {
-            updateQualityCounts(candidates.size, 0, 0, skippedCount, emptyList())
+            updateQualityCounts(candidates.size, 0, 0, skippedCount, failedSamples)
             onProgress(1f, "لم توجد كتل أجنبية ذات إحداثيات صالحة")
             return source.copy(Bitmap.Config.ARGB_8888, true)
                 ?: throw IllegalStateException("تعذر نسخ الصورة للمعالجة")
         }
 
         val translatedBlocks = ArrayList<TranslationLine>()
-        val failedSamples = ArrayList<String>()
         var failedCount = 0
         blocks.forEachIndexed { index, item ->
             try {
                 onProgress(0.43f + (0.50f * index / blocks.size), "تجهيز نموذج ${item.language} ثم ترجمة الكتلة ${index + 1}/${blocks.size}")
-                val learned = learnedTranslationFor(item.text)
+                val normalizedSource = correctLikelyOcrText(item.text, item.language)
+                val learned = learnedTranslationFor(item.text) ?: learnedTranslationFor(normalizedSource)
                 val sfx = if (getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(PREF_TRANSLATE_SFX, false)) {
                     dictionarySfxTranslation(item.text)
                 } else null
                 var translatedRaw: String? = learned ?: sfx
                 if (translatedRaw == null) {
-                    translatedRaw = runCatching { translateWithLanguage(item.text, item.language) }.getOrNull()
+                    translatedRaw = runCatching { translateWithLanguage(normalizedSource, item.language) }.getOrNull()
                     val firstClean = translatedRaw?.let { cleanArabicTranslation(it) }.orEmpty()
                     if (firstClean.isBlank() || firstClean.equals(item.text, ignoreCase = true)) {
                         // If one source model failed or merely echoed OCR, retry this block with a language-ID suggestion and alternate script model.
-                        for (retryCode in retryLanguageCandidates(item.text, item.language)) {
-                            val retried = runCatching { translateWithLanguage(item.text, retryCode) }.getOrNull()
+                        for (retryCode in retryLanguageCandidates(normalizedSource, item.language)) {
+                            val retried = runCatching { translateWithLanguage(normalizedSource, retryCode) }.getOrNull()
                             if (!retried.isNullOrBlank()) {
                                 val cleanedRetry = cleanArabicTranslation(retried)
                                 if (cleanedRetry.isNotBlank() && !cleanedRetry.equals(item.text, ignoreCase = true)) {
@@ -2593,7 +2999,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     failedCount++
                     failedSamples.add(item.text.take(100))
                 } else {
-                    translatedBlocks.add(TranslationLine(Rect(item.bounds), translated))
+                    translatedBlocks.add(TranslationLine(Rect(item.bounds), translated, item.text, item.language))
                 }
             } catch (_: Exception) {
                 failedCount++
@@ -2606,6 +3012,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             onProgress(1f, "لم تنجح ترجمة أي كتلة؛ راجع تقرير الجودة")
             return source.copy(Bitmap.Config.ARGB_8888, true)
                 ?: throw IllegalStateException("تعذر نسخ الصورة للمعالجة")
+        }
+        lastOcrTranslationLines = translatedBlocks.map {
+            TranslationLine(Rect(it.bounds), it.translated, it.sourceText, it.language)
         }
         onProgress(0.98f, "إخراج النص العربي بجودة عالية")
         val rendered = drawTranslatedLines(source, translatedBlocks)
