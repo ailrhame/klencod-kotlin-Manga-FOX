@@ -19,6 +19,7 @@ import android.graphics.Matrix
 import android.graphics.RectF
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.pdf.PdfDocument
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.Typeface
@@ -69,6 +70,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 private const val ACTION_SHOW_RESULTS = "com.manga.fox.SHOW_RESULTS"
 private const val ACTION_STOP_CAPTURE = "com.manga.fox.STOP_CAPTURE"
@@ -80,6 +82,7 @@ private const val PREF_FONT_FILE = "font_file_path"
 private const val PREF_FONT_LABEL = "font_file_label"
 private const val PREF_FONT_THICKNESS = "font_thickness"
 private const val REQUEST_PICK_FONT = 713
+private const val REQUEST_SAVE_PDF = 714
 private const val PREF_LENS_SIZE = "lens_size_dp"
 private const val PREF_LENS_ALPHA = "lens_alpha"
 private const val MAX_CAPTURE_FRAMES = 120
@@ -103,6 +106,7 @@ class MainActivity : android.app.Activity() {
     private var fontPreview: TextView? = null
     private var fontStatusText: TextView? = null
     private var readingFullscreen = false
+    private var pendingPdfFile: File? = null
     private val fontDownloadExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -450,6 +454,29 @@ class MainActivity : android.app.Activity() {
     @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_SAVE_PDF) {
+            val prepared = pendingPdfFile
+            pendingPdfFile = null
+            if (resultCode != RESULT_OK || data?.data == null || prepared == null || !prepared.isFile) {
+                prepared?.delete()
+                if (resultCode != RESULT_OK) toast("تم إلغاء حفظ ملف PDF")
+                return
+            }
+            val destination = data.data ?: run { prepared.delete(); return }
+            fontDownloadExecutor.execute {
+                try {
+                    val output = contentResolver.openOutputStream(destination, "w")
+                        ?: throw IllegalStateException("تعذر فتح ملف الوجهة")
+                    output.use { out -> prepared.inputStream().use { input -> input.copyTo(out) } }
+                    prepared.delete()
+                    runOnUiThread { toast("تم حفظ ملف PDF بنجاح") }
+                } catch (e: Exception) {
+                    prepared.delete()
+                    runOnUiThread { toast("تعذر حفظ PDF: ${e.localizedMessage ?: "خطأ في الملف"}") }
+                }
+            }
+            return
+        }
         if (requestCode != REQUEST_PICK_FONT || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
         runCatching {
@@ -482,6 +509,121 @@ class MainActivity : android.app.Activity() {
             updateFontPreview()
             toast("تم استيراد الخط وتفعيله: $displayName")
         }.onFailure { toast("تعذر استيراد الخط: ${it.localizedMessage ?: "ملف غير صالح"}") }
+    }
+
+    private fun exportResultsAsPdf() {
+        val images = MangaFoxRuntime.resultPages.map { File(it) }
+            .filter { it.isFile && it.length() > 0L }
+        if (images.isEmpty()) {
+            toast("لا توجد نتيجة مترجمة لتصديرها")
+            return
+        }
+        toast("جارٍ تجهيز ملف PDF متصل الصفحات...")
+        fontDownloadExecutor.execute {
+            var prepared: File? = null
+            try {
+                val readyFile = File(cacheDir, "mfox_export_${System.currentTimeMillis()}.pdf")
+                prepared = readyFile
+                createContinuousPdf(images, readyFile)
+                runOnUiThread {
+                    if (isFinishing || isDestroyed) {
+                        readyFile.delete()
+                        return@runOnUiThread
+                    }
+                    pendingPdfFile = readyFile
+                    val title = MangaFoxRuntime.resultTitle
+                        .replace(Regex("[^\\p{L}\\p{N} _-]"), "_")
+                        .trim().take(60).ifBlank { "Manga_Fox_Result" }
+                    val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "application/pdf"
+                        putExtra(Intent.EXTRA_TITLE, "$title.pdf")
+                    }
+                    try {
+                        startActivityForResult(intent, REQUEST_SAVE_PDF)
+                    } catch (e: Exception) {
+                        pendingPdfFile = null
+                        readyFile.delete()
+                        toast("لا يوجد تطبيق لحفظ ملف PDF")
+                    }
+                }
+            } catch (e: Exception) {
+                prepared?.delete()
+                runOnUiThread { toast("تعذر إنشاء PDF: ${e.localizedMessage ?: "خطأ في الصور"}") }
+            }
+        }
+    }
+
+    /**
+     * Writes all translated strips as one uninterrupted vertical stream.
+     * The image sequence continues at the exact y-coordinate where the prior
+     * image ended; only the physical PDF page boundary divides the output.
+     */
+    private fun createContinuousPdf(images: List<File>, outputFile: File) {
+        val pdf = PdfDocument()
+        val pageWidth = 595
+        val pageHeight = 842
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
+        var page: PdfDocument.Page? = null
+        var yOnPage = 0f
+        var pageNumber = 0
+
+        fun startPageIfNeeded() {
+            if (page == null) {
+                pageNumber++
+                val info = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageNumber).create()
+                page = pdf.startPage(info)
+                yOnPage = 0f
+                page!!.canvas.drawColor(Color.WHITE)
+            }
+        }
+
+        fun finishPage() {
+            val current = page ?: return
+            pdf.finishPage(current)
+            page = null
+            yOnPage = 0f
+        }
+
+        try {
+            for (file in images) {
+                val bitmap = BitmapFactory.decodeFile(file.absolutePath)
+                    ?: throw IllegalStateException("تعذر فتح صورة ${file.name}")
+                try {
+                    val scale = pageWidth.toFloat() / bitmap.width.toFloat()
+                    var consumedSourceY = 0f
+                    while (consumedSourceY < bitmap.height - 0.01f) {
+                        startPageIfNeeded()
+                        val availableOnPage = pageHeight.toFloat() - yOnPage
+                        val remainingSource = bitmap.height.toFloat() - consumedSourceY
+                        val sourceChunkHeight = min(remainingSource, availableOnPage / scale)
+                        if (sourceChunkHeight <= 0.01f) {
+                            finishPage()
+                            continue
+                        }
+                        val sourceTop = consumedSourceY.toInt().coerceIn(0, bitmap.height - 1)
+                        val sourceBottom = (consumedSourceY + sourceChunkHeight)
+                            .toInt().coerceIn(sourceTop + 1, bitmap.height)
+                        val actualSourceHeight = (sourceBottom - sourceTop).toFloat()
+                        val destHeight = actualSourceHeight * scale
+                        val src = Rect(0, sourceTop, bitmap.width, sourceBottom)
+                        val dst = RectF(0f, yOnPage, pageWidth.toFloat(), yOnPage + destHeight)
+                        page!!.canvas.drawBitmap(bitmap, src, dst, paint)
+                        consumedSourceY = sourceBottom.toFloat()
+                        yOnPage += destHeight
+                        if (yOnPage >= pageHeight - 0.5f) finishPage()
+                    }
+                } finally {
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                }
+            }
+            if (page != null) finishPage()
+            if (pageNumber == 0) throw IllegalStateException("لا توجد صور صالحة في النتيجة")
+            FileOutputStream(outputFile).use { pdf.writeTo(it) }
+        } finally {
+            runCatching { page?.let { pdf.finishPage(it) } }
+            pdf.close()
+        }
     }
 
     private fun downloadArabicFont(label: String, fileName: String, sourceUrl: String) {
@@ -569,6 +711,7 @@ class MainActivity : android.app.Activity() {
             setPadding(0, 0, 0, dp(8))
         }, matchWrap())
         root.addView(actionButton("العودة إلى الرئيسية", false) { showHome() }, matchWrap(dp(10)))
+        root.addView(actionButton("تنزيل النتيجة كملف PDF", true) { exportResultsAsPdf() }, matchWrap(dp(8)))
         root.addView(actionButton("إعادة تطبيق الخط والحجم المختار على هذه الترجمة", true) {
             val service = MangaFoxAccessibilityService.instance
             if (MangaFoxRuntime.sourcePages.isEmpty()) {
@@ -602,13 +745,17 @@ class MainActivity : android.app.Activity() {
                 val image = ZoomableImageView(this).apply {
                     setImageFile(filePath)
                     contentDescription = "الجزء المترجم ${index + 1} — كبّر بإصبعين"
-                    setBackgroundColor(Color.WHITE)
+                    setBackgroundColor(dark)
                 }
                 val displayWidth = resources.displayMetrics.widthPixels - dp(24)
-                val displayHeight = (sourceHeight * (displayWidth.toFloat() / sourceWidth)).toInt().coerceAtLeast(dp(180))
+                val displayHeight = (sourceHeight * (displayWidth.toFloat() / sourceWidth)).toInt().coerceAtLeast(1)
                 root.addView(image, LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, displayHeight
-                ).apply { bottomMargin = dp(4) })
+                ).apply {
+                    // Every captured strip begins exactly where the previous one ends.
+                    // A layout margin here creates a visible artificial manga gutter.
+                    bottomMargin = 0
+                })
                 pageViews.add(image)
             }
             scroll.setOnScrollChangeListener { _, _, _, _, _ -> updateVisiblePageImages(pageViews) }
@@ -1012,7 +1159,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             unchangedFrameCount = 0
             val overlapSmall = if (previous == null) 0 else findVerticalOverlap(previous, comparisonFrame)
             val overlapPx = if (overlapSmall <= 0) 0 else
-                ((overlapSmall.toFloat() / comparisonFrame.height) * bitmap.height).toInt().coerceIn(0, bitmap.height - 1)
+                ((overlapSmall.toFloat() / comparisonFrame.height) * bitmap.height).roundToInt().coerceIn(0, bitmap.height - 1)
             try {
                 capturedSegments.add(storeCaptureSegment(bitmap, overlapPx))
             } catch (e: Exception) {
@@ -1161,57 +1308,53 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private fun findVerticalOverlap(previous: Bitmap, current: Bitmap): Int {
         if (previous.width != current.width || previous.height != current.height) return 0
         val h = previous.height
-        // A shorter swipe intentionally creates a large shared band. Searching
-        // only plausible overlap values reduces false matches on repeated panels.
-        val minOverlap = (h * 0.18f).toInt().coerceAtLeast(28)
-        val maxOverlap = (h * 0.70f).toInt().coerceAtMost(h - 32)
+        // A 45% swipe normally leaves about 55% overlap; the wider range allows
+        // for momentum and readers that clamp or accelerate scroll gestures.
+        val minOverlap = (h * 0.24f).toInt().coerceAtLeast(24)
+        val maxOverlap = (h * 0.78f).toInt().coerceAtMost(h - 24)
         if (maxOverlap <= minOverlap) return 0
 
-        val candidateStep = 2
-        val sampleRows = 64
-        val sampleColumns = 32
-        var bestOverlap = 0
-        var bestScore = Double.MAX_VALUE
-        var secondBestScore = Double.MAX_VALUE
-        var secondBestOverlap = 0
-        var overlap = minOverlap
-        while (overlap <= maxOverlap) {
+        val sampleRows = 80
+        val sampleColumns = 48
+        val xPositions = IntArray(sampleColumns) { column ->
+            ((column + 0.5f) * previous.width / sampleColumns).toInt()
+                .coerceIn(0, previous.width - 1)
+        }
+        val candidates = ArrayList<Pair<Int, Double>>(maxOverlap - minOverlap + 1)
+
+        for (overlap in minOverlap..maxOverlap) {
             var total = 0L
             var samples = 0
             for (row in 0 until sampleRows) {
                 val offset = ((row + 0.5f) * overlap / sampleRows).toInt()
-                val py = (h - overlap + offset).coerceIn(0, h - 1)
-                val cy = offset.coerceIn(0, h - 1)
-                for (column in 0 until sampleColumns) {
-                    val x = ((column + 0.5f) * previous.width / sampleColumns).toInt().coerceIn(0, previous.width - 1)
-                    val a = previous.getPixel(x, py)
-                    val b = current.getPixel(x, cy)
-                    // Grayscale comparison is less sensitive to minor display color shifts.
-                    val ga = (Color.red(a) * 3 + Color.green(a) * 6 + Color.blue(a)) / 10
-                    val gb = (Color.red(b) * 3 + Color.green(b) * 6 + Color.blue(b)) / 10
-                    total += abs(ga - gb)
-                    samples++
+                val previousY = (h - overlap + offset).coerceIn(0, h - 1)
+                val currentY = offset.coerceIn(0, h - 1)
+                for (x in xPositions) {
+                    val a = previous.getPixel(x, previousY)
+                    val b = current.getPixel(x, currentY)
+                    val dr = abs(Color.red(a) - Color.red(b))
+                    val dg = abs(Color.green(a) - Color.green(b))
+                    val db = abs(Color.blue(a) - Color.blue(b))
+                    val grayA = (Color.red(a) * 3 + Color.green(a) * 6 + Color.blue(a)) / 10
+                    val grayB = (Color.red(b) * 3 + Color.green(b) * 6 + Color.blue(b)) / 10
+                    total += dr + dg + db + abs(grayA - grayB)
+                    samples += 4
                 }
             }
-            val score = total.toDouble() / samples.coerceAtLeast(1)
-            if (score < bestScore) {
-                secondBestScore = bestScore
-                secondBestOverlap = bestOverlap
-                bestScore = score
-                bestOverlap = overlap
-            } else if (abs(overlap - bestOverlap) > 24 && score < secondBestScore) {
-                secondBestScore = score
-                secondBestOverlap = overlap
-            }
-            overlap += candidateStep
+            candidates.add(overlap to (total.toDouble() / samples.coerceAtLeast(1)))
         }
 
-        // Reject ambiguous matches rather than cutting away unique artwork.
-        if (bestOverlap == 0 || bestScore > 24.0) return 0
-        if (secondBestOverlap > 0 && secondBestScore - bestScore < 3.0) return 0
-        // Keep a generous safety strip: a few repeated pixels are preferable to
-        // losing even one row of new artwork.
-        return (bestOverlap - max(24, (h * 0.018f).toInt())).coerceAtLeast(0)
+        val sorted = candidates.sortedBy { it.second }
+        val best = sorted.firstOrNull() ?: return 0
+        // Ignore nearby candidates when judging confidence: they are simply the
+        // shoulders of the same match. Compare against a genuinely different offset.
+        val secondDistinct = sorted.firstOrNull { abs(it.first - best.first) >= 12 }
+        if (best.second > 18.0) return 0
+        if (secondDistinct != null && secondDistinct.second - best.second < 1.2) return 0
+
+        // Cut the measured overlap exactly. V2.3 left 24px / ~1.8% uncut on
+        // purpose, which produced a visible repeated strip at every join.
+        return best.first.coerceIn(0, h - 1)
     }
 
     private fun cropContent(source: Bitmap, overlapTopPx: Int): Bitmap {
