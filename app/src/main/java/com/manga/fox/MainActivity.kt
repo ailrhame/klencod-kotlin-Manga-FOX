@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.Manifest
 import android.app.Notification
+import android.app.AlertDialog
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -39,6 +40,7 @@ import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.widget.Button
+import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -85,6 +87,11 @@ private const val REQUEST_PICK_FONT = 713
 private const val REQUEST_SAVE_PDF = 714
 private const val PREF_LENS_SIZE = "lens_size_dp"
 private const val PREF_LENS_ALPHA = "lens_alpha"
+private const val PREF_LENS_COUNT = "lens_count"
+private const val PREF_LENS_GLYPH = "lens_custom_glyph"
+private const val PREF_LENS_COLOR = "lens_custom_color"
+private const val PREF_ALLOWED_APPS = "lens_allowed_packages"
+private const val PREF_LAST_FOREGROUND_APP = "lens_last_foreground_app"
 private const val MAX_CAPTURE_FRAMES = 120
 
 object MangaFoxRuntime {
@@ -330,7 +337,7 @@ class MainActivity : android.app.Activity() {
         settingsCard.addView(previewPanel, matchWrap(dp(10)))
 
         addSettingSlider(
-            settingsCard, "حجم الخط العربي", 10, 40,
+            settingsCard, "حجم الخط العربي", 10, 72,
             preferences.getInt(PREF_FONT_SIZE, 22), " sp"
         ) { value ->
             preferences.edit().putInt(PREF_FONT_SIZE, value).apply()
@@ -397,6 +404,15 @@ class MainActivity : android.app.Activity() {
                 "https://cdn.jsdelivr.net/gh/notofonts/notofonts.github.io/fonts/NotoSansArabic/unhinted/ttf/NotoSansArabic-Regular.ttf"
             )
         }, matchWrap(dp(4)))
+        settingsCard.addView(actionButton("تنزيل Amiri · أميري كلاسيكي", false) {
+            downloadArabicFont("Amiri", "Amiri-Regular.ttf", "https://raw.githubusercontent.com/google/fonts/main/ofl/amiri/Amiri%5Bwght%5D.ttf")
+        }, matchWrap(dp(4)))
+        settingsCard.addView(actionButton("تنزيل Tajawal · تجوال", false) {
+            downloadArabicFont("Tajawal", "Tajawal-Regular.ttf", "https://raw.githubusercontent.com/google/fonts/main/ofl/tajawal/Tajawal%5Bwght%5D.ttf")
+        }, matchWrap(dp(4)))
+        settingsCard.addView(actionButton("تنزيل Reem Kufi · ريم كوفي", false) {
+            downloadArabicFont("Reem Kufi", "ReemKufi-Regular.ttf", "https://raw.githubusercontent.com/google/fonts/main/ofl/reemkufi/ReemKufi%5Bwght%5D.ttf")
+        }, matchWrap(dp(4)))
         settingsCard.addView(actionButton("استيراد خط من الهاتف · TTF / OTF / TTC", true) {
             pickFontFromDevice()
         }, matchWrap(dp(4)))
@@ -421,14 +437,108 @@ class MainActivity : android.app.Activity() {
             preferences.edit().putInt(PREF_LENS_ALPHA, value).apply()
             MangaFoxAccessibilityService.instance?.applyLensSettings()
         }
+        addSettingSlider(
+            settingsCard, "عدد العدسات العائمة", 1, 3,
+            preferences.getInt(PREF_LENS_COUNT, 3), " عدسات"
+        ) { value ->
+            preferences.edit().putInt(PREF_LENS_COUNT, value).apply()
+            MangaFoxAccessibilityService.instance?.rebuildFloatingLenses()
+        }
+        settingsCard.addView(actionButton("استوديو تصميم العدسة", true) {
+            openLensStudio()
+        }, matchWrap(dp(4)))
+        settingsCard.addView(text("ظهور العدسة على التطبيقات المحددة فقط", 14f, gold, true).apply {
+            setPadding(0, dp(12), 0, dp(3))
+        }, matchWrap())
+        settingsCard.addView(text("افتح تطبيق القراءة أولاً ثم ارجع إلى Manga Fox واضغط إضافة آخر تطبيق تمت زيارته. يمكنك تحديد عدة تطبيقات.", 11f, Color.LTGRAY), matchWrap())
+        settingsCard.addView(actionButton("إضافة آخر تطبيق تمت زيارته", false) {
+            val pkg = MangaFoxAccessibilityService.instance?.lastDetectedPackage
+                ?: preferences.getString(PREF_LAST_FOREGROUND_APP, null)
+            if (pkg.isNullOrBlank() || pkg == packageName) {
+                toast("افتح تطبيق القراءة ثم ارجع إلى هنا")
+            } else {
+                val allowed = preferences.getStringSet(PREF_ALLOWED_APPS, emptySet())?.toMutableSet() ?: mutableSetOf()
+                allowed.add(pkg)
+                preferences.edit().putStringSet(PREF_ALLOWED_APPS, allowed).apply()
+                MangaFoxAccessibilityService.instance?.refreshLensAppFilter()
+                toast("تم السماح للعدسة بالظهور في: $pkg")
+            }
+        }, matchWrap(dp(4)))
+        settingsCard.addView(actionButton("إدارة التطبيقات المسموح بها", false) {
+            showAllowedAppsDialog()
+        }, matchWrap(dp(4)))
         updateFontPreview()
         root.addView(settingsCard, matchWrap(dp(16)))
+    }
+
+    private fun openLensStudio() {
+        val input = EditText(this).apply {
+            setSingleLine(true)
+            hint = "رمز العدسة مثل 狐 أو ◉ أو ✦"
+            setText(preferences.getString(PREF_LENS_GLYPH, "狐"))
+        }
+        val colors = arrayOf("ذهبي", "بنفسجي", "سماوي", "وردي", "أبيض")
+        val values = intArrayOf(Color.rgb(255, 190, 65), Color.rgb(177, 107, 255), Color.rgb(90, 190, 255), Color.rgb(255, 107, 176), Color.WHITE)
+        var selected = values.indices.minByOrNull { index -> kotlin.math.abs(values[index] - preferences.getInt(PREF_LENS_COLOR, values[0])) } ?: 0
+        val colorButton = Button(this).apply {
+            isAllCaps = false
+            text = "لون العدسة: ${colors[selected]} · تغيير"
+            setOnClickListener {
+                selected = (selected + 1) % colors.size
+                text = "لون العدسة: ${colors[selected]} · تغيير"
+                background = rounded(values[selected], 12)
+                setTextColor(if (selected == 4) Color.BLACK else Color.WHITE)
+            }
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+            addView(input, matchWrap(dp(8)))
+            addView(colorButton, matchWrap())
+        }
+        colorButton.background = rounded(values[selected], 12)
+        colorButton.setTextColor(if (selected == 4) Color.BLACK else Color.WHITE)
+        AlertDialog.Builder(this)
+            .setTitle("استوديو تصميم العدسة")
+            .setMessage("اختر رمزاً ولوناً مخصصاً للعدسة الأساسية.")
+            .setView(content)
+            .setNegativeButton("إلغاء", null)
+            .setPositiveButton("حفظ التصميم") { _, _ ->
+                val glyph = input.text.toString().trim().take(3).ifBlank { "狐" }
+                preferences.edit().putString(PREF_LENS_GLYPH, glyph).putInt(PREF_LENS_COLOR, values[selected]).apply()
+                MangaFoxAccessibilityService.instance?.rebuildFloatingLenses()
+                toast("تم حفظ تصميم العدسة")
+            }.show()
+    }
+
+    private fun showAllowedAppsDialog() {
+        val saved = preferences.getStringSet(PREF_ALLOWED_APPS, emptySet())?.toMutableSet() ?: mutableSetOf()
+        if (saved.isEmpty()) {
+            AlertDialog.Builder(this).setTitle("التطبيقات المسموح بها")
+                .setMessage("لم تحدد تطبيقات بعد. افتح تطبيق المانجا ثم ارجع إلى Manga Fox واضغط إضافة آخر تطبيق تمت زيارته.")
+                .setPositiveButton("حسناً", null).show()
+            return
+        }
+        val packages = saved.toList()
+        val labels = packages.map { pkg ->
+            val label = runCatching { packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString() }.getOrDefault(pkg)
+            "$label\n$pkg"
+        }.toTypedArray()
+        val checked = BooleanArray(packages.size) { true }
+        AlertDialog.Builder(this).setTitle("اختر التطبيقات التي تظهر فيها العدسة")
+            .setMultiChoiceItems(labels, checked) { _, which, isChecked -> if (isChecked) saved.add(packages[which]) else saved.remove(packages[which]) }
+            .setNegativeButton("إلغاء", null)
+            .setPositiveButton("حفظ") { _, _ ->
+                preferences.edit().putStringSet(PREF_ALLOWED_APPS, saved).apply()
+                MangaFoxAccessibilityService.instance?.refreshLensAppFilter()
+                toast("تم تحديث التطبيقات المسموح بها")
+            }.show()
     }
 
     private fun updateFontPreview() {
         val preview = fontPreview ?: return
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        val size = prefs.getInt(PREF_FONT_SIZE, 22).coerceIn(10, 40)
+        val size = prefs.getInt(PREF_FONT_SIZE, 22).coerceIn(10, 72)
         preview.textSize = size.toFloat()
         preview.typeface = resolveArabicTypeface(prefs)
         preview.paint.style = Paint.Style.FILL_AND_STROKE
@@ -978,6 +1088,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private lateinit var windowManager: WindowManager
     private var bubble: TextView? = null
     private var bubbleParams: WindowManager.LayoutParams? = null
+    private val auxiliaryLenses = mutableListOf<Pair<TextView, WindowManager.LayoutParams>>()
+    @Volatile var lastDetectedPackage: String? = null
+        private set
+    @Volatile private var currentForegroundPackage: String? = null
     private var captureRunning = false
     private var fullChapterMode = false
     private var captureCount = 0
@@ -1007,13 +1121,22 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         instance = this
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         MangaFoxRuntime.status = "خدمة العدسة متصلة"
-        showFloatingBubble()
+        refreshLensAppFilter()
         // If Android/OEM stopped the service during a chapter capture, keep the
         // JPEG segments and recover them when the accessibility service returns.
         mainHandler.postDelayed({ recoverInterruptedCapture() }, 900L)
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        val pkg = event.packageName?.toString()?.takeIf { it.isNotBlank() } ?: return
+        currentForegroundPackage = pkg
+        if (pkg != packageName) {
+            lastDetectedPackage = pkg
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(PREF_LAST_FOREGROUND_APP, pkg).apply()
+        }
+        refreshLensAppFilter()
+    }
     override fun onInterrupt() = Unit
 
     override fun onDestroy() {
@@ -1697,7 +1820,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val horizontalPadding = max(4, rect.width() / 20)
         val maxWidth = (rect.width() - horizontalPadding * 2).coerceAtLeast(12)
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        val preferredSp = prefs.getInt(PREF_FONT_SIZE, 22).coerceIn(10, 40)
+        val preferredSp = prefs.getInt(PREF_FONT_SIZE, 22).coerceIn(10, 72)
         val preferredPx = preferredSp * resources.displayMetrics.density
         var size = min((rect.height() * 0.88f).coerceAtLeast(10f), preferredPx)
         size = size.coerceIn(10f, 64f)
@@ -1757,16 +1880,21 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             }
             val params = bubbleParams
             if (bubbleWasAdded && params != null) runCatching { windowManager.updateViewLayout(view, params) }
+            auxiliaryLenses.forEach { (extra, _) ->
+                if (translationRunning) extra.text = "${current.coerceIn(0, 99)}%"
+            }
         }
     }
 
     private fun resetLensProgress() {
         mainHandler.post {
             bubble?.apply {
-                text = "狐"
-                textSize = ((getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getInt(PREF_LENS_SIZE, 58)) * 0.40f).coerceIn(18f, 38f)
+                val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                text = prefs.getString(PREF_LENS_GLYPH, "狐") ?: "狐"
+                textSize = (prefs.getInt(PREF_LENS_SIZE, 58) * 0.40f).coerceIn(18f, 38f)
                 contentDescription = "Manga Fox Translator. اضغط لترجمة الجزء، واضغط مطولاً لترجمة الفصل"
             }
+            auxiliaryLenses.forEachIndexed { index, pair -> pair.first.text = if (index == 0) "◉" else "∞" }
         }
     }
 
@@ -1779,11 +1907,51 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         params.height = dp(size)
         view.textSize = (size * 0.40f).coerceIn(18f, 38f)
         view.alpha = prefs.getInt(PREF_LENS_ALPHA, 100).coerceIn(35, 100) / 100f
+        view.text = prefs.getString(PREF_LENS_GLYPH, "狐") ?: "狐"
+        view.background = lensBackground(prefs.getInt(PREF_LENS_COLOR, Color.rgb(255, 190, 65)))
         if (bubbleWasAdded) runCatching { windowManager.updateViewLayout(view, params) }
+        auxiliaryLenses.forEach { (extra, extraParams) ->
+            extraParams.width = dp((size * 0.78f).roundToInt())
+            extraParams.height = dp((size * 0.78f).roundToInt())
+            extra.textSize = (size * 0.30f).coerceIn(15f, 30f)
+            extra.alpha = view.alpha
+            runCatching { windowManager.updateViewLayout(extra, extraParams) }
+        }
+    }
+
+    private fun lensBackground(color: Int): GradientDrawable = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(color)
+        setStroke(dp(2), Color.WHITE)
+    }
+
+    fun refreshLensAppFilter() {
+        if (!this::windowManager.isInitialized) return
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val allowed = prefs.getStringSet(PREF_ALLOWED_APPS, emptySet()) ?: emptySet()
+        val foreground = currentForegroundPackage
+        val shouldShow = !foreground.isNullOrBlank() && foreground != packageName && allowed.contains(foreground)
+        if (shouldShow) {
+            if (bubble == null) showFloatingBubble() else if (!bubbleWasAdded) restoreFloatingBubble()
+            auxiliaryLenses.forEach { (v, lp) -> if (v.parent == null) runCatching { windowManager.addView(v, lp) } }
+        } else {
+            removeFloatingBubble()
+            auxiliaryLenses.forEach { (v, _) -> runCatching { windowManager.removeView(v) } }
+        }
+    }
+
+    fun rebuildFloatingLenses() {
+        if (!this::windowManager.isInitialized) return
+        removeFloatingBubble()
+        auxiliaryLenses.clear()
+        bubble = null
+        bubbleParams = null
+        bubbleWasAdded = false
+        refreshLensAppFilter()
     }
 
     fun ensureFloatingBubble() {
-        if (Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)) showFloatingBubble()
+        if (Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)) refreshLensAppFilter()
     }
 
     private fun showFloatingBubble() {
@@ -1793,16 +1961,12 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val lensSize = lensPrefs.getInt(PREF_LENS_SIZE, 58).coerceIn(42, 96)
         val lensAlpha = lensPrefs.getInt(PREF_LENS_ALPHA, 100).coerceIn(35, 100) / 100f
         val view = TextView(this).apply {
-            text = "狐"
+            text = lensPrefs.getString(PREF_LENS_GLYPH, "狐") ?: "狐"
             textSize = (lensSize * 0.40f).coerceIn(18f, 38f)
             typeface = Typeface.create("sans-serif-black", Typeface.BOLD)
             setTextColor(Color.BLACK)
             gravity = Gravity.CENTER
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.rgb(255, 190, 65))
-                setStroke(dp(2), Color.WHITE)
-            }
+            background = lensBackground(lensPrefs.getInt(PREF_LENS_COLOR, Color.rgb(255, 190, 65)))
             elevation = dp(8).toFloat()
             alpha = lensAlpha
             contentDescription = "Manga Fox Translator. اضغط لترجمة الجزء، واضغط مطولاً لترجمة الفصل"
@@ -1871,12 +2035,48 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             bubbleParams = null
             bubbleWasAdded = false
         }
+        if (bubbleWasAdded) createAuxiliaryLenses(lensPrefs, params)
+    }
+
+    private fun createAuxiliaryLenses(prefs: SharedPreferences, mainParams: WindowManager.LayoutParams) {
+        auxiliaryLenses.forEach { (v, _) -> runCatching { windowManager.removeView(v) } }
+        auxiliaryLenses.clear()
+        val count = prefs.getInt(PREF_LENS_COUNT, 3).coerceIn(1, 3)
+        if (count <= 1) return
+        val size = prefs.getInt(PREF_LENS_SIZE, 58).coerceIn(42, 96)
+        val alpha = prefs.getInt(PREF_LENS_ALPHA, 100).coerceIn(35, 100) / 100f
+        val definitions = listOf("◉" to { startSingleCapture() }, "∞" to { startFullChapterCapture() })
+        definitions.take(count - 1).forEachIndexed { index, pair ->
+            val extra = TextView(this).apply {
+                text = pair.first
+                textSize = (size * 0.30f).coerceIn(15f, 30f)
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                setTextColor(Color.BLACK)
+                background = lensBackground(if (index == 0) Color.rgb(95, 205, 255) else Color.rgb(190, 135, 255))
+                alpha = alpha
+                contentDescription = if (index == 0) "التقاط صورة واحدة" else "التقاط الفصل كاملاً"
+                setOnClickListener { pair.second.invoke() }
+            }
+            val extraParams = WindowManager.LayoutParams(
+                dp((size * 0.78f).roundToInt()), dp((size * 0.78f).roundToInt()),
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                x = mainParams.x + dp(size + 8)
+                y = mainParams.y + dp(index * (size + 8))
+            }
+            runCatching { windowManager.addView(extra, extraParams) }.onSuccess { auxiliaryLenses.add(extra to extraParams) }
+        }
     }
 
     private fun removeFloatingBubble() {
-        val view = bubble ?: return
-        if (bubbleWasAdded) runCatching { windowManager.removeView(view) }
+        val view = bubble
+        if (view != null && bubbleWasAdded) runCatching { windowManager.removeView(view) }
         bubbleWasAdded = false
+        auxiliaryLenses.forEach { (extra, _) -> runCatching { windowManager.removeView(extra) } }
     }
 
     private fun restoreFloatingBubble() {
