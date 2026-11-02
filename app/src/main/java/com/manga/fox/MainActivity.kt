@@ -91,6 +91,7 @@ private const val PREF_LENS_ALPHA = "lens_alpha"
 private const val PREF_LENS_GLYPH = "lens_custom_glyph"
 private const val PREF_LENS_COLOR = "lens_custom_color"
 private const val PREF_LENS_ENABLED = "lens_enabled"
+private const val PREF_SOURCE_LANGUAGE = "translation_source_language"
 private const val MAX_CAPTURE_FRAMES = 120
 
 object MangaFoxRuntime {
@@ -146,7 +147,12 @@ class MainActivity : android.app.Activity() {
     override fun onResume() {
         super.onResume()
         if (::statusText.isInitialized) refreshStatus()
-        MangaFoxAccessibilityService.instance?.ensureFloatingBubble()
+        MangaFoxAccessibilityService.instance?.onHostActivityResumed()
+    }
+
+    override fun onPause() {
+        MangaFoxAccessibilityService.instance?.onHostActivityPaused()
+        super.onPause()
     }
 
     private fun applySystemBars() {
@@ -404,10 +410,10 @@ class MainActivity : android.app.Activity() {
             )
         }, matchWrap(dp(4)))
         settingsCard.addView(actionButton("تنزيل Amiri · أميري كلاسيكي", false) {
-            downloadArabicFont("Amiri", "Amiri-Regular.ttf", "https://raw.githubusercontent.com/google/fonts/main/ofl/amiri/Amiri%5Bwght%5D.ttf")
+            downloadArabicFont("Amiri", "Amiri-Regular.ttf", "https://raw.githubusercontent.com/google/fonts/main/ofl/amiri/Amiri-Regular.ttf")
         }, matchWrap(dp(4)))
         settingsCard.addView(actionButton("تنزيل Tajawal · تجوال", false) {
-            downloadArabicFont("Tajawal", "Tajawal-Regular.ttf", "https://raw.githubusercontent.com/google/fonts/main/ofl/tajawal/Tajawal%5Bwght%5D.ttf")
+            downloadArabicFont("Tajawal", "Tajawal-Regular.ttf", "https://raw.githubusercontent.com/google/fonts/main/ofl/tajawal/Tajawal-Regular.ttf")
         }, matchWrap(dp(4)))
         settingsCard.addView(actionButton("تنزيل Reem Kufi · ريم كوفي", false) {
             downloadArabicFont("Reem Kufi", "ReemKufi-Regular.ttf", "https://raw.githubusercontent.com/google/fonts/main/ofl/reemkufi/ReemKufi%5Bwght%5D.ttf")
@@ -421,6 +427,32 @@ class MainActivity : android.app.Activity() {
         )
         fontStatusText = fontStatus
         settingsCard.addView(fontStatus, matchWrap())
+
+        settingsCard.addView(text("لغة النص الأصلي", 14f, gold, true).apply {
+            setPadding(0, dp(12), 0, dp(3))
+        }, matchWrap())
+        settingsCard.addView(text("الوضع التلقائي يحاول اكتشاف اللغة. عند الترجمة غير الدقيقة اختر لغة المانجا يدوياً.", 11f, Color.LTGRAY), matchWrap())
+        val sourceLanguages = listOf(
+            "auto" to "تلقائي",
+            "ja" to "اليابانية · مانجا",
+            "en" to "الإنجليزية",
+            "ko" to "الكورية · مانهوا",
+            "zh" to "الصينية · مانها"
+        )
+        fun sourceLanguageLabel(code: String): String = sourceLanguages.firstOrNull { it.first == code }?.second ?: "تلقائي"
+        val sourceLanguageButton = actionButton(
+            "لغة الترجمة: ${sourceLanguageLabel(preferences.getString(PREF_SOURCE_LANGUAGE, "auto") ?: "auto")} · تغيير",
+            false
+        ) { }
+        sourceLanguageButton.setOnClickListener {
+            val current = preferences.getString(PREF_SOURCE_LANGUAGE, "auto") ?: "auto"
+            val index = sourceLanguages.indexOfFirst { it.first == current }.let { if (it < 0) 0 else it }
+            val next = sourceLanguages[(index + 1) % sourceLanguages.size].first
+            preferences.edit().putString(PREF_SOURCE_LANGUAGE, next).apply()
+            sourceLanguageButton.text = "لغة الترجمة: ${sourceLanguageLabel(next)} · تغيير"
+            toast("تم ضبط لغة النص: ${sourceLanguageLabel(next)}")
+        }
+        settingsCard.addView(sourceLanguageButton, matchWrap(dp(4)))
 
         addSettingSlider(
             settingsCard, "حجم العدسة العائمة", 42, 96,
@@ -439,6 +471,9 @@ class MainActivity : android.app.Activity() {
         settingsCard.addView(text("العدسة العائمة", 14f, gold, true).apply {
             setPadding(0, dp(12), 0, dp(3))
         }, matchWrap())
+        settingsCard.addView(actionButton("فتح استوديو تصميم العدسة", true) {
+            openLensStudio()
+        }, matchWrap(dp(4)))
         settingsCard.addView(text("فعّل العدسة لتظهر فوق التطبيقات الأخرى، أو أوقفها من هنا متى شئت. تختفي العدسة تلقائياً عند فتح Manga FOX.", 11f, Color.LTGRAY), matchWrap())
         val lensSwitch = Switch(this).apply {
             text = "إظهار العدسة العائمة"
@@ -457,14 +492,37 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun openLensStudio() {
+        val colors = arrayOf("ذهبي", "بنفسجي", "سماوي", "وردي", "أبيض")
+        val values = intArrayOf(
+            Color.rgb(255, 190, 65), Color.rgb(177, 107, 255),
+            Color.rgb(90, 190, 255), Color.rgb(255, 107, 176), Color.WHITE
+        )
+        var selected = values.indices.minByOrNull { index ->
+            kotlin.math.abs(values[index] - preferences.getInt(PREF_LENS_COLOR, values[0]))
+        } ?: 0
         val input = EditText(this).apply {
             setSingleLine(true)
             hint = "رمز العدسة مثل 狐 أو ◉ أو ✦"
             setText(preferences.getString(PREF_LENS_GLYPH, "狐"))
+            textSize = 20f
+            gravity = Gravity.CENTER
         }
-        val colors = arrayOf("ذهبي", "بنفسجي", "سماوي", "وردي", "أبيض")
-        val values = intArrayOf(Color.rgb(255, 190, 65), Color.rgb(177, 107, 255), Color.rgb(90, 190, 255), Color.rgb(255, 107, 176), Color.WHITE)
-        var selected = values.indices.minByOrNull { index -> kotlin.math.abs(values[index] - preferences.getInt(PREF_LENS_COLOR, values[0])) } ?: 0
+        val preview = TextView(this).apply {
+            text = input.text.toString().ifBlank { "狐" }
+            textSize = 34f
+            gravity = Gravity.CENTER
+            setTextColor(Color.BLACK)
+            background = rounded(values[selected], 48)
+            setPadding(dp(18), dp(12), dp(18), dp(12))
+            elevation = dp(5).toFloat()
+        }
+        input.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                preview.text = s?.toString()?.trim()?.take(3).orEmpty().ifBlank { "狐" }
+            }
+            override fun afterTextChanged(s: android.text.Editable?) = Unit
+        })
         val colorButton = Button(this).apply {
             isAllCaps = false
             text = "لون العدسة: ${colors[selected]} · تغيير"
@@ -473,26 +531,33 @@ class MainActivity : android.app.Activity() {
                 text = "لون العدسة: ${colors[selected]} · تغيير"
                 background = rounded(values[selected], 12)
                 setTextColor(if (selected == 4) Color.BLACK else Color.WHITE)
+                preview.background = rounded(values[selected], 48)
             }
-        }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(8), dp(20), dp(8))
-            addView(input, matchWrap(dp(8)))
-            addView(colorButton, matchWrap())
         }
         colorButton.background = rounded(values[selected], 12)
         colorButton.setTextColor(if (selected == 4) Color.BLACK else Color.WHITE)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+            addView(preview, LinearLayout.LayoutParams(dp(92), dp(92)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                bottomMargin = dp(12)
+            })
+            addView(input, matchWrap(dp(8)))
+            addView(colorButton, matchWrap(dp(8)))
+        }
         AlertDialog.Builder(this)
             .setTitle("استوديو تصميم العدسة")
-            .setMessage("اختر رمزاً ولوناً مخصصاً للعدسة الأساسية.")
+            .setMessage("خصص الرمز واللون وشاهد معاينة مباشرة قبل الحفظ.")
             .setView(content)
             .setNegativeButton("إلغاء", null)
             .setPositiveButton("حفظ التصميم") { _, _ ->
                 val glyph = input.text.toString().trim().take(3).ifBlank { "狐" }
-                preferences.edit().putString(PREF_LENS_GLYPH, glyph).putInt(PREF_LENS_COLOR, values[selected]).apply()
-                MangaFoxAccessibilityService.instance?.rebuildFloatingLenses()
-                toast("تم حفظ تصميم العدسة")
+                preferences.edit().putString(PREF_LENS_GLYPH, glyph)
+                    .putInt(PREF_LENS_COLOR, values[selected]).apply()
+                MangaFoxAccessibilityService.instance?.applyLensSettings()
+                toast("تم حفظ تصميم العدسة وتطبيقه")
             }.show()
     }
 
@@ -729,8 +794,10 @@ class MainActivity : android.app.Activity() {
                 } finally {
                     connection.disconnect()
                 }
+                if (!temp.isFile || temp.length() < 4096L) throw IllegalStateException("ملف الخط غير مكتمل أو ليس ملف خط صالحاً")
+                // Parsing the actual font before activation prevents corrupt or HTML error pages being selected.
                 Typeface.createFromFile(temp)
-                if (target.exists()) target.delete()
+                if (target.exists() && !target.delete()) throw IllegalStateException("تعذر استبدال ملف الخط السابق")
                 if (!temp.renameTo(target)) throw IllegalStateException("تعذر حفظ الخط")
                 runOnUiThread {
                     preferences.edit().putString(PREF_FONT_FILE, target.absolutePath)
@@ -1079,17 +1146,46 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         instance = this
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         MangaFoxRuntime.status = "خدمة العدسة متصلة"
+        syncForegroundPackage()
+        // Some Android skins deliver the first window event late; retry the initial
+        // foreground lookup briefly instead of leaving the lens hidden indefinitely.
+        mainHandler.postDelayed({ syncForegroundPackage() }, 350L)
+        mainHandler.postDelayed({ syncForegroundPackage() }, 1100L)
+        mainHandler.postDelayed({ syncForegroundPackage() }, 2200L)
         refreshLensAppFilter()
-        // If Android/OEM stopped the service during a chapter capture, keep the
-        // JPEG segments and recover them when the accessibility service returns.
         mainHandler.postDelayed({ recoverInterruptedCapture() }, 900L)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
-        val pkg = event.packageName?.toString()?.takeIf { it.isNotBlank() } ?: return
-        currentForegroundPackage = pkg
+        if (event == null) return
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            event.eventType != AccessibilityEvent.TYPE_WINDOWS_CHANGED &&
+            event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) return
+        val pkg = event.packageName?.toString()?.takeIf { it.isNotBlank() }
+        if (pkg != null && pkg != currentForegroundPackage) {
+            currentForegroundPackage = pkg
+            refreshLensAppFilter()
+        }
+    }
+
+    private fun syncForegroundPackage() {
+        val activePackage = runCatching { rootInActiveWindow?.packageName?.toString() }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+        if (activePackage != null && activePackage != currentForegroundPackage) {
+            currentForegroundPackage = activePackage
+            refreshLensAppFilter()
+        }
+    }
+
+    fun onHostActivityResumed() {
+        currentForegroundPackage = packageName
         refreshLensAppFilter()
+    }
+
+    fun onHostActivityPaused() {
+        mainHandler.postDelayed({ syncForegroundPackage() }, 350L)
+        mainHandler.postDelayed({ syncForegroundPackage() }, 900L)
+        mainHandler.postDelayed({ syncForegroundPackage() }, 1600L)
     }
     override fun onInterrupt() = Unit
 
@@ -1452,7 +1548,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val file = File(filesDir, "mfox_capture_${System.currentTimeMillis()}_${captureCount}_${capturedSegments.size}.jpg")
         try {
             FileOutputStream(file).use { stream ->
-                if (!segment.compress(Bitmap.CompressFormat.JPEG, 91, stream)) {
+                if (!segment.compress(Bitmap.CompressFormat.JPEG, 96, stream)) {
                     throw IllegalStateException("تعذر ضغط صورة الالتقاط")
                 }
             }
@@ -1573,7 +1669,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                             translated = outputBitmap
                             val outputFile = File(cacheDir, "mfox_result_${System.currentTimeMillis()}_$index.jpg")
                             FileOutputStream(outputFile).use { stream ->
-                                if (!outputBitmap.compress(Bitmap.CompressFormat.JPEG, 92, stream)) {
+                                if (!outputBitmap.compress(Bitmap.CompressFormat.JPEG, 96, stream)) {
                                     throw IllegalStateException("تعذر حفظ نتيجة المقطع ${index + 1}")
                                 }
                             }
@@ -1645,76 +1741,149 @@ class MangaFoxAccessibilityService : AccessibilityService() {
 
     private data class TranslationLine(val bounds: Rect, val translated: String)
 
+    private fun countChars(text: String, predicate: (Char) -> Boolean): Int = text.count(predicate)
+
+    private fun inferTranslationLanguage(text: String, detectedTag: String, forced: String): String {
+        if (forced in setOf("ja", "en", "ko", "zh")) return forced
+        val hangul = countChars(text) { it in '\uAC00'..'\uD7AF' || it in '\u1100'..'\u11FF' }
+        val kana = countChars(text) { it in '\u3040'..'\u30FF' }
+        val han = countChars(text) { it in '\u4E00'..'\u9FFF' }
+        val arabic = countChars(text) { it in '\u0600'..'\u06FF' }
+        if (hangul >= 2) return "ko"
+        if (kana >= 1) return "ja"
+        if (arabic >= 3) return "ar"
+        val normalized = detectedTag.lowercase().substringBefore('-')
+        if (normalized in setOf("en", "ja", "ko", "zh")) return normalized
+        if (han >= 4) return "zh"
+        return "en"
+    }
+
+    private fun languageForCode(code: String): String = when (code) {
+        "ja" -> TranslateLanguage.JAPANESE
+        "ko" -> TranslateLanguage.KOREAN
+        "zh" -> TranslateLanguage.CHINESE
+        else -> TranslateLanguage.ENGLISH
+    }
+
     private fun translateBitmap(source: Bitmap, onProgress: (Float, String) -> Unit = { _, _ -> }): Bitmap {
         val input = InputImage.fromBitmap(source, 0)
-        onProgress(0.04f, "فحص الصورة")
-        var best: Text? = runCatching { Tasks.await(latinRecognizer.process(input)) }.getOrNull()
-        onProgress(0.18f, "التعرف على النصوص")
-        fun hasEnoughReadableText(result: Text?): Boolean {
-            val value = result?.text.orEmpty()
-            return value.length >= 24 && value.count { it.isLetter() } >= 16
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val forcedLanguage = prefs.getString(PREF_SOURCE_LANGUAGE, "auto") ?: "auto"
+        onProgress(0.03f, "تهيئة التعرف على النص")
+
+        fun runOcr(recognizer: TextRecognizer): Text? = runCatching {
+            Tasks.await(recognizer.process(input))
+        }.getOrNull()
+
+        val best: Text? = when (forcedLanguage) {
+            "ja" -> {
+                onProgress(0.12f, "قراءة النص الياباني")
+                runOcr(japaneseRecognizer)
+            }
+            "ko" -> {
+                onProgress(0.12f, "قراءة النص الكوري")
+                runOcr(koreanRecognizer)
+            }
+            "zh" -> {
+                onProgress(0.12f, "قراءة النص الصيني")
+                runOcr(chineseRecognizer)
+            }
+            "en" -> {
+                onProgress(0.12f, "قراءة النص الإنجليزي")
+                runOcr(latinRecognizer)
+            }
+            else -> {
+                onProgress(0.12f, "فحص النص اللاتيني والياباني")
+                val latin = runOcr(latinRecognizer)
+                onProgress(0.24f, "تحسين قراءة الحروف اليابانية")
+                val japanese = runOcr(japaneseRecognizer)
+                val latinText = latin?.text.orEmpty()
+                val japaneseText = japanese?.text.orEmpty()
+                val kanaCount = countChars(japaneseText) { it in '\u3040'..'\u30FF' }
+                val latinCount = countChars(latinText) { it in 'A'..'Z' || it in 'a'..'z' }
+                val cjkCount = countChars(japaneseText) { it in '\u4E00'..'\u9FFF' }
+                when {
+                    kanaCount >= 1 -> japanese
+                    cjkCount >= 5 && cjkCount > latinCount -> {
+                        onProgress(0.31f, "مطابقة النص الصيني")
+                        val chinese = runOcr(chineseRecognizer)
+                        if ((chinese?.text?.length ?: 0) > japaneseText.length) chinese else japanese
+                    }
+                    latinCount >= 8 -> latin
+                    else -> if (japaneseText.length > latinText.length) japanese else latin
+                }
+            }
         }
-        // Most English pages need only the Latin engine. Create/run the heavier
-        // CJK engines sequentially, and only when the first pass found little text.
-        if (!hasEnoughReadableText(best)) {
-            val candidate = runCatching { Tasks.await(japaneseRecognizer.process(input)) }.getOrNull()
-            if (candidate != null && candidate.text.length > (best?.text?.length ?: 0)) best = candidate
-            onProgress(0.25f, "فحص النص الياباني")
-        }
-        if (!hasEnoughReadableText(best)) {
-            val candidate = runCatching { Tasks.await(koreanRecognizer.process(input)) }.getOrNull()
-            if (candidate != null && candidate.text.length > (best?.text?.length ?: 0)) best = candidate
-            onProgress(0.30f, "فحص النص الكوري")
-        }
-        if (!hasEnoughReadableText(best)) {
-            val candidate = runCatching { Tasks.await(chineseRecognizer.process(input)) }.getOrNull()
-            if (candidate != null && candidate.text.length > (best?.text?.length ?: 0)) best = candidate
-            onProgress(0.34f, "فحص النص الصيني")
-        }
-        val lines = best?.textBlocks?.flatMap { it.lines }?.filter { it.text.isNotBlank() }.orEmpty()
-        if (lines.isEmpty()) {
-            onProgress(1f, "لا يوجد نص قابل للترجمة")
+
+        val blocks = best?.textBlocks.orEmpty()
+        if (blocks.isEmpty()) {
+            onProgress(1f, "لا يوجد نص واضح قابل للترجمة")
             return source.copy(Bitmap.Config.ARGB_8888, true)
                 ?: throw IllegalStateException("تعذر نسخ الصورة للمعالجة")
         }
-        onProgress(0.40f, "اكتشاف لغة النص")
-
-        val joinedText = lines.joinToString(" ") { it.text }.take(2500)
-        val detected = runCatching { Tasks.await(languageIdentifier.identifyLanguage(joinedText)) }.getOrDefault("en")
-        var sourceLanguage = TranslateLanguage.fromLanguageTag(detected)
-        if (sourceLanguage == null || sourceLanguage == TranslateLanguage.ARABIC) {
-            sourceLanguage = TranslateLanguage.ENGLISH
+        val joinedText = blocks.flatMap { it.lines }.joinToString(" ") { it.text }
+            .filter { it.isLetterOrDigit() || it.isWhitespace() }.take(2500)
+        onProgress(0.38f, "تحديد لغة النص")
+        val detected = runCatching {
+            Tasks.await(languageIdentifier.identifyLanguage(joinedText))
+        }.getOrDefault("und")
+        val languageCode = inferTranslationLanguage(joinedText, detected, forcedLanguage)
+        if (languageCode == "ar") {
+            onProgress(1f, "النص المكتشف عربي بالفعل؛ لا يحتاج إلى ترجمة")
+            return source.copy(Bitmap.Config.ARGB_8888, true)
+                ?: throw IllegalStateException("تعذر نسخ الصورة للمعالجة")
         }
-        val options = TranslatorOptions.Builder()
-            .setSourceLanguage(sourceLanguage)
-            .setTargetLanguage(TranslateLanguage.ARABIC)
-            .build()
-        val translator: Translator = Translation.getClient(options)
-        val translatedLines = ArrayList<TranslationLine>()
+        val sourceLanguage = languageForCode(languageCode)
+
+        // Translate each OCR text block as one phrase. Keeping neighboring lines together gives
+        // the translation model context that was lost when every tiny line was translated alone.
+        val translatableBlocks = blocks.mapNotNull { block ->
+            val lines = block.lines.filter { it.text.isNotBlank() && it.boundingBox != null }
+            if (lines.isEmpty()) return@mapNotNull null
+            val phrase = lines.joinToString(" ") { it.text.trim() }.trim()
+            if (phrase.isBlank()) return@mapNotNull null
+            val bounds = block.boundingBox?.let { Rect(it) } ?: Rect(lines.first().boundingBox!!)
+            if (block.boundingBox == null) {
+                lines.drop(1).forEach { line -> line.boundingBox?.let { bounds.union(it) } }
+            }
+            Pair(bounds, phrase)
+        }
+        if (translatableBlocks.isEmpty()) {
+            onProgress(1f, "لا توجد فقاعات نصية محددة")
+            return source.copy(Bitmap.Config.ARGB_8888, true)
+                ?: throw IllegalStateException("تعذر نسخ الصورة للمعالجة")
+        }
+
+        val translator: Translator = Translation.getClient(
+            TranslatorOptions.Builder()
+                .setSourceLanguage(sourceLanguage)
+                .setTargetLanguage(TranslateLanguage.ARABIC)
+                .build()
+        )
+        val translatedBlocks = ArrayList<TranslationLine>()
+        var failedBlockCount = 0
         try {
-            onProgress(0.48f, "تجهيز نموذج الترجمة")
+            onProgress(0.45f, "تجهيز نموذج ${when (languageCode) { "ja" -> "اليابانية"; "ko" -> "الكورية"; "zh" -> "الصينية"; else -> "الإنجليزية" }} إلى العربية")
             Tasks.await(translator.downloadModelIfNeeded(DownloadConditions.Builder().build()))
-            val translatableLines = lines.filter { it.boundingBox != null }
-            translatableLines.forEachIndexed { lineIndex, line ->
-                val bounds = line.boundingBox
-                if (bounds != null) {
-                    val translated = runCatching { Tasks.await(translator.translate(line.text)) }.getOrDefault(line.text)
-                    translatedLines.add(TranslationLine(Rect(bounds), translated))
-                }
-                val fraction = if (translatableLines.isEmpty()) 0.95f else 0.52f + (0.45f * (lineIndex + 1) / translatableLines.size)
-                onProgress(fraction, "ترجمة النص ${lineIndex + 1}/${translatableLines.size}")
+            translatableBlocks.forEachIndexed { index, item ->
+                val translated = runCatching { Tasks.await(translator.translate(item.second)) }
+                    .onFailure { failedBlockCount++ }
+                    .getOrDefault(item.second)
+                translatedBlocks.add(TranslationLine(Rect(item.first), translated))
+                val percent = 0.50f + (0.47f * (index + 1) / translatableBlocks.size)
+                onProgress(percent, "ترجمة الفقاعة ${index + 1}/${translatableBlocks.size}")
             }
         } finally {
             translator.close()
         }
-        if (translatedLines.isEmpty()) {
-            onProgress(1f, "اكتملت الصورة")
+        if (translatedBlocks.isEmpty()) {
+            onProgress(1f, "اكتملت الصورة دون نص مترجم")
             return source.copy(Bitmap.Config.ARGB_8888, true)
                 ?: throw IllegalStateException("تعذر نسخ الصورة للمعالجة")
         }
-        onProgress(0.98f, "تنسيق النص العربي")
-        val rendered = drawTranslatedLines(source, translatedLines)
-        onProgress(1f, "اكتملت الصورة")
+        onProgress(0.98f, "إخراج النص العربي بجودة عالية")
+        val rendered = drawTranslatedLines(source, translatedBlocks)
+        onProgress(1f, if (failedBlockCount == 0) "اكتملت الصورة" else "اكتملت الصورة؛ تعذرت ترجمة $failedBlockCount فقاعات")
         return rendered
     }
 
@@ -1733,7 +1902,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 bottom = bottom.coerceAtMost(output.height)
             }
             if (rect.width() < 8 || rect.height() < 8) return@forEach
-            backgroundPaint.color = sampleBubbleColor(output, rect)
+            backgroundPaint.color = sampleBubbleColor(source, rect)
             canvas.drawRoundRect(
                 rect.left.toFloat(), rect.top.toFloat(), rect.right.toFloat(), rect.bottom.toFloat(),
                 5f, 5f, backgroundPaint
@@ -1804,7 +1973,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             .setAlignment(android.text.Layout.Alignment.ALIGN_CENTER)
             .setTextDirection(android.text.TextDirectionHeuristics.RTL)
             .setIncludePad(false)
-            .setMaxLines(4)
+            .setMaxLines(8)
             .setBreakStrategy(android.text.Layout.BREAK_STRATEGY_SIMPLE)
             .build()
     }
@@ -1989,15 +2158,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     private fun restoreFloatingBubble() {
-        mainHandler.postDelayed({
-            if (Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)) {
-                if (bubble != null && !bubbleWasAdded) {
-                    runCatching { windowManager.addView(bubble, bubbleParams) }.onSuccess { bubbleWasAdded = true }
-                } else if (bubble == null) {
-                    showFloatingBubble()
-                }
-            }
-        }, 250L)
+        // Re-evaluate the real foreground package and toggle before restoring.
+        // This prevents a delayed capture callback from putting the lens over Manga Fox itself.
+        mainHandler.postDelayed({ refreshLensAppFilter() }, 250L)
     }
 
     private fun notifyCaptureProgress() {
