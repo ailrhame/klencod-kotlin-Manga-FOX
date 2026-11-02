@@ -47,7 +47,6 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
-import android.widget.Switch
 import android.widget.Toast
 import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.nl.languageid.LanguageIdentification
@@ -91,7 +90,6 @@ private const val PREF_LENS_SIZE = "lens_size_dp"
 private const val PREF_LENS_ALPHA = "lens_alpha"
 private const val PREF_LENS_GLYPH = "lens_custom_glyph"
 private const val PREF_LENS_COLOR = "lens_custom_color"
-private const val PREF_LENS_ENABLED = "lens_enabled"
 private const val PREF_SOURCE_LANGUAGE = "translation_source_language"
 private const val MAX_CAPTURE_FRAMES = 120
 
@@ -475,19 +473,7 @@ class MainActivity : android.app.Activity() {
         settingsCard.addView(actionButton("فتح استوديو تصميم العدسة", true) {
             openLensStudio()
         }, matchWrap(dp(4)))
-        settingsCard.addView(text("فعّل العدسة لتظهر فوق التطبيقات الأخرى، أو أوقفها من هنا متى شئت. تختفي العدسة تلقائياً عند فتح Manga FOX.", 11f, Color.LTGRAY), matchWrap())
-        val lensSwitch = Switch(this).apply {
-            text = "إظهار العدسة العائمة"
-            setTextColor(Color.WHITE)
-            textSize = 14f
-            isChecked = preferences.getBoolean(PREF_LENS_ENABLED, true)
-            setOnCheckedChangeListener { _, checked ->
-                preferences.edit().putBoolean(PREF_LENS_ENABLED, checked).apply()
-                MangaFoxAccessibilityService.instance?.setLensEnabled(checked)
-                toast(if (checked) "تم تفعيل العدسة العائمة" else "تم إيقاف العدسة العائمة")
-            }
-        }
-        settingsCard.addView(lensSwitch, matchWrap(dp(8)))
+        settingsCard.addView(text("العدسة العائمة تعمل دائماً وتبقى ظاهرة فوق التطبيقات، بما فيها Manga FOX، ما دامت خدمة إمكانية الوصول وإذن الظهور فوق التطبيقات مفعّلين.", 11f, Color.LTGRAY), matchWrap(dp(6)))
         updateFontPreview()
         root.addView(settingsCard, matchWrap(dp(16)))
     }
@@ -2074,24 +2060,19 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         setStroke(dp(2), Color.WHITE)
     }
 
-    fun setLensEnabled(enabled: Boolean) {
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(PREF_LENS_ENABLED, enabled).apply()
-        refreshLensAppFilter()
-    }
-
+    /** Keep the single overlay attached regardless of which app/window is in front. */
     fun refreshLensAppFilter() {
         if (!this::windowManager.isInitialized) return
-        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        val enabled = prefs.getBoolean(PREF_LENS_ENABLED, true)
-        val foreground = currentForegroundPackage
         val overlayAllowed = Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)
-        val shouldShow = enabled && overlayAllowed && !hostActivityResumed &&
-            (foreground.isNullOrBlank() || foreground != packageName)
-        if (shouldShow) {
-            if (bubble == null) showFloatingBubble() else if (!bubbleWasAdded) restoreFloatingBubble()
-        } else {
-            removeFloatingBubble()
+        if (!overlayAllowed) {
+            MangaFoxRuntime.status = "يلزم السماح بالظهور فوق التطبيقات"
+            MangaFoxRuntime.lastError = "افتح إعدادات Android واسمح لـ Manga FOX بالظهور فوق التطبيقات الأخرى."
+            return
         }
+        // Idempotent: accessibility events and Activity lifecycle callbacks must never
+        // remove/recreate an already attached view, otherwise the lens visibly flickers.
+        if (bubbleWasAdded && bubble != null) return
+        showFloatingBubble()
     }
 
     fun rebuildFloatingLenses() {
@@ -2205,9 +2186,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     private fun restoreFloatingBubble() {
-        // Re-evaluate the real foreground package and toggle before restoring.
-        // This prevents a delayed capture callback from putting the lens over Manga Fox itself.
-        mainHandler.postDelayed({ refreshLensAppFilter() }, 250L)
+        // Compatibility hook for older call sites. Visibility is no longer tied to foreground app.
+        refreshLensAppFilter()
     }
 
     private fun notifyCaptureProgress() {
