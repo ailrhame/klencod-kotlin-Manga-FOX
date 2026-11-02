@@ -2815,8 +2815,37 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         return OcrCandidate(boundsAtSource, phrase.trim(), engine)
     }
 
-    private fun collectCandidates(result: Text?, engine: String, scale: Float = 1f): List<OcrCandidate> =
-        result?.textBlocks.orEmpty().map { candidateFromBlock(it, engine, scale) }.filter { it.text.isNotBlank() }
+    /**
+     * Prefer line-sized OCR boxes over a whole TextBlock. A block may contain Arabic and
+     * Latin on adjacent lines; assigning one language and one large rectangle to it was
+     * the main source of mixed-script overlaps seen in translated pages.
+     */
+    private fun collectCandidates(result: Text?, engine: String, scale: Float = 1f): List<OcrCandidate> {
+        fun mapBounds(raw: Rect?): Rect? {
+            if (raw == null) return null
+            return if (scale == 1f) Rect(raw) else Rect(
+                (raw.left / scale).roundToInt(), (raw.top / scale).roundToInt(),
+                (raw.right / scale).roundToInt(), (raw.bottom / scale).roundToInt()
+            )
+        }
+        return result?.textBlocks.orEmpty().flatMap { block ->
+            val blockBounds = boxForBlock(block)
+            val hasVerticalCjk = blockBounds != null &&
+                blockBounds.height() > blockBounds.width() * 2.2f &&
+                countChars(block.text) { it in '\u3040'..'\u30FF' || it in '\u4E00'..'\u9FFF' } > 0
+            if (hasVerticalCjk) {
+                listOf(candidateFromBlock(block, engine, scale))
+            } else {
+                val lines = block.lines.mapNotNull { line ->
+                    val rawBounds = line.boundingBox ?: line.elements.mapNotNull { it.boundingBox }
+                        .reduceOrNull { acc, rect -> Rect(acc).apply { union(rect) } }
+                    val text = line.text.trim()
+                    if (text.isBlank()) null else OcrCandidate(mapBounds(rawBounds), text, engine)
+                }
+                if (lines.isNotEmpty()) lines else listOf(candidateFromBlock(block, engine, scale))
+            }
+        }.filter { it.text.isNotBlank() }
+    }
 
     private fun intersectionOverUnion(a: Rect, b: Rect): Float {
         val left = max(a.left, b.left)
@@ -2829,36 +2858,55 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         return if (union <= 0) 0f else intersection.toFloat() / union.toFloat()
     }
 
+    private fun candidateQuality(candidate: OcrCandidate): Int {
+        val letters = candidate.text.count { it.isLetterOrDigit() }
+        val arabic = candidate.text.count { it in '\u0600'..'\u06FF' }
+        val replacement = candidate.text.count { it == '\uFFFD' || it == '?' }
+        val areaPenalty = candidate.bounds?.let { (it.width().coerceAtLeast(1) * it.height().coerceAtLeast(1)) / 12000 } ?: 0
+        return letters * 5 + arabic * 2 - replacement * 12 - areaPenalty.coerceAtMost(40)
+    }
+
     private fun mergeOcrCandidates(input: List<OcrCandidate>): List<OcrCandidate> {
         val merged = ArrayList<OcrCandidate>()
-        input.forEach { candidate ->
-            val bounds = candidate.bounds
-            if (bounds == null) {
-                merged.add(candidate)
-                return@forEach
-            }
-            val overlapIndex = merged.indexOfFirst { existing ->
-                val other = existing.bounds ?: return@indexOfFirst false
-                val left = max(other.left, bounds.left)
-                val top = max(other.top, bounds.top)
-                val right = min(other.right, bounds.right)
-                val bottom = min(other.bottom, bounds.bottom)
-                val intersection = max(0, right - left) * max(0, bottom - top)
-                val smallerArea = min(other.width() * other.height(), bounds.width() * bounds.height()).coerceAtLeast(1)
-                val containedOverlap = intersection.toFloat() / smallerArea.toFloat()
-                intersectionOverUnion(other, bounds) > 0.28f || containedOverlap > 0.58f
-            }
-            if (overlapIndex < 0) merged.add(candidate)
-            else {
-                val old = merged[overlapIndex]
-                val newScore = candidate.text.count { it.isLetterOrDigit() }
-                val oldScore = old.text.count { it.isLetterOrDigit() }
-                if (newScore > oldScore || (newScore == oldScore && candidate.text.length > old.text.length)) {
-                    merged[overlapIndex] = candidate
+        fun overlaps(a: Rect, b: Rect): Boolean {
+            val left = max(a.left, b.left)
+            val top = max(a.top, b.top)
+            val right = min(a.right, b.right)
+            val bottom = min(a.bottom, b.bottom)
+            val intersection = max(0, right - left) * max(0, bottom - top)
+            if (intersection <= 0) return false
+            val smallerArea = min(a.width() * a.height(), b.width() * b.height()).coerceAtLeast(1)
+            val containedOverlap = intersection.toFloat() / smallerArea.toFloat()
+            return intersectionOverUnion(a, b) >= 0.22f || containedOverlap >= 0.76f
+        }
+        input.asSequence()
+            .filter { it.text.isNotBlank() && it.bounds?.let { box -> box.width() > 2 && box.height() > 2 } == true }
+            .sortedByDescending { candidateQuality(it) }
+            .forEach { candidate ->
+                val box = candidate.bounds ?: return@forEach
+                val conflicts = merged.filter { old -> old.bounds?.let { overlaps(it, box) } == true }
+                if (conflicts.isEmpty()) {
+                    merged.add(candidate)
+                } else {
+                    // Collapse every overlapping duplicate at once; replacing only the first
+                    // collision allowed a third OCR engine's near-identical box to survive.
+                    val winner = (conflicts + candidate).maxByOrNull { candidateQuality(it) } ?: candidate
+                    merged.removeAll { old -> old.bounds?.let { overlaps(it, box) } == true }
+                    merged.add(winner)
                 }
             }
+        // Deterministically remove residual collisions caused by chained/partially intersecting boxes.
+        val nonOverlapping = ArrayList<OcrCandidate>()
+        merged.sortedByDescending { candidateQuality(it) }.forEach { candidate ->
+            val box = candidate.bounds ?: return@forEach
+            if (nonOverlapping.none { it.bounds?.let { accepted -> overlaps(accepted, box) } == true }) {
+                nonOverlapping.add(candidate)
+            }
         }
-        return merged.sortedWith(compareBy<OcrCandidate> { it.bounds?.top ?: Int.MAX_VALUE }.thenBy { it.bounds?.left ?: Int.MAX_VALUE })
+        return nonOverlapping.sortedWith(
+            compareBy<OcrCandidate> { it.bounds?.top ?: Int.MAX_VALUE }
+                .thenBy { it.bounds?.left ?: Int.MAX_VALUE }
+        )
     }
 
     private fun createOcrVariant(source: Bitmap, inverted: Boolean): Pair<Bitmap, Float> {
@@ -3018,7 +3066,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 }
                 if (!overlapsExisting) selected.add(rect)
             }
-            return selected.take(14)
+            return selected.take(28)
         } finally {
             if (!sample.isRecycled && sample !== source) sample.recycle()
         }
@@ -3095,24 +3143,80 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun hasArabicLetters(value: String): Boolean =
+        value.any { it in '\u0600'..'\u06FF' && it.isLetter() }
+
+    private fun hasForeignLetters(value: String): Boolean = value.any { it.isLetter() && it !in '\u0600'..'\u06FF' }
+
+    private fun foreignLetterCount(value: String): Int =
+        value.count { it.isLetter() && it !in '\u0600'..'\u06FF' }
+
+    /** Reject outputs that retain almost all foreign letters, even if the line also contains Arabic. */
+    private fun isUsefulArabicTranslation(source: String, translated: String): Boolean {
+        if (translated.isBlank()) return false
+        if (!hasForeignLetters(source)) return hasArabicLetters(translated)
+        if (!hasArabicLetters(translated)) return false
+        val sourceForeign = foreignLetterCount(source)
+        val outputForeign = foreignLetterCount(translated)
+        return sourceForeign == 0 || outputForeign < max(2, (sourceForeign * 0.68f).roundToInt())
+    }
+
     private fun languageForBlock(text: String, engineHint: String, forced: String): String {
         val letters = text.filter { it.isLetter() }
         val arabic = countChars(letters) { it in '\u0600'..'\u06FF' }
-        if (arabic >= 2 && arabic >= letters.length / 2) return "ar"
         val hangul = countChars(text) { it in '\uAC00'..'\uD7AF' || it in '\u1100'..'\u11FF' }
         val kana = countChars(text) { it in '\u3040'..'\u30FF' }
+        val cjk = countChars(text) { it in '\u4E00'..'\u9FFF' }
+        val latin = countChars(text) { it in 'A'..'Z' || it in 'a'..'z' }
+        // Arabic-only lines are retained. Mixed Arabic/foreign lines must not be skipped.
+        if (arabic > 0 && hangul + kana + cjk + latin == 0) return "ar"
         if (hangul > 0) return "ko"
         if (kana > 0) return "ja"
+        if (cjk > 0) return if (engineHint == "ja" || engineHint == "zh") engineHint else "zh"
+        if (latin > 0) return if (forced in setOf("ja", "ko", "zh") && engineHint == forced) forced else "en"
+        if (arabic >= 2 && !hasForeignLetters(text)) return "ar"
         if (forced in setOf("ja", "en", "ko", "zh")) return forced
-        if (engineHint in setOf("ja", "en", "ko", "zh") && engineHint != "und") {
-            if (engineHint == "ja" && countChars(text) { it in '\u4E00'..'\u9FFF' } > 0) return "ja"
-            if (engineHint == "ko" || engineHint == "zh") return engineHint
-            if (engineHint == "en" && countChars(text) { it in '\u4E00'..'\u9FFF' } == 0) return "en"
-        }
+        if (engineHint in setOf("ja", "en", "ko", "zh")) return engineHint
         val identified = runCatching { Tasks.await(languageIdentifier.identifyLanguage(text.take(500))) }.getOrDefault("und")
         val normalized = identified.lowercase().substringBefore('-')
-        if (normalized in setOf("ja", "en", "ko", "zh")) return normalized
-        return if (countChars(text) { it in '\u4E00'..'\u9FFF' } >= 2) "zh" else "en"
+        return if (normalized in setOf("ja", "en", "ko", "zh")) normalized else "en"
+    }
+
+    /** Translate foreign-script runs while preserving Arabic already present in the OCR line. */
+    private fun translateMixedTextPreservingArabic(source: String, language: String): String {
+        val output = StringBuilder()
+        val segment = StringBuilder()
+        var segmentIsArabic: Boolean? = null
+        fun flush() {
+            if (segment.isEmpty()) return
+            val raw = segment.toString()
+            val kind = segmentIsArabic
+            if (kind == true || raw.none { it.isLetterOrDigit() }) {
+                output.append(raw)
+            } else {
+                val trimmed = raw.trim()
+                val leading = raw.takeWhile { it.isWhitespace() }
+                val trailing = raw.takeLastWhile { it.isWhitespace() }
+                val translated = if (trimmed.any { it.isLetterOrDigit() }) {
+                    runCatching { translateWithLanguage(trimmed, language) }.getOrDefault(trimmed)
+                } else trimmed
+                output.append(leading).append(translated).append(trailing)
+            }
+            segment.clear()
+            segmentIsArabic = null
+        }
+        source.forEach { ch ->
+            val script = when {
+                ch.isLetter() && ch in '\u0600'..'\u06FF' -> true
+                ch.isLetterOrDigit() -> false
+                else -> null
+            }
+            if (script != null && segmentIsArabic != null && script != segmentIsArabic) flush()
+            if (script != null && segmentIsArabic == null) segmentIsArabic = script
+            segment.append(ch)
+        }
+        flush()
+        return output.toString()
     }
 
     private fun correctLikelyOcrText(value: String, language: String): String {
@@ -3248,9 +3352,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
         val preBubbleMerge = mergeOcrCandidates(allCandidates)
         val preBubbleChars = preBubbleMerge.sumOf { it.text.count { character -> character.isLetterOrDigit() } }
-        val tallSparsePage = source.height >= 2400 && source.height > source.width * 2 && preBubbleMerge.size < 12
-        val lowCoveragePage = preBubbleChars < 120 && preBubbleMerge.size < 8
-        if (preBubbleMerge.size < 5 || preBubbleChars < 80 || tallSparsePage || lowCoveragePage) {
+        val tallSparsePage = source.height >= 2400 && source.height > source.width * 2 && preBubbleMerge.size < 20
+        val lowCoveragePage = preBubbleChars < 180 && preBubbleMerge.size < 14
+        if (preBubbleMerge.size < 6 || preBubbleChars < 100 || tallSparsePage || lowCoveragePage) {
             onProgress(0.355f, "فحص مناطق الفقاعات الفاتحة وإعادة OCR لكل منطقة")
             allCandidates.addAll(recognizeBubbleRegions(source, engines) { fraction, detail ->
                 onProgress(fraction, detail)
@@ -3316,15 +3420,25 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 } else null
                 var translatedRaw: String? = learned ?: sfx
                 if (translatedRaw == null) {
-                    translatedRaw = runCatching { translateWithLanguage(normalizedSource, item.language) }.getOrNull()
+                    val mixed = hasArabicLetters(normalizedSource) && hasForeignLetters(normalizedSource)
+                    translatedRaw = runCatching {
+                        if (mixed) translateMixedTextPreservingArabic(normalizedSource, item.language)
+                        else translateWithLanguage(normalizedSource, item.language)
+                    }.getOrNull()
                     val firstClean = translatedRaw?.let { cleanArabicTranslation(it) }.orEmpty()
-                    if (firstClean.isBlank() || firstClean.equals(item.text, ignoreCase = true)) {
-                        // If one source model failed or merely echoed OCR, retry this block with a language-ID suggestion and alternate script model.
+                    val needsArabicOutput = hasForeignLetters(normalizedSource)
+                    if (firstClean.isBlank() || firstClean.equals(item.text, ignoreCase = true) ||
+                        (needsArabicOutput && !isUsefulArabicTranslation(normalizedSource, firstClean))) {
+                        // Retry not only on empty output: reject a model that simply echoes Latin OCR.
                         for (retryCode in retryLanguageCandidates(normalizedSource, item.language)) {
-                            val retried = runCatching { translateWithLanguage(normalizedSource, retryCode) }.getOrNull()
+                            val retried = runCatching {
+                                if (mixed) translateMixedTextPreservingArabic(normalizedSource, retryCode)
+                                else translateWithLanguage(normalizedSource, retryCode)
+                            }.getOrNull()
                             if (!retried.isNullOrBlank()) {
                                 val cleanedRetry = cleanArabicTranslation(retried)
-                                if (cleanedRetry.isNotBlank() && !cleanedRetry.equals(item.text, ignoreCase = true)) {
+                                if (cleanedRetry.isNotBlank() && !cleanedRetry.equals(item.text, ignoreCase = true) &&
+                                    (!needsArabicOutput || isUsefulArabicTranslation(normalizedSource, cleanedRetry))) {
                                     translatedRaw = retried
                                     break
                                 }
@@ -3333,7 +3447,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     }
                 }
                 val translated = translatedRaw?.let { cleanArabicTranslation(it) }.orEmpty()
-                if (translated.isBlank() || translated.equals(item.text, ignoreCase = true)) {
+                val sourceNeedsArabic = hasForeignLetters(item.text)
+                if (translated.isBlank() || translated.equals(item.text, ignoreCase = true) ||
+                    (sourceNeedsArabic && !isUsefulArabicTranslation(item.text, translated))) {
                     failedCount++
                     failedSamples.add(item.text.take(100))
                 } else {
@@ -3373,6 +3489,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         val renderItems = translatedLines.mapNotNull { item ->
             val textRect = Rect(item.bounds).apply {
+                val padX = max(3, width() / 12)
+                val padY = max(3, height() / 8)
+                inset(-padX, -padY)
                 left = left.coerceIn(0, output.width)
                 top = top.coerceIn(0, output.height)
                 right = right.coerceIn(0, output.width)
@@ -3412,31 +3531,47 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         return output
     }
 
+    /** Samples a ring around the text box and prefers the dominant bright bubble fill. */
     private fun sampleBubbleColor(bitmap: Bitmap, rect: Rect): Int {
-        val points = arrayOf(
-            rect.left to (rect.top - 2).coerceAtLeast(0),
-            rect.right - 1 to (rect.top - 2).coerceAtLeast(0),
-            rect.left to (rect.bottom + 1).coerceAtMost(bitmap.height - 1),
-            rect.right - 1 to (rect.bottom + 1).coerceAtMost(bitmap.height - 1)
-        )
-        var red = 0
-        var green = 0
-        var blue = 0
-        points.forEach { (x, y) ->
-            val pixel = bitmap.getPixel(x.coerceIn(0, bitmap.width - 1), y.coerceIn(0, bitmap.height - 1))
-            red += Color.red(pixel)
-            green += Color.green(pixel)
-            blue += Color.blue(pixel)
+        val samples = ArrayList<Int>(24)
+        val left = rect.left.coerceIn(0, bitmap.width - 1)
+        val right = (rect.right - 1).coerceIn(0, bitmap.width - 1)
+        val top = rect.top.coerceIn(0, bitmap.height - 1)
+        val bottom = (rect.bottom - 1).coerceIn(0, bitmap.height - 1)
+        val insetX = max(1, rect.width() / 5)
+        val insetY = max(1, rect.height() / 5)
+        val xs = listOf((left + insetX).coerceAtMost(right), rect.centerX().coerceIn(left, right), (right - insetX).coerceAtLeast(left))
+        val ys = listOf((top + insetY).coerceAtMost(bottom), rect.centerY().coerceIn(top, bottom), (bottom - insetY).coerceAtLeast(top))
+        // Sample just outside each side; corners alone are easily contaminated by balloon outlines.
+        xs.forEach { x ->
+            samples.add(bitmap.getPixel(x, (top - 3).coerceAtLeast(0)))
+            samples.add(bitmap.getPixel(x, (bottom + 3).coerceAtMost(bitmap.height - 1)))
         }
-        red = red / points.size
-        green = green / points.size
-        blue = blue / points.size
-        val brightness = (red + green + blue) / 3
-        return if (brightness < 105) Color.rgb(245, 245, 238) else Color.rgb(
-            ((red * 3 + 245) / 4).coerceIn(0, 255),
-            ((green * 3 + 245) / 4).coerceIn(0, 255),
-            ((blue * 3 + 238) / 4).coerceIn(0, 255)
-        )
+        ys.forEach { y ->
+            samples.add(bitmap.getPixel((left - 3).coerceAtLeast(0), y))
+            samples.add(bitmap.getPixel((right + 3).coerceAtMost(bitmap.width - 1), y))
+        }
+        if (samples.isEmpty()) return Color.WHITE
+        fun luminance(c: Int) = (Color.red(c) * 30 + Color.green(c) * 59 + Color.blue(c) * 11) / 100
+        val bright = samples.filter { luminance(it) >= 205 }
+        val chosen = if (bright.size >= (samples.size * 0.42f).roundToInt().coerceAtLeast(1)) bright else samples
+        val red = chosen.map { Color.red(it) }.sorted()[chosen.size / 2]
+        val green = chosen.map { Color.green(it) }.sorted()[chosen.size / 2]
+        val blue = chosen.map { Color.blue(it) }.sorted()[chosen.size / 2]
+        val brightness = (red * 30 + green * 59 + blue * 11) / 100
+        val chroma = max(red, max(green, blue)) - min(red, min(green, blue))
+        return when {
+            bright.size >= (samples.size * 0.70f).roundToInt().coerceAtLeast(1) && brightness >= 225 && chroma <= 25 ->
+                Color.WHITE
+            bright.size >= (samples.size * 0.33f).roundToInt().coerceAtLeast(1) && brightness >= 218 && chroma <= 42 ->
+                Color.rgb(max(red, 246), max(green, 246), max(blue, 244))
+            brightness < 105 -> Color.rgb(245, 245, 238)
+            else -> Color.rgb(
+                ((red * 4 + 245) / 5).coerceIn(0, 255),
+                ((green * 4 + 245) / 5).coerceIn(0, 255),
+                ((blue * 4 + 238) / 5).coerceIn(0, 255)
+            )
+        }
     }
 
     private fun drawArabicText(canvas: Canvas, text: String, rect: Rect, vertical: Boolean = false) {
