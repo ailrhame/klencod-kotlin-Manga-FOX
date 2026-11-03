@@ -88,126 +88,35 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
-private const val ACTION_SHOW_RESULTS = "com.manga.fox.SHOW_RESULTS"
-private const val ACTION_STOP_CAPTURE = "com.manga.fox.STOP_CAPTURE"
-private const val PREFS_NAME = "manga_fox_v2_preferences"
-private const val PREF_FONT_SIZE = "font_size_sp"
-private const val PREF_FONT_FAMILY = "font_family"
-private const val PREF_FONT_BOLD = "font_bold"
-private const val PREF_FONT_FILE = "font_file_path"
-private const val PREF_FONT_LABEL = "font_file_label"
-private const val PREF_AUTO_FONT_FIT = "auto_font_fit_enabled"
-private const val PREF_RESULTS_EDIT_MODE = "results_edit_mode"
-private const val REQUEST_PICK_FONT = 713
-private const val REQUEST_SAVE_PDF = 714
-private const val REQUEST_EXPORT_PHANTOM_PROJECT = 715
-private const val REQUEST_IMPORT_PHANTOM_PROJECT = 716
-private const val PREF_LENS_SIZE = "lens_size_dp"
-private const val PREF_LENS_ALPHA = "lens_alpha"
-private const val PREF_LENS_GLYPH = "lens_custom_glyph"
-private const val PREF_LENS_COLOR = "lens_custom_color"
-private const val PREF_SOURCE_LANGUAGE = "translation_source_language"
-private const val PREF_ONBOARDING_SEEN = "onboarding_seen_v1"
-private const val PREF_TRANSLATE_SFX = "translate_japanese_sfx"
-private const val PREF_LEARNED_TRANSLATIONS = "learned_translation_dictionary"
-private const val MAX_CAPTURE_FRAMES = 120
 
-object MangaFoxRuntime {
-    private const val SESSION_MANIFEST = "mfox_session_v1.json"
 
-    @Synchronized fun persist(context: Context) {
-        runCatching {
-            val root = org.json.JSONObject()
-                .put("title", resultTitle)
-                .put("quality", qualitySummary)
-                .put("sources", org.json.JSONArray(sourcePages))
-                .put("results", org.json.JSONArray(resultPages))
-                .put("layers", org.json.JSONArray(translationLayerFiles))
-            val target = File(context.filesDir, SESSION_MANIFEST)
-            val temp = File(context.filesDir, "$SESSION_MANIFEST.tmp")
-            temp.writeText(root.toString(), Charsets.UTF_8)
-            if (!temp.renameTo(target)) {
-                temp.copyTo(target, overwrite = true)
-                temp.delete()
-            }
-        }
-    }
+// ============================================================
+// MERGED FROM: MangaFox_V3_0_3_MainActivity.kt
+// ============================================================
 
-    @Synchronized fun restore(context: Context) {
-        runCatching {
-            val manifest = File(context.filesDir, SESSION_MANIFEST)
-            if (!manifest.isFile) {
-                fun indexed(files: List<File>, prefix: String): List<File> = files
-                    .filter { it.isFile && it.name.startsWith(prefix) && it.length() > 0L }
-                    .sortedBy { it.name.substringAfterLast('_').substringBefore('.').toIntOrNull() ?: Int.MAX_VALUE }
-                val legacyResults = indexed(
-                    (context.filesDir.listFiles()?.toList().orEmpty() + context.cacheDir.listFiles()?.toList().orEmpty()),
-                    "mfox_result_"
-                )
-                val legacySources = indexed(context.filesDir.listFiles()?.toList().orEmpty(), "mfox_source_")
-                val legacyLayers = indexed(context.filesDir.listFiles()?.toList().orEmpty(), "mfox_layers_")
-                val count = minOf(legacyResults.size, legacySources.size)
-                if (count > 0) {
-                    resultPages = legacyResults.take(count).map { it.absolutePath }
-                    sourcePages = legacySources.take(count).map { it.absolutePath }
-                    translationLayerFiles = (0 until count).map { legacyLayers.getOrNull(it)?.absolutePath.orEmpty() }
-                    resultTitle = "الفصل السابق"
-                    persist(context)
-                }
-                return
-            }
-            val root = org.json.JSONObject(manifest.readText(Charsets.UTF_8))
-            // Keep positional alignment: an empty layer path for page 2 must not
-            // shift page 3's layer file into page 2 after process restoration.
-            fun stringList(key: String): List<String> {
-                val array = root.optJSONArray(key) ?: return emptyList()
-                return (0 until array.length()).map { index -> array.optString(index, "") }
-            }
-            val sources = stringList("sources")
-            val results = stringList("results")
-            val layers = stringList("layers")
-            val count = minOf(sources.size, results.size)
-            sourcePages = sources.take(count)
-            resultPages = results.take(count)
-            translationLayerFiles = (0 until count).map { layers.getOrNull(it).orEmpty() }
-            resultTitle = root.optString("title", "الفصل المترجم")
-            qualitySummary = root.optString("quality", qualitySummary)
-            if (resultPages.none { File(it).isFile }) {
-                sourcePages = emptyList()
-                resultPages = emptyList()
-                translationLayerFiles = emptyList()
-            }
-        }
-    }
-
-    @Synchronized fun removePage(context: Context, index: Int) {
-        if (index !in resultPages.indices) return
-        val removed = listOfNotNull(
-            resultPages.getOrNull(index), sourcePages.getOrNull(index), translationLayerFiles.getOrNull(index)
-        )
-        resultPages = resultPages.toMutableList().also { it.removeAt(index) }
-        if (index in sourcePages.indices) sourcePages = sourcePages.toMutableList().also { it.removeAt(index) }
-        if (index in translationLayerFiles.indices) translationLayerFiles = translationLayerFiles.toMutableList().also { it.removeAt(index) }
-        removed.forEach { path -> runCatching { File(path).delete() } }
-        persist(context)
-    }
-
-    @Volatile var status: String = "جاهز للترجمة"
-    @Volatile var resultPages: List<String> = emptyList()
-    @Volatile var sourcePages: List<String> = emptyList()
-    @Volatile var resultTitle: String = "الفصل المترجم"
-    @Volatile var lastError: String = ""
-    @Volatile var progressPercent: Int = 0
-    @Volatile var progressDetail: String = ""
-    @Volatile var detectedBlocks: Int = 0
-    @Volatile var translatedBlocks: Int = 0
-    @Volatile var failedBlocks: Int = 0
-    @Volatile var skippedBlocks: Int = 0
-    @Volatile var qualitySummary: String = "لم تبدأ ترجمة بعد"
-    @Volatile var failedBlockSamples: List<String> = emptyList()
-    // Per-page OCR/translation layers are stored separately from the rendered JPG.
-    @Volatile var translationLayerFiles: List<String> = emptyList()
-}
+internal const val ACTION_SHOW_RESULTS = "com.manga.fox.SHOW_RESULTS"
+internal const val ACTION_STOP_CAPTURE = "com.manga.fox.STOP_CAPTURE"
+internal const val PREFS_NAME = "manga_fox_v2_preferences"
+internal const val PREF_FONT_SIZE = "font_size_sp"
+internal const val PREF_FONT_FAMILY = "font_family"
+internal const val PREF_FONT_BOLD = "font_bold"
+internal const val PREF_FONT_FILE = "font_file_path"
+internal const val PREF_FONT_LABEL = "font_file_label"
+internal const val PREF_AUTO_FONT_FIT = "auto_font_fit_enabled"
+internal const val PREF_RESULTS_EDIT_MODE = "results_edit_mode"
+internal const val REQUEST_PICK_FONT = 713
+internal const val REQUEST_SAVE_PDF = 714
+internal const val REQUEST_EXPORT_PHANTOM_PROJECT = 715
+internal const val REQUEST_IMPORT_PHANTOM_PROJECT = 716
+internal const val PREF_LENS_SIZE = "lens_size_dp"
+internal const val PREF_LENS_ALPHA = "lens_alpha"
+internal const val PREF_LENS_GLYPH = "lens_custom_glyph"
+internal const val PREF_LENS_COLOR = "lens_custom_color"
+internal const val PREF_SOURCE_LANGUAGE = "translation_source_language"
+internal const val PREF_ONBOARDING_SEEN = "onboarding_seen_v1"
+internal const val PREF_TRANSLATE_SFX = "translate_japanese_sfx"
+internal const val PREF_LEARNED_TRANSLATIONS = "learned_translation_dictionary"
+internal const val MAX_CAPTURE_FRAMES = 120
 
 class MainActivity : android.app.Activity() {
     private val dark = Color.rgb(10, 10, 13)
@@ -1717,7 +1626,11 @@ class MainActivity : android.app.Activity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_RTL
-            setPadding(dp(12), dp(8), dp(12), dp(12))
+            // In reading mode the page stack is edge-to-edge: no horizontal/vertical
+            // container padding, child margins, separators, or card spacing.
+            setPadding(if (editMode) dp(12) else 0, if (editMode) dp(8) else 0,
+                if (editMode) dp(12) else 0, if (editMode) dp(12) else 0)
+            setBackgroundColor(Color.BLACK)
         }
         val pages = MangaFoxRuntime.resultPages
         val topBar = LinearLayout(this).apply {
@@ -1793,6 +1706,9 @@ class MainActivity : android.app.Activity() {
                 val image = ZoomableImageView(this).apply {
                     setImageFile(filePath)
                     contentDescription = "الصورة ${index + 1} من ${pages.size} — معاينة متصلة"
+                    setPadding(0, 0, 0, 0)
+                    minimumHeight = 0
+                    minimumWidth = 0
                     setBackgroundColor(Color.BLACK)
                     setOnLongClickListener {
                         if (originalPath == null) toast("الصورة الأصلية غير متوفرة لهذه الصفحة")
@@ -1805,8 +1721,9 @@ class MainActivity : android.app.Activity() {
                         true
                     }
                 }
-                val displayWidth = resources.displayMetrics.widthPixels - dp(24)
-                val displayHeight = (sourceHeight * (displayWidth.toFloat() / sourceWidth)).toInt().coerceAtLeast(1)
+                val displayWidth = if (editMode) resources.displayMetrics.widthPixels - dp(24)
+                    else resources.displayMetrics.widthPixels
+                val displayHeight = kotlin.math.ceil(sourceHeight * (displayWidth.toFloat() / sourceWidth)).toInt().coerceAtLeast(1)
                 root.addView(image, LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, displayHeight
                 ).apply {
@@ -2152,193 +2069,7 @@ class MainActivity : android.app.Activity() {
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
 }
 
-private class RegionSelectionView(context: Context) : View(context) {
-    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(70, 255, 190, 65)
-        style = Paint.Style.FILL
-    }
-    private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(255, 190, 65)
-        style = Paint.Style.STROKE
-        strokeWidth = 3f * resources.displayMetrics.density
-    }
-    private var startX = 0f
-    private var startY = 0f
-    private var selection = RectF()
-    private var hasSelection = false
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        if (hasSelection) {
-            canvas.drawRect(selection, fillPaint)
-            canvas.drawRect(selection, borderPaint)
-        }
-    }
-
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                startX = event.x.coerceIn(0f, width.toFloat())
-                startY = event.y.coerceIn(0f, height.toFloat())
-                selection.set(startX, startY, startX, startY)
-                hasSelection = true
-                invalidate()
-                return true
-            }
-            MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP -> {
-                val x = event.x.coerceIn(0f, width.toFloat())
-                val y = event.y.coerceIn(0f, height.toFloat())
-                selection.set(min(startX, x), min(startY, y), max(startX, x), max(startY, y))
-                invalidate()
-                return true
-            }
-            MotionEvent.ACTION_CANCEL -> {
-                hasSelection = false
-                invalidate()
-                return true
-            }
-        }
-        return true
-    }
-
-    fun toSourceRect(sourceWidth: Int, sourceHeight: Int): Rect? {
-        if (!hasSelection || width <= 0 || height <= 0) return null
-        val rect = Rect(
-            (selection.left / width * sourceWidth).roundToInt().coerceIn(0, sourceWidth - 1),
-            (selection.top / height * sourceHeight).roundToInt().coerceIn(0, sourceHeight - 1),
-            (selection.right / width * sourceWidth).roundToInt().coerceIn(1, sourceWidth),
-            (selection.bottom / height * sourceHeight).roundToInt().coerceIn(1, sourceHeight)
-        )
-        return rect.takeIf { it.width() > 0 && it.height() > 0 }
-    }
-}
-
-private class ZoomableImageView(context: Context) : ImageView(context) {
-    private val drawMatrix = Matrix()
-    private val displayedRect = RectF()
-    private var userScale = 1f
-    private var lastX = 0f
-    private var lastY = 0f
-    private var dragging = false
-    private var imageFilePath: String? = null
-    private var loadedBitmap: Bitmap? = null
-    private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
-        override fun onScale(detector: ScaleGestureDetector): Boolean {
-            val next = (userScale * detector.scaleFactor).coerceIn(1f, 5f)
-            val factor = next / userScale
-            userScale = next
-            drawMatrix.postScale(factor, factor, detector.focusX, detector.focusY)
-            fixBounds()
-            imageMatrix = drawMatrix
-            return true
-        }
-    })
-
-    init {
-        scaleType = ScaleType.MATRIX
-        isClickable = true
-    }
-
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-        super.onSizeChanged(w, h, oldw, oldh)
-        resetBaseMatrix()
-    }
-
-    fun setImageFile(path: String) {
-        imageFilePath = path
-        releasePage()
-    }
-
-    fun loadPage() {
-        if (loadedBitmap != null) return
-        val path = imageFilePath ?: return
-        val bitmap = BitmapFactory.decodeFile(path) ?: return
-        loadedBitmap = bitmap
-        super.setImageBitmap(bitmap)
-        post { resetBaseMatrix() }
-    }
-
-    fun releasePage() {
-        val old = loadedBitmap
-        loadedBitmap = null
-        super.setImageDrawable(null)
-        old?.let { if (!it.isRecycled) it.recycle() }
-        userScale = 1f
-        drawMatrix.reset()
-    }
-
-    override fun onDetachedFromWindow() {
-        releasePage()
-        super.onDetachedFromWindow()
-    }
-
-    private fun resetBaseMatrix() {
-        val d = drawable ?: return
-        if (width <= 0 || height <= 0 || d.intrinsicWidth <= 0 || d.intrinsicHeight <= 0) return
-        val fit = min(width.toFloat() / d.intrinsicWidth, height.toFloat() / d.intrinsicHeight)
-        val left = (width - d.intrinsicWidth * fit) / 2f
-        val top = (height - d.intrinsicHeight * fit) / 2f
-        drawMatrix.reset()
-        drawMatrix.setScale(fit, fit)
-        drawMatrix.postTranslate(left, top)
-        userScale = 1f
-        imageMatrix = drawMatrix
-    }
-
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        scaleDetector.onTouchEvent(event)
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                lastX = event.x
-                lastY = event.y
-                dragging = userScale > 1.01f
-                parent?.requestDisallowInterceptTouchEvent(dragging)
-                return true
-            }
-            MotionEvent.ACTION_POINTER_DOWN -> {
-                parent?.requestDisallowInterceptTouchEvent(true)
-                return true
-            }
-            MotionEvent.ACTION_MOVE -> {
-                if (userScale > 1.01f && !scaleDetector.isInProgress && event.pointerCount == 1) {
-                    val dx = event.x - lastX
-                    val dy = event.y - lastY
-                    drawMatrix.postTranslate(dx, dy)
-                    fixBounds()
-                    imageMatrix = drawMatrix
-                    dragging = true
-                    parent?.requestDisallowInterceptTouchEvent(true)
-                }
-                lastX = event.x
-                lastY = event.y
-                return true
-            }
-            MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (userScale <= 1.01f) parent?.requestDisallowInterceptTouchEvent(false)
-                if (event.actionMasked != MotionEvent.ACTION_POINTER_UP && userScale <= 1.01f) resetBaseMatrix()
-                return true
-            }
-        }
-        return true
-    }
-
-    private fun fixBounds() {
-        val d = drawable ?: return
-        displayedRect.set(0f, 0f, d.intrinsicWidth.toFloat(), d.intrinsicHeight.toFloat())
-        drawMatrix.mapRect(displayedRect)
-        var dx = 0f
-        var dy = 0f
-        if (displayedRect.width() <= width) dx = width / 2f - displayedRect.centerX()
-        else if (displayedRect.left > 0f) dx = -displayedRect.left
-        else if (displayedRect.right < width) dx = width - displayedRect.right
-        if (displayedRect.height() <= height) dy = height / 2f - displayedRect.centerY()
-        else if (displayedRect.top > 0f) dy = -displayedRect.top
-        else if (displayedRect.bottom < height) dy = height - displayedRect.bottom
-        drawMatrix.postTranslate(dx, dy)
-    }
-}
-
-private fun resolveArabicTypeface(prefs: SharedPreferences): Typeface {
+internal fun resolveArabicTypeface(prefs: SharedPreferences): Typeface {
     val style = if (prefs.getBoolean(PREF_FONT_BOLD, true)) Typeface.BOLD else Typeface.NORMAL
     val customPath = prefs.getString(PREF_FONT_FILE, null)
     if (!customPath.isNullOrBlank()) {
@@ -2356,6 +2087,11 @@ private fun resolveArabicTypeface(prefs: SharedPreferences): Typeface {
     val family = prefs.getString(PREF_FONT_FAMILY, "sans-serif") ?: "sans-serif"
     return Typeface.create(family, style)
 }
+
+
+// ============================================================
+// MERGED FROM: MangaFox_V3_0_3_MangaFoxAccessibilityService.kt
+// ============================================================
 
 class MangaFoxAccessibilityService : AccessibilityService() {
     companion object {
@@ -3005,10 +2741,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 output = BitmapFactory.decodeFile(resultPath) ?: original!!.copy(Bitmap.Config.ARGB_8888, true)
                 Canvas(output!!).drawBitmap(translatedCrop!!, safe.left.toFloat(), safe.top.toFloat(), Paint(Paint.ANTI_ALIAS_FLAG))
                 val target = File(resultPath)
-                val temp = File(target.parentFile, target.nameWithoutExtension + "_region.tmp.jpg")
-                FileOutputStream(temp).use { stream ->
-                    if (!output!!.compress(Bitmap.CompressFormat.JPEG, 96, stream)) throw IllegalStateException("تعذر حفظ المنطقة بعد الترجمة")
-                }
+                val temp = File(target.parentFile, target.nameWithoutExtension + "_region.tmp." + target.extension)
+                writeRenderedBitmap(output!!, temp)
                 if (!temp.renameTo(target)) {
                     temp.copyTo(target, overwrite = true)
                     temp.delete()
@@ -3102,12 +2836,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                         }
                         rendered = drawTranslatedLines(original!!, records)
                         val target = targets[index]
-                        val temp = File(target.parentFile, target.nameWithoutExtension + "_layers.tmp.jpg")
-                        FileOutputStream(temp).use { stream ->
-                            if (!rendered!!.compress(Bitmap.CompressFormat.JPEG, 96, stream)) {
-                                throw IllegalStateException("تعذر حفظ تنسيق الصورة ${index + 1}")
-                            }
-                        }
+                        val temp = File(target.parentFile, target.nameWithoutExtension + "_layers.tmp." + target.extension)
+                        writeRenderedBitmap(rendered!!, temp)
                         if (!temp.renameTo(target)) {
                             temp.copyTo(target, overwrite = true)
                             temp.delete()
@@ -3264,12 +2994,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                                 stream.write(layerArray.toString().toByteArray(Charsets.UTF_8))
                             }
                             newLayerFiles.add(layerFile.absolutePath)
-                            val outputFile = File(filesDir, "mfox_result_${System.currentTimeMillis()}_$index.jpg")
-                            FileOutputStream(outputFile).use { stream ->
-                                if (!outputBitmap.compress(Bitmap.CompressFormat.JPEG, 96, stream)) {
-                                    throw IllegalStateException("تعذر حفظ نتيجة المقطع ${index + 1}")
-                                }
-                            }
+                            // PNG prevents JPEG ringing/gray halos around freshly repainted speech balloons.
+                            val outputFile = File(filesDir, "mfox_result_${System.currentTimeMillis()}_$index.png")
+                            writeRenderedBitmap(outputBitmap, outputFile)
                             translatedFiles.add(outputFile.absolutePath)
                             updateTranslationLens((((index + 1).toFloat() / groups.size) * 100f).toInt().coerceIn(0, 99), "اكتمل المقطع ${index + 1} من ${groups.size}")
                         } finally {
@@ -3565,6 +3292,67 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * Otsu-binarized OCR input for decorative/outlined/faded Latin lettering.
+     * The longest side is capped at 2400 px and pixels are processed in bands
+     * so a full-page threshold pass does not require a second full-size IntArray.
+     */
+    private fun createBinarizedOcrVariant(source: Bitmap): Pair<Bitmap, Float> {
+        val largest = max(source.width, source.height).coerceAtLeast(1)
+        val scale = min(1.45f, 2400f / largest.toFloat()).coerceAtLeast(0.01f)
+        val width = (source.width * scale).roundToInt().coerceAtLeast(1)
+        val height = (source.height * scale).roundToInt().coerceAtLeast(1)
+        val transform = Matrix().apply { setScale(width.toFloat() / source.width, height.toFloat() / source.height) }
+        val scaled = Bitmap.createBitmap(source, 0, 0, source.width, source.height, transform, true)
+        val gray = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val grayscale = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            colorFilter = ColorMatrixColorFilter(ColorMatrix().apply { setSaturation(0f) })
+        }
+        Canvas(gray).drawBitmap(scaled, 0f, 0f, grayscale)
+        if (scaled !== source && !scaled.isRecycled) scaled.recycle()
+
+        val histogram = IntArray(256)
+        val bandHeight = min(64, height).coerceAtLeast(1)
+        val band = IntArray(width * bandHeight)
+        for (top in 0 until height step bandHeight) {
+            val rows = min(bandHeight, height - top)
+            gray.getPixels(band, 0, width, 0, top, width, rows)
+            for (i in 0 until width * rows) histogram[Color.red(band[i]).coerceIn(0, 255)]++
+        }
+        val total = width.toLong() * height.toLong()
+        var sum = 0.0
+        for (v in 0..255) sum += v.toDouble() * histogram[v]
+        var sumBackground = 0.0
+        var weightBackground = 0L
+        var bestVariance = -1.0
+        var threshold = 145
+        for (v in 0..255) {
+            weightBackground += histogram[v].toLong()
+            if (weightBackground == 0L) continue
+            val weightForeground = total - weightBackground
+            if (weightForeground == 0L) break
+            sumBackground += v.toDouble() * histogram[v]
+            val meanBackground = sumBackground / weightBackground
+            val meanForeground = (sum - sumBackground) / weightForeground
+            val delta = meanBackground - meanForeground
+            val variance = weightBackground.toDouble() * weightForeground.toDouble() * delta * delta
+            if (variance > bestVariance) { bestVariance = variance; threshold = v }
+        }
+        // Keep anti-aliased glyph edges readable: the threshold is softened slightly
+        // rather than turning every gray edge pixel into a hard white boundary.
+        val cutoff = (threshold - 8).coerceIn(0, 255)
+        for (top in 0 until height step bandHeight) {
+            val rows = min(bandHeight, height - top)
+            gray.getPixels(band, 0, width, 0, top, width, rows)
+            for (i in 0 until width * rows) {
+                val value = Color.red(band[i])
+                band[i] = if (value <= cutoff) Color.BLACK else Color.WHITE
+            }
+            gray.setPixels(band, 0, width, 0, top, width, rows)
+        }
+        return gray to scale
+    }
+
+    /**
      * Finds enclosed bright regions that resemble speech-balloon interiors.
      * This is a lightweight heuristic (not a trained balloon detector): it runs
      * on a bounded thumbnail and returns only compact, enclosed components.
@@ -3588,7 +3376,14 @@ class MangaFoxAccessibilityService : AccessibilityService() {
 
             fun isBright(index: Int): Boolean {
                 val color = pixels[index]
-                return (Color.red(color) * 30 + Color.green(color) * 59 + Color.blue(color) * 11) / 100 >= 218
+                val red = Color.red(color)
+                val green = Color.green(color)
+                val blue = Color.blue(color)
+                val luminance = (red * 30 + green * 59 + blue * 11) / 100
+                val chroma = max(red, max(green, blue)) - min(red, min(green, blue))
+                // Includes white/gray and pale pastel speech balloons, while avoiding
+                // treating every saturated colorful drawing as a balloon interior.
+                luminance >= 198 && (chroma <= 82 || luminance >= 232)
             }
 
             for (start in 0 until total) {
@@ -3684,15 +3479,34 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             }.getOrNull() ?: return@forEachIndexed
             try {
                 val input = InputImage.fromBitmap(crop, 0)
+                var latinCharacters = 0
                 engines.forEach { engine ->
                     val result = runCatching { Tasks.await(engine.second.process(input)) }.getOrNull()
-                    collectCandidates(result, engine.first, enlarge).forEach { candidate ->
+                    val local = collectCandidates(result, engine.first, enlarge)
+                    if (engine.first == "en") latinCharacters = local.sumOf { item -> item.text.count { it.isLetter() } }
+                    local.forEach { candidate ->
                         val shifted = candidate.bounds?.let { Rect(it).apply { offset(region.left, region.top) } }
                         found.add(candidate.copy(
                             bounds = shifted,
                             containerBounds = Rect(region),
                             bubbleId = index
                         ))
+                    }
+                }
+                // Artistic fonts often fail on the raw crop but become legible after
+                // binarization. Retry only Latin here to bound the additional work.
+                if (engines.any { it.first == "en" } && latinCharacters < 8) {
+                    val (binary, binaryScale) = createBinarizedOcrVariant(crop)
+                    try {
+                        val retry = runCatching {
+                            Tasks.await(latinRecognizer.process(InputImage.fromBitmap(binary, 0)))
+                        }.getOrNull()
+                        collectCandidates(retry, "en", enlarge * binaryScale).forEach { candidate ->
+                            val shifted = candidate.bounds?.let { Rect(it).apply { offset(region.left, region.top) } }
+                            found.add(candidate.copy(bounds = shifted, containerBounds = Rect(region), bubbleId = index))
+                        }
+                    } finally {
+                        if (!binary.isRecycled) binary.recycle()
                     }
                 }
             } finally {
@@ -3965,6 +3779,38 @@ class MangaFoxAccessibilityService : AccessibilityService() {
 
         val allCandidates = ArrayList<OcrCandidate>()
         allCandidates.addAll(recognizeAll(source, 1f))
+        // OCR robustness for non-standard Latin lettering: run an independent
+        // contrast pass even when other scripts were recognized successfully.
+        if (forcedLanguage == "auto" || forcedLanguage == "en") {
+            val existingLatinChars = allCandidates.asSequence().filter { it.engineLanguage == "en" }
+                .sumOf { it.text.count { ch -> ch in 'A'..'Z' || ch in 'a'..'z' } }
+            if (existingLatinChars < 120) {
+                onProgress(0.20f, "فحص الخطوط اللاتينية المزخرفة بعد تحسين التباين")
+                val (latinEnhanced, latinScale) = createOcrVariant(source, inverted = false)
+                try {
+                    val retry = runCatching {
+                        Tasks.await(latinRecognizer.process(InputImage.fromBitmap(latinEnhanced, 0)))
+                    }.getOrNull()
+                    allCandidates.addAll(collectCandidates(retry, "en", latinScale))
+                } finally {
+                    if (!latinEnhanced.isRecycled) latinEnhanced.recycle()
+                }
+                val recoveredLatin = allCandidates.asSequence().filter { it.engineLanguage == "en" }
+                    .sumOf { it.text.count { ch -> ch in 'A'..'Z' || ch in 'a'..'z' } }
+                if (recoveredLatin < 48) {
+                    onProgress(0.235f, "محاولة قراءة الخطوط المزخرفة بالعتبة التكيفية العامة")
+                    val (binary, binaryScale) = createBinarizedOcrVariant(source)
+                    try {
+                        val retry = runCatching {
+                            Tasks.await(latinRecognizer.process(InputImage.fromBitmap(binary, 0)))
+                        }.getOrNull()
+                        allCandidates.addAll(collectCandidates(retry, "en", binaryScale))
+                    } finally {
+                        if (!binary.isRecycled) binary.recycle()
+                    }
+                }
+            }
+        }
         val firstMerged = mergeOcrCandidates(allCandidates)
         val foundChars = firstMerged.sumOf { it.text.count { character -> character.isLetterOrDigit() } }
         if (firstMerged.size < 2 || foundChars < 18) {
@@ -4117,6 +3963,16 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         return rendered
     }
 
+    /** Keeps new rendered pages lossless while preserving JPEG compatibility for older sessions. */
+    private fun writeRenderedBitmap(bitmap: Bitmap, target: File) {
+        val png = target.extension.equals("png", ignoreCase = true)
+        FileOutputStream(target).use { stream ->
+            val format = if (png) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+            val quality = if (png) 100 else 96
+            if (!bitmap.compress(format, quality, stream)) throw IllegalStateException("تعذر حفظ الصورة المعالجة")
+        }
+    }
+
     private fun drawTranslatedLines(source: Bitmap, translatedLines: List<TranslationLine>): Bitmap {
         val output = source.copy(Bitmap.Config.ARGB_8888, true)
             ?: throw IllegalStateException("تعذر إنشاء صورة الترجمة")
@@ -4149,20 +4005,40 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         // Pass 1: erase every source text region first. This avoids a later bubble's
         // background rectangle overwriting Arabic text drawn for an earlier bubble.
         renderItems.forEach { (item, eraseRect, _) ->
-            val margin = max(2, min(eraseRect.width(), eraseRect.height()) / 30)
-            val fillRect = Rect(eraseRect).apply {
-                inset(-margin, -margin)
-                left = left.coerceAtLeast(0)
-                top = top.coerceAtLeast(0)
-                right = right.coerceAtMost(output.width)
-                bottom = bottom.coerceAtMost(output.height)
+            val detectedBubble = item.containerBounds?.let { raw ->
+                Rect(raw).apply {
+                    // Keep the original dark outline/tail untouched; repaint only the inner face.
+                    inset(max(2, width() / 13), max(2, height() / 13))
+                    left = left.coerceIn(0, output.width)
+                    top = top.coerceIn(0, output.height)
+                    right = right.coerceIn(0, output.width)
+                    bottom = bottom.coerceIn(0, output.height)
+                }.takeIf { it.width() >= 12 && it.height() >= 12 }
             }
-            backgroundPaint.color = sampleBubbleColor(source, fillRect)
-            val bounds = RectF(fillRect)
-            when (item.shape) {
-                "oval" -> canvas.drawOval(bounds, backgroundPaint)
-                "rect" -> canvas.drawRect(bounds, backgroundPaint)
-                else -> canvas.drawRoundRect(bounds, 5f, 5f, backgroundPaint)
+            if (detectedBubble != null) {
+                backgroundPaint.color = MangaFoxBubbleRepair.sampleInteriorColor(source, item.containerBounds!!, eraseRect)
+                val bubbleRect = RectF(detectedBubble)
+                val ratio = detectedBubble.width().toFloat() / detectedBubble.height().coerceAtLeast(1)
+                when {
+                    item.shape == "oval" || ratio in 0.82f..1.22f -> canvas.drawOval(bubbleRect, backgroundPaint)
+                    item.shape == "rect" -> canvas.drawRoundRect(bubbleRect, 4f, 4f, backgroundPaint)
+                    else -> {
+                        val radius = min(detectedBubble.width(), detectedBubble.height()) * 0.24f
+                        canvas.drawRoundRect(bubbleRect, radius, radius, backgroundPaint)
+                    }
+                }
+            } else {
+                // Fallback for undetected/complex bubbles: use a tight local patch only.
+                val patch = Rect(eraseRect).apply {
+                    left = left.coerceIn(0, output.width)
+                    top = top.coerceIn(0, output.height)
+                    right = right.coerceIn(0, output.width)
+                    bottom = bottom.coerceIn(0, output.height)
+                }
+                backgroundPaint.color = sampleBubbleColor(source, patch)
+                backgroundPaint.isAntiAlias = false
+                canvas.drawRect(RectF(patch), backgroundPaint)
+                backgroundPaint.isAntiAlias = true
             }
         }
         // Pass 2: draw text only after all backgrounds are ready; clipping keeps
@@ -4547,6 +4423,12 @@ class MangaFoxAccessibilityService : AccessibilityService() {
 }
 
 // PHANTOM CORE INLINE: kept in this file so source-only GitHub uploads cannot omit engine classes.
+
+
+// ============================================================
+// MERGED FROM: MangaFox_V3_0_3_MangaFoxEngines.kt
+// ============================================================
+
 /** Persistent glossary and character bible. This is local-only and never uploads page text. */
 class MangaFoxKnowledgeStore(context: Context) {
     private val prefs = context.getSharedPreferences("mfox_phantom_knowledge_v1", Context.MODE_PRIVATE)
@@ -4905,6 +4787,66 @@ object MangaFoxProjectArchive {
 
 /** Dominant boundary-color sampler for flat speech balloons; avoids forcing dark/colorful areas to white. */
 object MangaFoxBubbleRepair {
+    /**
+     * Samples the balloon face away from its outline and away from the source glyphs.
+     * A quantized dominant-color estimate is more stable than sampling pixels just
+     * outside an OCR rectangle, where the dark outline creates the former gray halo.
+     */
+    fun sampleInteriorColor(bitmap: android.graphics.Bitmap, balloon: Rect, excludedText: Rect): Int {
+        if (bitmap.width < 2 || bitmap.height < 2) return android.graphics.Color.WHITE
+        val safe = Rect(balloon).apply {
+            inset(maxOf(2, width() / 10), maxOf(2, height() / 10))
+            left = left.coerceIn(0, bitmap.width - 1)
+            top = top.coerceIn(0, bitmap.height - 1)
+            right = right.coerceIn(left + 1, bitmap.width)
+            bottom = bottom.coerceIn(top + 1, bitmap.height)
+        }
+        val excluded = Rect(excludedText).apply {
+            inset(-maxOf(3, width() / 5), -maxOf(3, height() / 5))
+        }
+        val stepX = maxOf(1, safe.width() / 24)
+        val stepY = maxOf(1, safe.height() / 24)
+        val samples = ArrayList<Int>(500)
+        var y = safe.top
+        while (y < safe.bottom) {
+            var x = safe.left
+            while (x < safe.right) {
+                if (!excluded.contains(x, y)) samples.add(bitmap.getPixel(x, y))
+                x += stepX
+            }
+            y += stepY
+        }
+        if (samples.size < 8) {
+            // For a very large text box, recover the dominant color from the full
+            // inner balloon. Text pixels are usually a minority in a speech bubble.
+            var fy = safe.top
+            while (fy < safe.bottom) {
+                var fx = safe.left
+                while (fx < safe.right) {
+                    samples.add(bitmap.getPixel(fx, fy))
+                    fx += stepX
+                }
+                fy += stepY
+            }
+        }
+        if (samples.isEmpty()) return android.graphics.Color.WHITE
+
+        val buckets = HashMap<Int, MutableList<Int>>()
+        samples.forEach { color ->
+            val key = ((android.graphics.Color.red(color) shr 5) shl 6) or
+                ((android.graphics.Color.green(color) shr 5) shl 3) or
+                (android.graphics.Color.blue(color) shr 5)
+            buckets.getOrPut(key) { ArrayList() }.add(color)
+        }
+        val dominant = buckets.values.maxByOrNull { it.size }.orEmpty()
+        val chosen = if (dominant.size >= maxOf(6, samples.size / 10)) dominant else samples
+        fun median(channel: (Int) -> Int): Int = chosen.map(channel).sorted()[chosen.size / 2]
+        val red = median { android.graphics.Color.red(it) }
+        val green = median { android.graphics.Color.green(it) }
+        val blue = median { android.graphics.Color.blue(it) }
+        return android.graphics.Color.rgb(red, green, blue)
+    }
+
     fun sampleBackground(bitmap: android.graphics.Bitmap, area: Rect): Int {
         if (bitmap.width < 2 || bitmap.height < 2) return android.graphics.Color.WHITE
         val left = area.left.coerceIn(0, bitmap.width - 1)
@@ -4966,4 +4908,298 @@ object MangaFoxPerformanceAdvisor {
         availableMemoryMb < 1800 -> Profile("متوازن", 2400, 1, true)
         else -> Profile("دقة مرتفعة", 3200, minOf(2, cpuCores.coerceAtLeast(1)), true)
     }
+}
+
+
+// ============================================================
+// MERGED FROM: MangaFox_V3_0_3_MangaFoxImageViews.kt
+// ============================================================
+
+class RegionSelectionView(context: Context) : View(context) {
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(70, 255, 190, 65)
+        style = Paint.Style.FILL
+    }
+    private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(255, 190, 65)
+        style = Paint.Style.STROKE
+        strokeWidth = 3f * resources.displayMetrics.density
+    }
+    private var startX = 0f
+    private var startY = 0f
+    private var selection = RectF()
+    private var hasSelection = false
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (hasSelection) {
+            canvas.drawRect(selection, fillPaint)
+            canvas.drawRect(selection, borderPaint)
+        }
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                startX = event.x.coerceIn(0f, width.toFloat())
+                startY = event.y.coerceIn(0f, height.toFloat())
+                selection.set(startX, startY, startX, startY)
+                hasSelection = true
+                invalidate()
+                return true
+            }
+            MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP -> {
+                val x = event.x.coerceIn(0f, width.toFloat())
+                val y = event.y.coerceIn(0f, height.toFloat())
+                selection.set(min(startX, x), min(startY, y), max(startX, x), max(startY, y))
+                invalidate()
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                hasSelection = false
+                invalidate()
+                return true
+            }
+        }
+        return true
+    }
+
+    fun toSourceRect(sourceWidth: Int, sourceHeight: Int): Rect? {
+        if (!hasSelection || width <= 0 || height <= 0) return null
+        val rect = Rect(
+            (selection.left / width * sourceWidth).roundToInt().coerceIn(0, sourceWidth - 1),
+            (selection.top / height * sourceHeight).roundToInt().coerceIn(0, sourceHeight - 1),
+            (selection.right / width * sourceWidth).roundToInt().coerceIn(1, sourceWidth),
+            (selection.bottom / height * sourceHeight).roundToInt().coerceIn(1, sourceHeight)
+        )
+        return rect.takeIf { it.width() > 0 && it.height() > 0 }
+    }
+}
+
+class ZoomableImageView(context: Context) : ImageView(context) {
+    private val drawMatrix = Matrix()
+    private val displayedRect = RectF()
+    private var userScale = 1f
+    private var lastX = 0f
+    private var lastY = 0f
+    private var dragging = false
+    private var imageFilePath: String? = null
+    private var loadedBitmap: Bitmap? = null
+    private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScale(detector: ScaleGestureDetector): Boolean {
+            val next = (userScale * detector.scaleFactor).coerceIn(1f, 5f)
+            val factor = next / userScale
+            userScale = next
+            drawMatrix.postScale(factor, factor, detector.focusX, detector.focusY)
+            fixBounds()
+            imageMatrix = drawMatrix
+            return true
+        }
+    })
+
+    init {
+        scaleType = ScaleType.MATRIX
+        isClickable = true
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        resetBaseMatrix()
+    }
+
+    fun setImageFile(path: String) {
+        imageFilePath = path
+        releasePage()
+    }
+
+    fun loadPage() {
+        if (loadedBitmap != null) return
+        val path = imageFilePath ?: return
+        val bitmap = BitmapFactory.decodeFile(path) ?: return
+        loadedBitmap = bitmap
+        super.setImageBitmap(bitmap)
+        post { resetBaseMatrix() }
+    }
+
+    fun releasePage() {
+        val old = loadedBitmap
+        loadedBitmap = null
+        super.setImageDrawable(null)
+        old?.let { if (!it.isRecycled) it.recycle() }
+        userScale = 1f
+        drawMatrix.reset()
+    }
+
+    override fun onDetachedFromWindow() {
+        releasePage()
+        super.onDetachedFromWindow()
+    }
+
+    private fun resetBaseMatrix() {
+        val d = drawable ?: return
+        if (width <= 0 || height <= 0 || d.intrinsicWidth <= 0 || d.intrinsicHeight <= 0) return
+        // The page view is measured from the exact source aspect ratio. Scale X/Y
+        // independently by final integer bounds so rounding cannot leave a one-pixel
+        // black seam between consecutive chapter pages.
+        val scaleX = width.toFloat() / d.intrinsicWidth.toFloat()
+        val scaleY = height.toFloat() / d.intrinsicHeight.toFloat()
+        drawMatrix.reset()
+        drawMatrix.setScale(scaleX, scaleY)
+        userScale = 1f
+        imageMatrix = drawMatrix
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        scaleDetector.onTouchEvent(event)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                lastX = event.x
+                lastY = event.y
+                dragging = userScale > 1.01f
+                parent?.requestDisallowInterceptTouchEvent(dragging)
+                return true
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                parent?.requestDisallowInterceptTouchEvent(true)
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (userScale > 1.01f && !scaleDetector.isInProgress && event.pointerCount == 1) {
+                    val dx = event.x - lastX
+                    val dy = event.y - lastY
+                    drawMatrix.postTranslate(dx, dy)
+                    fixBounds()
+                    imageMatrix = drawMatrix
+                    dragging = true
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                }
+                lastX = event.x
+                lastY = event.y
+                return true
+            }
+            MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (userScale <= 1.01f) parent?.requestDisallowInterceptTouchEvent(false)
+                if (event.actionMasked != MotionEvent.ACTION_POINTER_UP && userScale <= 1.01f) resetBaseMatrix()
+                return true
+            }
+        }
+        return true
+    }
+
+    private fun fixBounds() {
+        val d = drawable ?: return
+        displayedRect.set(0f, 0f, d.intrinsicWidth.toFloat(), d.intrinsicHeight.toFloat())
+        drawMatrix.mapRect(displayedRect)
+        var dx = 0f
+        var dy = 0f
+        if (displayedRect.width() <= width) dx = width / 2f - displayedRect.centerX()
+        else if (displayedRect.left > 0f) dx = -displayedRect.left
+        else if (displayedRect.right < width) dx = width - displayedRect.right
+        if (displayedRect.height() <= height) dy = height / 2f - displayedRect.centerY()
+        else if (displayedRect.top > 0f) dy = -displayedRect.top
+        else if (displayedRect.bottom < height) dy = height - displayedRect.bottom
+        drawMatrix.postTranslate(dx, dy)
+    }
+}
+
+
+// ============================================================
+// MERGED FROM: MangaFox_V3_0_3_MangaFoxRuntime.kt
+// ============================================================
+
+object MangaFoxRuntime {
+    private const val SESSION_MANIFEST = "mfox_session_v1.json"
+
+    @Synchronized fun persist(context: Context) {
+        runCatching {
+            val root = org.json.JSONObject()
+                .put("title", resultTitle)
+                .put("quality", qualitySummary)
+                .put("sources", org.json.JSONArray(sourcePages))
+                .put("results", org.json.JSONArray(resultPages))
+                .put("layers", org.json.JSONArray(translationLayerFiles))
+            val target = File(context.filesDir, SESSION_MANIFEST)
+            val temp = File(context.filesDir, "$SESSION_MANIFEST.tmp")
+            temp.writeText(root.toString(), Charsets.UTF_8)
+            if (!temp.renameTo(target)) {
+                temp.copyTo(target, overwrite = true)
+                temp.delete()
+            }
+        }
+    }
+
+    @Synchronized fun restore(context: Context) {
+        runCatching {
+            val manifest = File(context.filesDir, SESSION_MANIFEST)
+            if (!manifest.isFile) {
+                fun indexed(files: List<File>, prefix: String): List<File> = files
+                    .filter { it.isFile && it.name.startsWith(prefix) && it.length() > 0L }
+                    .sortedBy { it.name.substringAfterLast('_').substringBefore('.').toIntOrNull() ?: Int.MAX_VALUE }
+                val legacyResults = indexed(
+                    (context.filesDir.listFiles()?.toList().orEmpty() + context.cacheDir.listFiles()?.toList().orEmpty()),
+                    "mfox_result_"
+                )
+                val legacySources = indexed(context.filesDir.listFiles()?.toList().orEmpty(), "mfox_source_")
+                val legacyLayers = indexed(context.filesDir.listFiles()?.toList().orEmpty(), "mfox_layers_")
+                val count = minOf(legacyResults.size, legacySources.size)
+                if (count > 0) {
+                    resultPages = legacyResults.take(count).map { it.absolutePath }
+                    sourcePages = legacySources.take(count).map { it.absolutePath }
+                    translationLayerFiles = (0 until count).map { legacyLayers.getOrNull(it)?.absolutePath.orEmpty() }
+                    resultTitle = "الفصل السابق"
+                    persist(context)
+                }
+                return
+            }
+            val root = org.json.JSONObject(manifest.readText(Charsets.UTF_8))
+            // Keep positional alignment: an empty layer path for page 2 must not
+            // shift page 3's layer file into page 2 after process restoration.
+            fun stringList(key: String): List<String> {
+                val array = root.optJSONArray(key) ?: return emptyList()
+                return (0 until array.length()).map { index -> array.optString(index, "") }
+            }
+            val sources = stringList("sources")
+            val results = stringList("results")
+            val layers = stringList("layers")
+            val count = minOf(sources.size, results.size)
+            sourcePages = sources.take(count)
+            resultPages = results.take(count)
+            translationLayerFiles = (0 until count).map { layers.getOrNull(it).orEmpty() }
+            resultTitle = root.optString("title", "الفصل المترجم")
+            qualitySummary = root.optString("quality", qualitySummary)
+            if (resultPages.none { File(it).isFile }) {
+                sourcePages = emptyList()
+                resultPages = emptyList()
+                translationLayerFiles = emptyList()
+            }
+        }
+    }
+
+    @Synchronized fun removePage(context: Context, index: Int) {
+        if (index !in resultPages.indices) return
+        val removed = listOfNotNull(
+            resultPages.getOrNull(index), sourcePages.getOrNull(index), translationLayerFiles.getOrNull(index)
+        )
+        resultPages = resultPages.toMutableList().also { it.removeAt(index) }
+        if (index in sourcePages.indices) sourcePages = sourcePages.toMutableList().also { it.removeAt(index) }
+        if (index in translationLayerFiles.indices) translationLayerFiles = translationLayerFiles.toMutableList().also { it.removeAt(index) }
+        removed.forEach { path -> runCatching { File(path).delete() } }
+        persist(context)
+    }
+
+    @Volatile var status: String = "جاهز للترجمة"
+    @Volatile var resultPages: List<String> = emptyList()
+    @Volatile var sourcePages: List<String> = emptyList()
+    @Volatile var resultTitle: String = "الفصل المترجم"
+    @Volatile var lastError: String = ""
+    @Volatile var progressPercent: Int = 0
+    @Volatile var progressDetail: String = ""
+    @Volatile var detectedBlocks: Int = 0
+    @Volatile var translatedBlocks: Int = 0
+    @Volatile var failedBlocks: Int = 0
+    @Volatile var skippedBlocks: Int = 0
+    @Volatile var qualitySummary: String = "لم تبدأ ترجمة بعد"
+    @Volatile var failedBlockSamples: List<String> = emptyList()
+    // Per-page OCR/translation layers are stored separately from the rendered JPG.
+    @Volatile var translationLayerFiles: List<String> = emptyList()
 }
