@@ -79,6 +79,14 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.InputStream
+import java.io.OutputStream
+import java.util.Locale
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 
 private const val ACTION_SHOW_RESULTS = "com.manga.fox.SHOW_RESULTS"
 private const val ACTION_STOP_CAPTURE = "com.manga.fox.STOP_CAPTURE"
@@ -4302,4 +4310,426 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+
+// PHANTOM CORE INLINE: kept in this file so source-only GitHub uploads cannot omit engine classes.
+/** Persistent glossary and character bible. This is local-only and never uploads page text. */
+class MangaFoxKnowledgeStore(context: Context) {
+    private val prefs = context.getSharedPreferences("mfox_phantom_knowledge_v1", Context.MODE_PRIVATE)
+    private val lock = Any()
+
+    data class GlossaryEntry(val source: String, val arabic: String, val note: String = "")
+    data class CharacterEntry(val name: String, val voice: String, val notes: String = "")
+
+    fun glossary(): List<GlossaryEntry> = synchronized(lock) {
+        val array = runCatching { JSONArray(prefs.getString(KEY_GLOSSARY, "[]")) }.getOrElse { JSONArray() }
+        (0 until array.length()).mapNotNull { i ->
+            array.optJSONObject(i)?.let { obj ->
+                val source = obj.optString("source").trim()
+                val arabic = obj.optString("arabic").trim()
+                if (source.isBlank() || arabic.isBlank()) null else GlossaryEntry(source, arabic, obj.optString("note"))
+            }
+        }
+    }
+
+    fun saveGlossaryEntry(entry: GlossaryEntry) = synchronized(lock) {
+        val values = glossary().filterNot { it.source.equals(entry.source, true) }.toMutableList()
+        values.add(entry)
+        val array = JSONArray()
+        values.forEach { array.put(JSONObject().put("source", it.source).put("arabic", it.arabic).put("note", it.note)) }
+        prefs.edit().putString(KEY_GLOSSARY, array.toString()).apply()
+    }
+
+    fun deleteGlossaryEntry(source: String) = synchronized(lock) {
+        val array = JSONArray()
+        glossary().filterNot { it.source.equals(source, true) }.forEach {
+            array.put(JSONObject().put("source", it.source).put("arabic", it.arabic).put("note", it.note))
+        }
+        prefs.edit().putString(KEY_GLOSSARY, array.toString()).apply()
+    }
+
+    fun characters(): List<CharacterEntry> = synchronized(lock) {
+        val array = runCatching { JSONArray(prefs.getString(KEY_CHARACTERS, "[]")) }.getOrElse { JSONArray() }
+        (0 until array.length()).mapNotNull { i ->
+            array.optJSONObject(i)?.let { obj ->
+                val name = obj.optString("name").trim()
+                if (name.isBlank()) null else CharacterEntry(name, obj.optString("voice"), obj.optString("notes"))
+            }
+        }
+    }
+
+    fun saveCharacter(entry: CharacterEntry) = synchronized(lock) {
+        val values = characters().filterNot { it.name.equals(entry.name, true) }.toMutableList()
+        values.add(entry)
+        val array = JSONArray()
+        values.forEach { array.put(JSONObject().put("name", it.name).put("voice", it.voice).put("notes", it.notes)) }
+        prefs.edit().putString(KEY_CHARACTERS, array.toString()).apply()
+    }
+
+    fun deleteCharacter(name: String) = synchronized(lock) {
+        val array = JSONArray()
+        characters().filterNot { it.name.equals(name, true) }.forEach {
+            array.put(JSONObject().put("name", it.name).put("voice", it.voice).put("notes", it.notes))
+        }
+        prefs.edit().putString(KEY_CHARACTERS, array.toString()).apply()
+    }
+
+    /** Exact whole-line entries are safe overrides; partial terms are deliberately not blindly substituted. */
+    fun exactGlossaryTranslation(source: String): String? = glossary().firstOrNull {
+        normalize(it.source) == normalize(source)
+    }?.arabic
+
+    fun exportJson(): String = JSONObject()
+        .put("glossary", JSONArray().also { a -> glossary().forEach { a.put(JSONObject().put("source", it.source).put("arabic", it.arabic).put("note", it.note)) } })
+        .put("characters", JSONArray().also { a -> characters().forEach { a.put(JSONObject().put("name", it.name).put("voice", it.voice).put("notes", it.notes)) } })
+        .toString()
+
+    fun importJson(json: String) = synchronized(lock) {
+        val root = JSONObject(json)
+        val glossaryArray = root.optJSONArray("glossary") ?: JSONArray()
+        val characterArray = root.optJSONArray("characters") ?: JSONArray()
+        val safeGlossary = JSONArray()
+        for (i in 0 until glossaryArray.length()) {
+            val item = glossaryArray.optJSONObject(i) ?: continue
+            val source = item.optString("source").trim().take(180)
+            val arabic = item.optString("arabic").trim().take(300)
+            if (source.isNotBlank() && arabic.isNotBlank()) safeGlossary.put(JSONObject().put("source", source).put("arabic", arabic).put("note", item.optString("note").take(300)))
+        }
+        val safeCharacters = JSONArray()
+        for (i in 0 until characterArray.length()) {
+            val item = characterArray.optJSONObject(i) ?: continue
+            val name = item.optString("name").trim().take(100)
+            if (name.isNotBlank()) safeCharacters.put(JSONObject().put("name", name).put("voice", item.optString("voice").take(300)).put("notes", item.optString("notes").take(1000)))
+        }
+        prefs.edit().putString(KEY_GLOSSARY, safeGlossary.toString()).putString(KEY_CHARACTERS, safeCharacters.toString()).apply()
+    }
+
+    private fun normalize(value: String) = value.lowercase(Locale.ROOT).trim().replace(Regex("\\s+"), " ")
+
+    companion object {
+        private const val KEY_GLOSSARY = "glossary_json"
+        private const val KEY_CHARACTERS = "characters_json"
+    }
+}
+
+data class MangaFoxQualityFinding(val severity: String, val page: Int, val message: String)
+data class MangaFoxPageAudit(
+    val page: Int,
+    val layerCount: Int,
+    val overlapCount: Int,
+    val outOfBoundsCount: Int,
+    val untranslatedCount: Int,
+    val emptyTextCount: Int,
+    val findings: List<MangaFoxQualityFinding>
+)
+data class MangaFoxQualityReport(val pages: List<MangaFoxPageAudit>) {
+    val errorCount get() = pages.sumOf { page -> page.findings.count { it.severity == "خطأ" } }
+    val warningCount get() = pages.sumOf { page -> page.findings.count { it.severity != "خطأ" } }
+    val inspectedLayers get() = pages.sumOf { it.layerCount }
+    fun toArabicText(): String = buildString {
+        append("فحص بنيوي للطبقات: ${pages.size} صفحة · $inspectedLayers طبقة\n")
+        append("مشاكل حرجة: $errorCount · تحذيرات نصية: $warningCount\n\n")
+        pages.filter { it.findings.isNotEmpty() }.forEach { page ->
+            append("الصفحة ${page.page}:\n")
+            page.findings.take(14).forEach { append("• [${it.severity}] ${it.message}\n") }
+            append('\n')
+        }
+        if (pages.all { it.findings.isEmpty() }) append("لم تُكتشف مشاكل بنيوية في الطبقات. هذا لا يثبت صحة OCR أو الترجمة بصرياً؛ راجع الصورة يدوياً أيضاً.")
+        else append("ملاحظة: هذا الفحص يتحقق من بيانات الطبقات والإحداثيات والتداخل. لا يستطيع وحده إثبات أن كل كلمة في الصورة تُرجمت.")
+    }
+}
+
+/** Static quality gate for known structural failure modes: overlap, clipping, blank and likely untranslated layers. */
+object MangaFoxQualityGuard {
+    fun inspect(resultPaths: List<String>, layerPaths: List<String>): MangaFoxQualityReport {
+        val audits = resultPaths.indices.map { pageIndex ->
+            val findings = ArrayList<MangaFoxQualityFinding>()
+            val imagePath = resultPaths.getOrNull(pageIndex).orEmpty()
+            val imageFile = File(imagePath)
+            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            if (imageFile.isFile) BitmapFactory.decodeFile(imagePath, options)
+            val width = options.outWidth
+            val height = options.outHeight
+            val layerPath = layerPaths.getOrNull(pageIndex).orEmpty()
+            val layerFile = File(layerPath)
+            val array = if (layerFile.isFile) runCatching { JSONArray(layerFile.readText(Charsets.UTF_8)) }.getOrNull() else null
+            val layers = (0 until (array?.length() ?: 0)).mapNotNull { array?.optJSONObject(it) }
+                .filterNot { it.optBoolean("_mfoxKeepFlattenedBase", false) }
+            var outside = 0
+            var overlap = 0
+            var untranslated = 0
+            var empty = 0
+            val rects = ArrayList<Pair<Rect, Int>>()
+            layers.forEachIndexed { index, layer ->
+                val left = layer.optInt("left", -1)
+                val top = layer.optInt("top", -1)
+                val right = layer.optInt("right", -1)
+                val bottom = layer.optInt("bottom", -1)
+                if (left < 0 || top < 0 || right <= left || bottom <= top || (width > 0 && right > width) || (height > 0 && bottom > height)) {
+                    outside++
+                    findings.add(MangaFoxQualityFinding("خطأ", pageIndex + 1, "الطبقة ${index + 1} تتجاوز حدود الصورة أو تملك إحداثيات غير صالحة"))
+                } else {
+                    val rect = Rect(left, top, right, bottom)
+                    rects.forEach { (other, otherIndex) ->
+                        val intersection = Rect(rect)
+                        if (intersection.intersect(other)) {
+                            val intersectionArea = intersection.width().toLong() * intersection.height().toLong()
+                            val smallerArea = minOf(rect.width().toLong() * rect.height(), other.width().toLong() * other.height())
+                            if (smallerArea > 0L && intersectionArea.toDouble() / smallerArea >= 0.34) {
+                                overlap++
+                                val severity = if (intersectionArea.toDouble() / smallerArea >= 0.82) "خطأ" else "تحذير"
+                                findings.add(MangaFoxQualityFinding(severity, pageIndex + 1, "تداخل ملحوظ بين الطبقتين ${otherIndex + 1} و${index + 1}"))
+                            }
+                        }
+                    }
+                    rects.add(rect to index)
+                }
+                if (!layer.optBoolean("eraseOnly", false)) {
+                    val translated = layer.optString("translated").trim()
+                    val source = layer.optString("source").trim()
+                    if (translated.isBlank()) {
+                        empty++
+                        findings.add(MangaFoxQualityFinding("خطأ", pageIndex + 1, "الطبقة ${index + 1} لا تحتوي نص ترجمة"))
+                    } else {
+                        fun isArabicLetter(ch: Char): Boolean = ch in '\u0600'..'\u06FF' || ch in '\u0750'..'\u077F' ||
+                            ch in '\u08A0'..'\u08FF' || ch in '\uFB50'..'\uFDFF' || ch in '\uFE70'..'\uFEFF'
+                        val sourceHasForeign = source.any { it.isLetter() && !isArabicLetter(it) }
+                        val outputForeignLetters = translated.count { it.isLetter() && !isArabicLetter(it) }
+                        if (sourceHasForeign && outputForeignLetters >= 3) {
+                            untranslated++
+                            findings.add(MangaFoxQualityFinding("مراجعة", pageIndex + 1, "قد تحتوي الطبقة ${index + 1} على أحرف أجنبية متبقية؛ قد تكون اسماً أو مؤثراً صوتياً ويجب مراجعتها"))
+                        }
+                    }
+                }
+            }
+            if (!imageFile.isFile) findings.add(MangaFoxQualityFinding("خطأ", pageIndex + 1, "ملف الصورة الناتجة غير موجود"))
+            if (!layerFile.isFile) findings.add(MangaFoxQualityFinding("مراجعة", pageIndex + 1, "ملف الطبقات غير موجود؛ لا يمكن تدقيق العناصر القابلة للتحرير"))
+            MangaFoxPageAudit(pageIndex + 1, layers.size, overlap, outside, untranslated, empty, findings)
+        }
+        return MangaFoxQualityReport(audits)
+    }
+}
+
+/** Per-page JSON snapshots for undo/redo. Snapshots are capped to avoid unlimited storage growth. */
+class MangaFoxLayerHistory(private val context: Context) {
+    private fun folder(page: Int, kind: String) = File(context.filesDir, "mfox_phantom_history/page_${page + 1}/$kind").apply { mkdirs() }
+    @Synchronized fun push(page: Int, current: File) {
+        if (page < 0 || !current.isFile || current.length() > 4L * 1024L * 1024L) return
+        runCatching {
+            val target = File(folder(page, "undo"), "${System.currentTimeMillis()}.json")
+            current.copyTo(target, overwrite = true)
+            folder(page, "redo").listFiles()?.forEach { it.delete() }
+            folder(page, "undo").listFiles()?.sortedByDescending { it.name }?.drop(10)?.forEach { it.delete() }
+        }
+    }
+    @Synchronized fun undo(page: Int, current: File): Boolean = move(page, current, "undo", "redo")
+    @Synchronized fun redo(page: Int, current: File): Boolean = move(page, current, "redo", "undo")
+    private fun move(page: Int, current: File, from: String, to: String): Boolean = runCatching {
+        val candidates = folder(page, from).listFiles()?.filter { it.isFile }?.sortedByDescending { it.name }.orEmpty()
+        val snapshot = candidates.firstOrNull() ?: return false
+        if (current.isFile) current.copyTo(File(folder(page, to), "${System.currentTimeMillis()}.json"), overwrite = true)
+        val text = snapshot.readText(Charsets.UTF_8)
+        val temp = File(current.parentFile, current.name + ".history.tmp")
+        temp.writeText(text, Charsets.UTF_8)
+        if (!temp.renameTo(current)) { temp.copyTo(current, overwrite = true); temp.delete() }
+        snapshot.delete()
+        true
+    }.getOrDefault(false)
+}
+
+/** Safe ZIP backup of source/result/layer files plus local terminology and character notes. */
+object MangaFoxProjectArchive {
+    private const val MAX_IMPORT_BYTES = 600L * 1024L * 1024L
+
+    fun export(context: Context, output: OutputStream) {
+        val root = JSONObject()
+            .put("format", "MANGAFOX_PHANTOM_PROJECT")
+            .put("version", 1)
+            .put("title", MangaFoxRuntime.resultTitle)
+        val sources = JSONArray(); val results = JSONArray(); val layers = JSONArray()
+        // Keep every page index aligned even when an older project has a missing source or layer file.
+        MangaFoxRuntime.resultPages.forEachIndexed { index, resultPath ->
+            val source = File(MangaFoxRuntime.sourcePages.getOrNull(index).orEmpty())
+            val result = File(resultPath)
+            val layer = File(MangaFoxRuntime.translationLayerFiles.getOrNull(index).orEmpty())
+            sources.put(if (source.isFile) "source/$index${source.extension.takeIf { it.isNotBlank() }?.let { ".$it" } ?: ".jpg"}" else "")
+            results.put(if (result.isFile) "result/$index${result.extension.takeIf { it.isNotBlank() }?.let { ".$it" } ?: ".jpg"}" else "")
+            layers.put(if (layer.isFile) "layers/$index.json" else "")
+        }
+        root.put("sources", sources).put("results", results).put("layers", layers)
+            .put("quality", MangaFoxRuntime.qualitySummary)
+        ZipOutputStream(output).use { zip ->
+            zip.putNextEntry(ZipEntry("project.json")); zip.write(root.toString().toByteArray(Charsets.UTF_8)); zip.closeEntry()
+            for (i in 0 until sources.length()) {
+                val entry = sources.optString(i)
+                if (entry.isNotBlank()) putFile(zip, entry, File(MangaFoxRuntime.sourcePages[i]))
+            }
+            for (i in 0 until results.length()) {
+                val entry = results.optString(i)
+                if (entry.isNotBlank()) putFile(zip, entry, File(MangaFoxRuntime.resultPages[i]))
+            }
+            for (i in 0 until layers.length()) {
+                val entry = layers.optString(i)
+                if (entry.isNotBlank()) putFile(zip, entry, File(MangaFoxRuntime.translationLayerFiles[i]))
+            }
+            zip.putNextEntry(ZipEntry("knowledge.json"))
+            zip.write(MangaFoxKnowledgeStore(context).exportJson().toByteArray(Charsets.UTF_8))
+            zip.closeEntry()
+        }
+    }
+
+    fun restore(context: Context, input: InputStream) {
+        val temporary = File(context.filesDir, "mfox_phantom_import_${System.currentTimeMillis()}").apply { mkdirs() }
+        var consumed = 0L
+        var importedRootForRollback: File? = null
+        var importCommitted = false
+        val seenEntries = HashSet<String>()
+        try {
+            ZipInputStream(input).use { zip ->
+                while (true) {
+                    val entry = zip.nextEntry ?: break
+                    val name = entry.name.replace('\\', '/')
+                    require(seenEntries.add(name)) { "النسخة تحتوي ملفاً مكرراً: $name" }
+                    require(!entry.isDirectory && !name.startsWith("/") && !name.contains("..") &&
+                        (name == "project.json" || name == "knowledge.json" || name.matches(Regex("(source|result)/[0-9]+\\.(jpg|jpeg|png|webp)", RegexOption.IGNORE_CASE)) || name.matches(Regex("layers/[0-9]+\\.json")))) {
+                        "ملف مشروع غير آمن أو غير مدعوم: $name"
+                    }
+                    val target = File(temporary, name)
+                    require(target.canonicalPath.startsWith(temporary.canonicalPath + File.separator)) { "مسار استيراد غير آمن" }
+                    target.parentFile?.mkdirs()
+                    target.outputStream().use { out ->
+                        val buffer = ByteArray(8192)
+                        while (true) {
+                            val read = zip.read(buffer)
+                            if (read <= 0) break
+                            consumed += read
+                            require(consumed <= MAX_IMPORT_BYTES) { "حجم النسخة الاحتياطية أكبر من الحد المسموح" }
+                            out.write(buffer, 0, read)
+                        }
+                    }
+                    zip.closeEntry()
+                }
+            }
+            val manifest = File(temporary, "project.json")
+            require(manifest.isFile && manifest.length() <= 2L * 1024L * 1024L) { "ملف project.json غير موجود أو أكبر من الحد المسموح" }
+            val root = JSONObject(manifest.readText(Charsets.UTF_8))
+            require(root.optString("format") == "MANGAFOX_PHANTOM_PROJECT") { "صيغة النسخة غير معروفة" }
+            val importedRoot = File(context.filesDir, "mfox_phantom_projects/import_${System.currentTimeMillis()}").apply { mkdirs() }
+            importedRootForRollback = importedRoot
+            val sourceNames = root.optJSONArray("sources") ?: JSONArray()
+            val resultNames = root.optJSONArray("results") ?: JSONArray()
+            val layerNames = root.optJSONArray("layers") ?: JSONArray()
+            val count = minOf(resultNames.length(), sourceNames.length())
+            require(count in 1..2000) { "عدد صفحات النسخة غير صالح أو يتجاوز 2000 صفحة" }
+            val newSources = ArrayList<String>(count)
+            val newResults = ArrayList<String>(count)
+            val newLayers = ArrayList<String>(count)
+            for (i in 0 until count) {
+                fun copyEntry(name: String, folder: String): String {
+                    if (name.isBlank()) return ""
+                    val validName = when (folder) {
+                        "source", "result" -> name.matches(Regex("$folder/[0-9]+\\.(jpg|jpeg|png|webp)", RegexOption.IGNORE_CASE))
+                        "layers" -> name.matches(Regex("layers/[0-9]+\\.json"))
+                        else -> false
+                    }
+                    require(validName) { "مرجع ملف غير صالح" }
+                    val from = File(temporary, name)
+                    require(from.canonicalPath.startsWith(temporary.canonicalPath + File.separator) && from.isFile) { "ملف مفقود أو مساره غير آمن: $name" }
+                    val to = File(importedRoot, name).apply { parentFile?.mkdirs() }
+                    from.copyTo(to, overwrite = true)
+                    return to.absolutePath
+                }
+                newSources.add(copyEntry(sourceNames.optString(i), "source"))
+                newResults.add(copyEntry(resultNames.optString(i), "result"))
+                newLayers.add(copyEntry(layerNames.optString(i), "layers"))
+            }
+            require(newResults.any { it.isNotBlank() && File(it).isFile }) { "النسخة لا تحتوي صور نتائج صالحة" }
+            MangaFoxRuntime.sourcePages = newSources
+            MangaFoxRuntime.resultPages = newResults
+            MangaFoxRuntime.translationLayerFiles = newLayers
+            MangaFoxRuntime.resultTitle = root.optString("title", "مشروع Manga FOX مستورد")
+            MangaFoxRuntime.qualitySummary = root.optString("quality", "تم استيراد المشروع")
+            File(temporary, "knowledge.json").takeIf { it.isFile }?.let { knowledge ->
+                runCatching { MangaFoxKnowledgeStore(context).importJson(knowledge.readText(Charsets.UTF_8)) }
+            }
+            MangaFoxRuntime.persist(context)
+            importCommitted = true
+        } finally {
+            temporary.deleteRecursively()
+            if (!importCommitted) importedRootForRollback?.deleteRecursively()
+        }
+    }
+
+    private fun putFile(zip: ZipOutputStream, entryName: String, file: File) {
+        if (!file.isFile || file.length() > MAX_IMPORT_BYTES) return
+        zip.putNextEntry(ZipEntry(entryName))
+        file.inputStream().use { it.copyTo(zip) }
+        zip.closeEntry()
+    }
+}
+
+
+/** Dominant boundary-color sampler for flat speech balloons; avoids forcing dark/colorful areas to white. */
+object MangaFoxBubbleRepair {
+    fun sampleBackground(bitmap: android.graphics.Bitmap, area: Rect): Int {
+        if (bitmap.width < 2 || bitmap.height < 2) return android.graphics.Color.WHITE
+        val left = area.left.coerceIn(0, bitmap.width - 1)
+        val right = (area.right - 1).coerceIn(left, bitmap.width - 1)
+        val top = area.top.coerceIn(0, bitmap.height - 1)
+        val bottom = (area.bottom - 1).coerceIn(top, bitmap.height - 1)
+        val gap = maxOf(2, minOf(area.width(), area.height()) / 12)
+        val colors = ArrayList<Int>(48)
+        val steps = 12
+        for (i in 0..steps) {
+            val x = left + ((right - left) * i / steps)
+            val y = top + ((bottom - top) * i / steps)
+            val topY = (top - gap).coerceAtLeast(0)
+            val bottomY = (bottom + gap).coerceAtMost(bitmap.height - 1)
+            val leftX = (left - gap).coerceAtLeast(0)
+            val rightX = (right + gap).coerceAtMost(bitmap.width - 1)
+            colors.add(bitmap.getPixel(x, topY))
+            colors.add(bitmap.getPixel(x, bottomY))
+            colors.add(bitmap.getPixel(leftX, y))
+            colors.add(bitmap.getPixel(rightX, y))
+        }
+        fun lum(c: Int) = (android.graphics.Color.red(c) * 30 + android.graphics.Color.green(c) * 59 + android.graphics.Color.blue(c) * 11) / 100
+        val bright = colors.filter { lum(it) >= 218 }
+        val source = if (bright.size >= colors.size * 0.68f) bright else colors
+        fun median(channel: (Int) -> Int): Int = source.map(channel).sorted()[source.size / 2]
+        val r = median { android.graphics.Color.red(it) }
+        val g = median { android.graphics.Color.green(it) }
+        val b = median { android.graphics.Color.blue(it) }
+        val chroma = maxOf(r, g, b) - minOf(r, g, b)
+        val brightness = (r * 30 + g * 59 + b * 11) / 100
+        return when {
+            bright.size >= colors.size * 0.72f && brightness >= 228 && chroma <= 28 -> android.graphics.Color.WHITE
+            brightness >= 242 && chroma <= 12 -> android.graphics.Color.rgb(250, 250, 250)
+            else -> android.graphics.Color.rgb(r, g, b)
+        }
+    }
+}
+
+/** Conservative direction and fitting hints shared by the renderer and editor. */
+object MangaFoxLayoutEngine {
+    fun shouldUseVertical(bounds: Rect, userChoice: String = "auto"): Boolean = when (userChoice) {
+        "vertical" -> true
+        "horizontal" -> false
+        else -> bounds.height() > bounds.width() * 1.42f
+    }
+
+    fun fittingFontSize(preferredPx: Float, rectWidth: Int, rectHeight: Int, minimumPx: Float = 7f): Float {
+        val safeWidth = rectWidth.coerceAtLeast(8).toFloat()
+        val safeHeight = rectHeight.coerceAtLeast(8).toFloat()
+        return minOf(preferredPx, safeWidth * 0.82f, safeHeight * 0.72f).coerceAtLeast(minimumPx)
+    }
+}
+
+/** Runtime profile helper; it never starts more than one CPU-heavy page job per configured worker. */
+object MangaFoxPerformanceAdvisor {
+    data class Profile(val name: String, val maxImageSide: Int, val workerCount: Int, val highContrastPass: Boolean)
+    fun forDevice(availableMemoryMb: Int, cpuCores: Int): Profile = when {
+        availableMemoryMb < 900 -> Profile("توفير الذاكرة", 1800, 1, false)
+        availableMemoryMb < 1800 -> Profile("متوازن", 2400, 1, true)
+        else -> Profile("دقة مرتفعة", 3200, minOf(2, cpuCores.coerceAtLeast(1)), true)
+    }
 }
