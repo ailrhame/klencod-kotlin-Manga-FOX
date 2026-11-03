@@ -3089,7 +3089,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     )
     private data class BlockForTranslation(
         val bounds: Rect, val text: String, val language: String,
-        val containerBounds: Rect? = null
+        val containerBounds: Rect? = null,
+        val mergedLines: Int = 1
     )
 
     private fun countChars(text: String, predicate: (Char) -> Boolean): Int = text.count(predicate)
@@ -3635,7 +3636,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         if (!hasArabicLetters(translated)) return false
         val sourceForeign = foreignLetterCount(source)
         val outputForeign = foreignLetterCount(translated)
-        return sourceForeign == 0 || outputForeign < max(2, (sourceForeign * 0.68f).roundToInt())
+        // Long dialogues legitimately keep names (Xianlun, Yaoyao...) in Latin;
+        // a flat 68% cap used to reject many valid long translations.
+        val allowedRatio = if (source.length > 120) 0.45f else 0.68f
+        return sourceForeign == 0 || outputForeign < max(2, (sourceForeign * allowedRatio).roundToInt())
     }
 
     private fun languageForBlock(text: String, engineHint: String, forced: String): String {
@@ -3773,6 +3777,85 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         return Tasks.await(translator.translate(sourceText))
     }
 
+    /** ML Kit quality drops on long comic strings; translate sentence-sized chunks instead. */
+    private fun translateInChunks(sourceText: String, languageCode: String, maxChunk: Int = 240): String {
+        if (sourceText.length <= maxChunk) return translateWithLanguage(sourceText, languageCode)
+        val sentences = sourceText.split(Regex("(?<=[.!?؟…])\\s+")).filter { it.isNotBlank() }
+        val chunks = ArrayList<String>()
+        val current = StringBuilder()
+        fun flush() {
+            if (current.isNotBlank()) { chunks.add(current.toString().trim()); current.clear() }
+        }
+        for (sentence in sentences) {
+            if (current.length + sentence.length + 1 > maxChunk) flush()
+            if (sentence.length > maxChunk) {
+                var rest = sentence.trim()
+                while (rest.length > maxChunk) {
+                    val cut = rest.lastIndexOf(' ', maxChunk).takeIf { it > 60 } ?: maxChunk
+                    chunks.add(rest.substring(0, cut))
+                    rest = rest.substring(cut).trim()
+                }
+                current.append(rest).append(' ')
+            } else {
+                current.append(sentence).append(' ')
+            }
+        }
+        flush()
+        if (chunks.isEmpty()) return translateWithLanguage(sourceText, languageCode)
+        return chunks.joinToString(" ") { chunk ->
+            runCatching { translateWithLanguage(chunk, languageCode) }.getOrDefault(chunk)
+        }
+    }
+
+    /** Last-resort re-read of one failed block using enhanced variants of its own crop. */
+    private fun retranslateBlockWithEnhancedOcr(source: Bitmap, item: BlockForTranslation, language: String): String? {
+        val b = item.bounds
+        if (b.width() < 24 || b.height() < 12) return null
+        val left = b.left.coerceIn(0, source.width - 1)
+        val top = b.top.coerceIn(0, source.height - 1)
+        val width = b.right.coerceIn(left + 1, source.width) - left
+        val height = b.bottom.coerceIn(top + 1, source.height) - top
+        if (width < 24 || height < 12) return null
+        val crop = runCatching { Bitmap.createBitmap(source, left, top, width, height) }.getOrNull() ?: return null
+        try {
+            val recognizer = when (language) {
+                "ja" -> japaneseRecognizer
+                "ko" -> koreanRecognizer
+                "zh" -> chineseRecognizer
+                else -> latinRecognizer
+            }
+            val variants = listOf(
+                runCatching { createBinarizedOcrVariant(crop) }.getOrNull(),
+                runCatching { createOcrVariant(crop, inverted = false) }.getOrNull()
+            )
+            var bestText: String? = null
+            var bestScore = 0
+            for (entry in variants) {
+                if (entry == null) continue
+                val (variant, _) = entry
+                try {
+                    val result = runCatching {
+                        Tasks.await(recognizer.process(InputImage.fromBitmap(variant, 0)))
+                    }.getOrNull()
+                    val read = result?.text?.trim().orEmpty()
+                    if (read.length < 4) continue
+                    val letters = read.count { it.isLetter() }
+                    val weird = read.count { !(it.isLetterOrDigit() || it.isWhitespace() || it in ".,!?…'\"-—:;()«»") }
+                    val score = letters * 2 - weird * 5
+                    if (score > bestScore) { bestScore = score; bestText = read }
+                } finally {
+                    if (!variant.isRecycled) variant.recycle()
+                }
+            }
+            val read = bestText ?: return null
+            val cleaned = correctLikelyOcrText(read.replace(Regex("\\s+"), " "), language)
+            if (cleaned.length < 3 || cleaned.equals(item.text, ignoreCase = true)) return null
+            return runCatching { translateInChunks(cleaned, language) }.getOrNull()
+        } finally {
+            if (!crop.isRecycled) crop.recycle()
+        }
+    }
+
     private fun retryLanguageCandidates(sourceText: String, current: String): List<String> {
         val detected = runCatching {
             Tasks.await(languageIdentifier.identifyLanguage(sourceText.take(500)))
@@ -3818,7 +3901,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         if (forcedLanguage == "auto" || forcedLanguage == "en") {
             val existingLatinChars = allCandidates.asSequence().filter { it.engineLanguage == "en" }
                 .sumOf { it.text.count { ch -> ch in 'A'..'Z' || ch in 'a'..'z' } }
-            if (existingLatinChars < 120) {
+            if (existingLatinChars < 900) {
                 onProgress(0.20f, "فحص الخطوط اللاتينية المزخرفة بعد تحسين التباين")
                 val (latinEnhanced, latinScale) = createOcrVariant(source, inverted = false)
                 try {
@@ -3897,22 +3980,38 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val blocks = ArrayList<BlockForTranslation>()
         val failedSamples = ArrayList<String>()
         var skippedCount = 0
+        // Merge OCR lines that share one detected balloon into a single block. Translating
+        // one coherent dialogue at once (instead of isolated fragments) is what fixes
+        // the "more text in the bubble = more errors" pattern.
+        val groupedByContainer = LinkedHashMap<String, ArrayList<OcrCandidate>>()
+        val singleBlocks = ArrayList<OcrCandidate>()
         candidates.forEach { candidate ->
-            val code = languageForBlock(candidate.text, candidate.engineLanguage, forcedLanguage)
-            if (code == "ar") {
-                skippedCount++ // Arabic-only blocks stay untouched; other languages on this page continue.
-                return@forEach
-            }
-            val bounds = candidate.bounds
-            if (bounds == null || bounds.width() < 3 || bounds.height() < 3) {
-                skippedCount++ // No safe rendering position was returned by any OCR engine.
-                if (candidate.text.isNotBlank()) failedSamples.add("بلا إحداثيات · ${candidate.text.take(90)}")
-                return@forEach
-            }
-            blocks.add(BlockForTranslation(
-                Rect(bounds), candidate.text, code, candidate.containerBounds?.let(::Rect)
-            ))
+            val key = candidate.containerBounds?.toShortString()
+            if (key != null) groupedByContainer.getOrPut(key) { ArrayList() }.add(candidate)
+            else singleBlocks.add(candidate)
         }
+        fun emitBlock(list: List<OcrCandidate>) {
+            val withBounds = list.mapNotNull { c -> c.bounds?.let { Rect(it) to c } }
+            if (withBounds.isEmpty()) {
+                skippedCount++
+                val t = list.firstOrNull()?.text.orEmpty()
+                if (t.isNotBlank()) failedSamples.add("بلا إحداثيات · ${t.take(90)}")
+                return
+            }
+            val union = Rect(withBounds.first().first)
+            withBounds.drop(1).forEach { union.union(it.first) }
+            if (union.width() < 3 || union.height() < 3) { skippedCount++; return }
+            val joined = withBounds.sortedBy { it.first.top }
+                .joinToString(" ") { it.second.text.trim() }
+                .replace(Regex("\\s+"), " ").trim()
+            if (joined.isBlank()) { skippedCount++; return }
+            val code = languageForBlock(joined, withBounds.first().second.engineLanguage, forcedLanguage)
+            if (code == "ar") { skippedCount++; return }
+            val container = list.firstNotNullOfOrNull { it.containerBounds }?.let(::Rect)
+            blocks.add(BlockForTranslation(union, joined, code, container, withBounds.size))
+        }
+        groupedByContainer.values.forEach { emitBlock(it) }
+        singleBlocks.forEach { emitBlock(listOf(it)) }
         if (blocks.isEmpty()) {
             updateQualityCounts(candidates.size, 0, 0, skippedCount, failedSamples)
             onProgress(1f, "لم توجد كتل أجنبية ذات إحداثيات صالحة")
@@ -3936,7 +4035,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     val mixed = hasArabicLetters(normalizedSource) && hasForeignLetters(normalizedSource)
                     translatedRaw = runCatching {
                         if (mixed) translateMixedTextPreservingArabic(normalizedSource, item.language)
-                        else translateWithLanguage(normalizedSource, item.language)
+                        else translateInChunks(normalizedSource, item.language)
                     }.getOrNull()
                     val firstClean = translatedRaw?.let { cleanArabicTranslation(it) }.orEmpty()
                     val needsArabicOutput = hasForeignLetters(normalizedSource)
@@ -3946,7 +4045,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                         for (retryCode in retryLanguageCandidates(normalizedSource, item.language)) {
                             val retried = runCatching {
                                 if (mixed) translateMixedTextPreservingArabic(normalizedSource, retryCode)
-                                else translateWithLanguage(normalizedSource, retryCode)
+                                else translateInChunks(normalizedSource, retryCode)
                             }.getOrNull()
                             if (!retried.isNullOrBlank()) {
                                 val cleanedRetry = cleanArabicTranslation(retried)
@@ -3968,18 +4067,44 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     (translated.equals(item.text, ignoreCase = true) && item.text.length > 8) ||
                     junkLatin ||
                     (sourceNeedsArabic && !isUsefulArabicTranslation(item.text, translated))) {
-                    failedCount++
-                    failedSamples.add(item.text.take(100))
+                    // Text-heavy bubbles usually carry decorative lettering the full-page
+                    // OCR pass misreads. Re-read just this region with enhanced variants
+                    // and translate the cleaner reading before declaring failure.
+                    val enhancedRaw = if (learned == null && sfx == null && glossaryOverride == null)
+                        retranslateBlockWithEnhancedOcr(source, item, item.language) else null
+                    val enhanced = enhancedRaw?.let { cleanArabicTranslation(it) }.orEmpty()
+                    if (enhanced.isNotBlank() && !enhanced.equals(item.text, ignoreCase = true) &&
+                        !hasUntranslatedLatinRuns(enhanced) &&
+                        (!sourceNeedsArabic || isUsefulArabicTranslation(item.text, enhanced))) {
+                        translatedBlocks.add(TranslationLine(
+                            Rect(item.bounds), enhanced, item.text, item.language,
+                            vertical = item.mergedLines <= 1 && MangaFoxLayoutEngine.shouldUseVertical(item.bounds),
+                            containerBounds = item.containerBounds?.let(::Rect)
+                        ))
+                    } else {
+                        failedCount++
+                        failedSamples.add(item.text.take(100))
+                    }
                 } else {
                     translatedBlocks.add(TranslationLine(
                         Rect(item.bounds), translated, item.text, item.language,
-                        vertical = MangaFoxLayoutEngine.shouldUseVertical(item.bounds),
+                        vertical = item.mergedLines <= 1 && MangaFoxLayoutEngine.shouldUseVertical(item.bounds),
                         containerBounds = item.containerBounds?.let(::Rect)
                     ))
                 }
             } catch (_: Exception) {
-                failedCount++
-                failedSamples.add(item.text.take(100))
+                val rescued = runCatching { retranslateBlockWithEnhancedOcr(source, item, item.language) }.getOrNull()
+                val rescuedClean = rescued?.let { cleanArabicTranslation(it) }.orEmpty()
+                if (rescuedClean.isNotBlank() && !hasUntranslatedLatinRuns(rescuedClean)) {
+                    translatedBlocks.add(TranslationLine(
+                        Rect(item.bounds), rescuedClean, item.text, item.language,
+                        vertical = item.mergedLines <= 1 && MangaFoxLayoutEngine.shouldUseVertical(item.bounds),
+                        containerBounds = item.containerBounds?.let(::Rect)
+                    ))
+                } else {
+                    failedCount++
+                    failedSamples.add(item.text.take(100))
+                }
             }
             onProgress(0.45f + (0.48f * (index + 1) / blocks.size), "ترجمة الكتلة ${index + 1}/${blocks.size}")
         }
