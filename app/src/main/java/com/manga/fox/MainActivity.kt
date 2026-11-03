@@ -1,4 +1,3 @@
-// @N5CR4 | MangaFox V3.0.3 OCR overlap and balloon consolidation hotfix
 package com.manga.fox
 
 import android.accessibilityservice.AccessibilityService
@@ -2131,7 +2130,6 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private val languageIdentifierDelegate = lazy { LanguageIdentification.getClient() }
     private val languageIdentifier by languageIdentifierDelegate
     private val translatorCache = LinkedHashMap<String, Translator>()
-    private val downloadedTranslatorModels = HashSet<String>()
     // Each worker thread owns its OCR output. A crop retry can never overwrite another page's layer list.
     private val lastOcrTranslationLines = ThreadLocal.withInitial<List<TranslationLine>> { emptyList() }
 
@@ -2246,7 +2244,6 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         if (languageIdentifierDelegate.isInitialized()) runCatching { languageIdentifier.close() }
         translatorCache.values.forEach { translator -> runCatching { translator.close() } }
         translatorCache.clear()
-        downloadedTranslatorModels.clear()
     }
 
     fun startSingleCapture(startDelayMs: Long = 250L) {
@@ -3130,8 +3127,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Preserve ML Kit paragraph boundaries: lines inside one TextBlock are joined into
-     * one candidate so a multi-line balloon is translated and typeset as a paragraph.
+     * Prefer line-sized OCR boxes over a whole TextBlock. A block may contain Arabic and
+     * Latin on adjacent lines; assigning one language and one large rectangle to it was
+     * the main source of mixed-script overlaps seen in translated pages.
      */
     private fun collectCandidates(result: Text?, engine: String, scale: Float = 1f): List<OcrCandidate> {
         fun mapBounds(raw: Rect?): Rect? {
@@ -3149,44 +3147,15 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             if (hasVerticalCjk) {
                 listOf(candidateFromBlock(block, engine, scale))
             } else {
-                val lineParts = block.lines.mapNotNull { line ->
+                val lines = block.lines.mapNotNull { line ->
                     val rawBounds = line.boundingBox ?: line.elements.mapNotNull { it.boundingBox }
                         .reduceOrNull { acc, rect -> Rect(acc).apply { union(rect) } }
                     val text = line.text.trim()
-                    if (text.isBlank()) null else mapBounds(rawBounds)?.let { it to text }
+                    if (text.isBlank()) null else OcrCandidate(mapBounds(rawBounds), text, engine)
                 }
-                if (lineParts.isEmpty()) {
-                    listOf(candidateFromBlock(block, engine, scale))
-                } else if (lineParts.size == 1) {
-                    listOf(OcrCandidate(lineParts.first().first, lineParts.first().second, engine))
-                } else {
-                    // ML Kit's TextBlock is the natural paragraph boundary. Keep its
-                    // line sequence together so the translator and renderer see one
-                    // coherent sentence instead of several tiny independent fragments.
-                    val union = Rect(lineParts.first().first).apply {
-                        lineParts.drop(1).forEach { union(it.first) }
-                    }
-                    // ML Kit already returns lines in recognizer reading order. Re-sorting
-                    // by box edges here can scramble horizontal Japanese/Chinese paragraphs.
-                    listOf(OcrCandidate(union, lineParts.joinToString(" ") { it.second }, engine))
-                }
+                if (lines.isNotEmpty()) lines else listOf(candidateFromBlock(block, engine, scale))
             }
-        }.filter { candidate ->
-            if (candidate.text.isBlank()) return@filter false
-            val text = candidate.text
-            val letters = text.count { it.isLetter() }.coerceAtLeast(1)
-            val latin = text.count { it in 'A'..'Z' || it in 'a'..'z' }
-            val kana = text.count { it in '\u3040'..'\u30FF' }
-            val hangul = text.count { it in '\uAC00'..'\uD7AF' || it in '\u1100'..'\u11FF' }
-            val han = text.count { it in '\u4E00'..'\u9FFF' }
-            when (engine) {
-                "en" -> !((kana + hangul + han) >= 3 && (kana + hangul + han) > latin * 1.5f)
-                "ja" -> !(latin >= 3 && kana + han == 0 && latin > hangul * 1.8f)
-                "ko" -> !(latin >= 3 && hangul == 0 && latin > (kana + han) * 1.8f)
-                "zh" -> !(latin >= 3 && han == 0 && latin > (kana + hangul) * 1.8f)
-                else -> true
-            }
-        }
+        }.filter { it.text.isNotBlank() }
     }
 
     private fun intersectionOverUnion(a: Rect, b: Rect): Float {
@@ -3208,40 +3177,6 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         return letters * 5 + arabic * 2 - replacement * 12 - areaPenalty.coerceAtMost(40)
     }
 
-    private fun normalizedOcrText(value: String): String =
-        value.lowercase().filter { it.isLetterOrDigit() }
-
-    /** Similarity tolerant of normal OCR substitutions, but not just shared character sets. */
-    private fun ocrTextSimilarity(first: String, second: String): Float {
-        val a = normalizedOcrText(first).take(320)
-        val b = normalizedOcrText(second).take(320)
-        if (a.isBlank() || b.isBlank()) return 0f
-        if (a == b) return 1f
-        val shorter = min(a.length, b.length)
-        val longer = max(a.length, b.length)
-        if (shorter < 3) return if (a.contains(b) || b.contains(a)) 1f else 0f
-        if (a.contains(b) || b.contains(a)) return shorter.toFloat() / longer
-        if (longer - shorter > longer * 0.62f) return 0f
-
-        var previous = IntArray(b.length + 1) { it }
-        var current = IntArray(b.length + 1)
-        for (i in a.indices) {
-            current[0] = i + 1
-            for (j in b.indices) {
-                val substitution = if (a[i] == b[j]) 0 else 1
-                current[j + 1] = minOf(
-                    current[j] + 1,
-                    previous[j + 1] + 1,
-                    previous[j] + substitution
-                )
-            }
-            val swap = previous
-            previous = current
-            current = swap
-        }
-        return 1f - previous[b.length].toFloat() / longer
-    }
-
     private fun mergeOcrCandidates(input: List<OcrCandidate>): List<OcrCandidate> {
         val merged = ArrayList<OcrCandidate>()
         fun overlaps(a: Rect, b: Rect): Boolean {
@@ -3255,36 +3190,37 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             val containedOverlap = intersection.toFloat() / smallerArea.toFloat()
             return intersectionOverUnion(a, b) >= 0.22f || containedOverlap >= 0.76f
         }
-
         input.asSequence()
             .filter { it.text.isNotBlank() && it.bounds?.let { box -> box.width() > 2 && box.height() > 2 } == true }
             .sortedByDescending { candidateQuality(it) }
             .forEach { candidate ->
                 val box = candidate.bounds ?: return@forEach
                 val conflicts = merged.filter { old -> old.bounds?.let { overlaps(it, box) } == true }
-                val duplicateConflicts = conflicts.filter { old ->
-                    ocrTextSimilarity(old.text, candidate.text) >= 0.52f
-                }
-                if (duplicateConflicts.isEmpty()) {
-                    // Spatial overlap alone is not enough to discard text: two separate
-                    // stylized effects can touch or cross. Keep genuinely different text.
+                if (conflicts.isEmpty()) {
                     merged.add(candidate)
                 } else {
-                    val group = duplicateConflicts + candidate
-                    val winner = group.maxByOrNull { candidateEngineQuality(it) } ?: candidate
+                    // Collapse every overlapping duplicate at once; replacing only the first
+                    // collision allowed a third OCR engine's near-identical box to survive.
+                    val group = conflicts + candidate
+                    val winner = group.maxByOrNull { candidateQuality(it) } ?: candidate
                     val bubbleMetadata = group.firstOrNull { it.containerBounds != null }
-                    merged.removeAll { old -> duplicateConflicts.contains(old) }
+                    merged.removeAll { old -> old.bounds?.let { overlaps(it, box) } == true }
                     merged.add(winner.copy(
                         containerBounds = bubbleMetadata?.containerBounds?.let(::Rect),
                         bubbleId = bubbleMetadata?.bubbleId
                     ))
                 }
             }
-
-        // Do not run a geometry-only non-overlap filter here. It erased legitimate
-        // adjacent/overprinted lettering; duplicate OCR variants were already clustered
-        // using both their geometry and their normalized edit-distance similarity.
-        return merged.sortedWith(
+        // Deterministically remove residual collisions caused by chained/partially intersecting boxes.
+        val nonOverlapping = ArrayList<OcrCandidate>()
+        merged.sortedByDescending { candidateQuality(it) }.forEach { candidate ->
+            val box = candidate.bounds ?: return@forEach
+            if (nonOverlapping.none { it.bounds?.let { accepted -> overlaps(accepted, box) } == true }) {
+                nonOverlapping.add(candidate)
+            }
+        }
+        // Manga panels are read top-to-bottom, then right-to-left within a visual row.
+        return nonOverlapping.sortedWith(
             compareBy<OcrCandidate> { it.bounds?.top ?: Int.MAX_VALUE }
                 .thenByDescending { it.bounds?.right ?: Int.MIN_VALUE }
         )
@@ -3608,83 +3544,12 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             if (match == null) candidate
             else candidate.copy(containerBounds = Rect(match.value), bubbleId = match.index)
         }
-        // A speech balloon is expected to contain multiple OCR lines. All of them
-        // deliberately share the same container; paragraph consolidation happens next.
-        return associated
-    }
-
-    /**
-     * Consolidates a detected balloon without concatenating duplicate readings from
-     * multiple OCR engines. ML Kit TextBlocks already contain their own ordered lines;
-     * when several engines see the same balloon, select the most script-compatible
-     * engine result instead of treating alternate OCR readings as extra dialogue.
-     */
-    private fun candidateEngineQuality(candidate: OcrCandidate): Int {
-        val text = candidate.text
-        val latin = text.count { it in 'A'..'Z' || it in 'a'..'z' }
-        val kana = text.count { it in '\u3040'..'\u30FF' }
-        val hangul = text.count { it in '\uAC00'..'\uD7AF' || it in '\u1100'..'\u11FF' }
-        val han = text.count { it in '\u4E00'..'\u9FFF' }
-        val scriptFit = when (candidate.engineLanguage) {
-            "en" -> latin * 5 - (kana + hangul + han) * 8
-            "ja" -> kana * 9 + han * 2 - hangul * 8
-            "ko" -> hangul * 10 - (kana + han) * 5
-            "zh" -> han * 4 - (kana + hangul) * 7
-            else -> 0
+        val counts = associated.mapNotNull { it.bubbleId }.groupingBy { it }.eachCount()
+        return associated.map { candidate ->
+            val id = candidate.bubbleId
+            if (id != null && counts[id] == 1) candidate
+            else candidate.copy(containerBounds = null, bubbleId = null)
         }
-        val noisePenalty = text.count { it == '\uFFFD' || it == '\u0000' || it == '\u25A1' } * 18
-        return candidateQuality(candidate) * 2 + scriptFit - noisePenalty
-    }
-
-    private fun consolidateBubbleCandidates(candidates: List<OcrCandidate>): List<OcrCandidate> {
-        val output = ArrayList<OcrCandidate>()
-        val contained = candidates.filter { it.bubbleId != null && it.containerBounds != null }
-        val uncontained = candidates.filter { it.bubbleId == null || it.containerBounds == null }
-
-        contained.groupBy { it.bubbleId }.values.forEach { group ->
-            // Keep one recognizer's reading for this balloon. Combining EN/JA/KO/ZH
-            // strings unconditionally was the direct source of duplicated overlapping
-            // Arabic text in pages where all four recognizers partially read the same line.
-            val bestEngine = group.groupBy { it.engineLanguage }.maxByOrNull { (_, items) ->
-                items.sumOf { candidateEngineQuality(it) }
-            }?.value ?: group
-            val bestLanguage = bestEngine.firstOrNull()?.engineLanguage ?: "und"
-            val ordered = if (bestLanguage == "ja" || bestLanguage == "zh") {
-                bestEngine.sortedWith(
-                    compareBy<OcrCandidate> { it.bounds?.top ?: Int.MAX_VALUE }
-                        .thenByDescending { it.bounds?.right ?: Int.MIN_VALUE }
-                )
-            } else {
-                bestEngine.sortedWith(
-                    compareBy<OcrCandidate> { it.bounds?.top ?: Int.MAX_VALUE }
-                        .thenBy { it.bounds?.left ?: Int.MAX_VALUE }
-                )
-            }
-
-            // A single TextBlock is already a paragraph. If the same engine emitted
-            // multiple distinct blocks inside a balloon, join those blocks once.
-            val bounds = ordered.mapNotNull { it.bounds }
-                .reduceOrNull { acc, rect -> Rect(acc).apply { union(rect) } }
-            val container = ordered.firstNotNullOfOrNull { it.containerBounds?.let(::Rect) }
-            val text = ordered.map { it.text.trim() }
-                .filter { it.isNotBlank() }
-                .distinctBy { it.lowercase().filter(Char::isLetterOrDigit) }
-                .joinToString(" ")
-                .replace(Regex("\\s+"), " ").trim()
-            val engine = ordered.firstOrNull()?.engineLanguage ?: "und"
-            val bubbleId = ordered.firstOrNull()?.bubbleId
-            if (bounds != null && text.isNotBlank()) {
-                output.add(OcrCandidate(bounds, text, engine, container, bubbleId))
-            }
-        }
-
-        // Uncontained TextBlocks remain independent. The spatial deduplication pass in
-        // mergeOcrCandidates has already removed overlapping cross-engine duplicates.
-        output.addAll(uncontained)
-        return output.sortedWith(
-            compareBy<OcrCandidate> { it.bounds?.top ?: Int.MAX_VALUE }
-                .thenByDescending { it.bounds?.right ?: Int.MIN_VALUE }
-        )
     }
 
     private fun rotatedJapaneseCandidates(source: Bitmap): List<OcrCandidate> {
@@ -3856,9 +3721,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             "バン" to "بانغ!",
             "ザッ" to "خطوة سريعة!"
         )
-        return dictionary.entries.firstOrNull { (key, _) ->
-            normalized == key || (normalized.length <= key.length + 2 && normalized.startsWith(key))
-        }?.value
+        return dictionary.entries.firstOrNull { normalized.contains(it.key) }?.value
     }
 
     private fun isLikelyAdPage(candidates: List<OcrCandidate>): Boolean {
@@ -3867,28 +3730,12 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val soft = listOf("next chapter", "read more", "follow us", "support the author", "join our discord", "subscribe", "次の話", "次の章", "다음 화", "다음 회", "下一章", "继续阅读")
         val strongHits = strong.count { content.contains(it) }
         val softHits = soft.count { content.contains(it) }
-        val wordCount = content.split(Regex("\\s+")).count { it.length >= 2 }
-        val promoHits = (strong + soft).count { content.contains(it) }
-        val promotionalDensity = promoHits.toFloat() / max(1, candidates.size)
-        // One incidental word such as "download" or "next chapter" is not enough
-        // to skip a page. Require several independent signals and a sparse page.
-        return (strongHits >= 2 && candidates.size <= 10 && promotionalDensity >= 0.25f) ||
-            (strongHits >= 1 && softHits >= 1 && candidates.size <= 8 && wordCount <= 45) ||
-            (softHits >= 3 && candidates.size <= 6)
+        return strongHits > 0 || (softHits >= 2 && candidates.size <= 12)
     }
 
     private fun translateWithLanguage(sourceText: String, languageCode: String): String {
         val translator = translatorFor(languageCode)
-        // Translation runs on the service's single worker. Cache model readiness so
-        // a chapter with many balloons does not request the same model for every block.
-        if (synchronized(downloadedTranslatorModels) { downloadedTranslatorModels.add(languageCode) }) {
-            try {
-                Tasks.await(translator.downloadModelIfNeeded(DownloadConditions.Builder().build()))
-            } catch (error: Exception) {
-                synchronized(downloadedTranslatorModels) { downloadedTranslatorModels.remove(languageCode) }
-                throw error
-            }
-        }
+        Tasks.await(translator.downloadModelIfNeeded(DownloadConditions.Builder().build()))
         return Tasks.await(translator.translate(sourceText))
     }
 
@@ -3998,7 +3845,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             allCandidates.addAll(rotatedJapaneseCandidates(source))
         }
         val mergedCandidates = mergeOcrCandidates(allCandidates)
-        val candidates = consolidateBubbleCandidates(attachSingleBlockBubbleContainers(source, mergedCandidates))
+        val candidates = attachSingleBlockBubbleContainers(source, mergedCandidates)
         if (candidates.isEmpty()) {
             updateQualityCounts(0, 0, 0, 0, emptyList())
             onProgress(1f, "لم يكتشف OCR أي نص واضح")
@@ -4025,7 +3872,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             val bounds = candidate.bounds
             if (bounds == null || bounds.width() < 3 || bounds.height() < 3) {
                 skippedCount++ // No safe rendering position was returned by any OCR engine.
-                if (candidate.text.isNotBlank()) failedSamples.add("needsReview · بلا إحداثيات · ${candidate.text.take(90)}")
+                if (candidate.text.isNotBlank()) failedSamples.add("بلا إحداثيات · ${candidate.text.take(90)}")
                 return@forEach
             }
             blocks.add(BlockForTranslation(
@@ -4040,7 +3887,6 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
 
         val translatedBlocks = ArrayList<TranslationLine>()
-        val knowledgeStore = MangaFoxKnowledgeStore(this)
         var failedCount = 0
         blocks.forEachIndexed { index, item ->
             try {
@@ -4050,7 +3896,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 val sfx = if (getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(PREF_TRANSLATE_SFX, false)) {
                     dictionarySfxTranslation(item.text)
                 } else null
-                val glossaryOverride = knowledgeStore.exactGlossaryTranslation(normalizedSource)
+                val glossaryOverride = MangaFoxKnowledgeStore(this).exactGlossaryTranslation(normalizedSource)
                 var translatedRaw: String? = learned ?: sfx ?: glossaryOverride
                 if (translatedRaw == null) {
                     val mixed = hasArabicLetters(normalizedSource) && hasForeignLetters(normalizedSource)
@@ -4081,25 +3927,20 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 }
                 val translated = translatedRaw?.let { cleanArabicTranslation(it) }.orEmpty()
                 val sourceNeedsArabic = hasForeignLetters(item.text)
-                val meaningfulLetters = item.text.count { it.isLetter() }
-                val shortNameOrToken = meaningfulLetters in 1..2 && item.text.length <= 6
-                if (shortNameOrToken && (translated.isBlank() || translated.equals(item.text, ignoreCase = true))) {
-                    skippedCount++
-                    failedSamples.add("needsReview · رمز/اسم قصير · ${item.bounds.left},${item.bounds.top},${item.bounds.right},${item.bounds.bottom} · ${item.text.take(50)}")
-                } else if (translated.isBlank() || translated.equals(item.text, ignoreCase = true) ||
+                if (translated.isBlank() || translated.equals(item.text, ignoreCase = true) ||
                     (sourceNeedsArabic && !isUsefulArabicTranslation(item.text, translated))) {
                     failedCount++
-                    failedSamples.add("needsReview · ${item.bounds.left},${item.bounds.top},${item.bounds.right},${item.bounds.bottom} · ${item.text.take(90)}")
+                    failedSamples.add(item.text.take(100))
                 } else {
                     translatedBlocks.add(TranslationLine(
                         Rect(item.bounds), translated, item.text, item.language,
-                        vertical = MangaFoxLayoutEngine.shouldUseVertical(item.bounds, language = item.language),
+                        vertical = MangaFoxLayoutEngine.shouldUseVertical(item.bounds),
                         containerBounds = item.containerBounds?.let(::Rect)
                     ))
                 }
             } catch (_: Exception) {
                 failedCount++
-                failedSamples.add("needsReview · ${item.bounds.left},${item.bounds.top},${item.bounds.right},${item.bounds.bottom} · ${item.text.take(90)}")
+                failedSamples.add(item.text.take(100))
             }
             onProgress(0.45f + (0.48f * (index + 1) / blocks.size), "ترجمة الكتلة ${index + 1}/${blocks.size}")
         }
@@ -4112,7 +3953,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         lastOcrTranslationLines.set(translatedBlocks.map {
             TranslationLine(
                 Rect(it.bounds), it.translated, it.sourceText, it.language,
-                vertical = MangaFoxLayoutEngine.shouldUseVertical(it.bounds, language = it.language),
+                vertical = MangaFoxLayoutEngine.shouldUseVertical(it.bounds),
                 containerBounds = it.containerBounds?.let(::Rect)
             )
         })
@@ -5046,10 +4887,10 @@ object MangaFoxBubbleRepair {
 
 /** Conservative direction and fitting hints shared by the renderer and editor. */
 object MangaFoxLayoutEngine {
-    fun shouldUseVertical(bounds: Rect, userChoice: String = "auto", language: String = "auto"): Boolean = when (userChoice) {
+    fun shouldUseVertical(bounds: Rect, userChoice: String = "auto"): Boolean = when (userChoice) {
         "vertical" -> true
         "horizontal" -> false
-        else -> language in setOf("ja", "zh") && bounds.height() > bounds.width() * 1.85f
+        else -> bounds.height() > bounds.width() * 1.42f
     }
 
     fun fittingFontSize(preferredPx: Float, rectWidth: Int, rectHeight: Int, minimumPx: Float = 7f): Float {
