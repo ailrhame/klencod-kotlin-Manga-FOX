@@ -1,4 +1,4 @@
-// @N5CR4 | MangaFox V3.0.3 single-file maintenance build
+// @N5CR4 | MangaFox V3.0.3 OCR overlap and balloon consolidation hotfix
 package com.manga.fox
 
 import android.accessibilityservice.AccessibilityService
@@ -3166,12 +3166,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     val union = Rect(lineParts.first().first).apply {
                         lineParts.drop(1).forEach { union(it.first) }
                     }
-                    val ordered = if (engine == "ja" || engine == "zh") {
-                        lineParts.sortedWith(compareByDescending<Pair<Rect, String>> { it.first.right }.thenBy { it.first.top })
-                    } else {
-                        lineParts.sortedWith(compareBy<Pair<Rect, String>> { it.first.top }.thenBy { it.first.left })
-                    }
-                    listOf(OcrCandidate(union, ordered.joinToString(" ") { it.second }, engine))
+                    // ML Kit already returns lines in recognizer reading order. Re-sorting
+                    // by box edges here can scramble horizontal Japanese/Chinese paragraphs.
+                    listOf(OcrCandidate(union, lineParts.joinToString(" ") { it.second }, engine))
                 }
             }
         }.filter { candidate ->
@@ -3211,6 +3208,40 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         return letters * 5 + arabic * 2 - replacement * 12 - areaPenalty.coerceAtMost(40)
     }
 
+    private fun normalizedOcrText(value: String): String =
+        value.lowercase().filter { it.isLetterOrDigit() }
+
+    /** Similarity tolerant of normal OCR substitutions, but not just shared character sets. */
+    private fun ocrTextSimilarity(first: String, second: String): Float {
+        val a = normalizedOcrText(first).take(320)
+        val b = normalizedOcrText(second).take(320)
+        if (a.isBlank() || b.isBlank()) return 0f
+        if (a == b) return 1f
+        val shorter = min(a.length, b.length)
+        val longer = max(a.length, b.length)
+        if (shorter < 3) return if (a.contains(b) || b.contains(a)) 1f else 0f
+        if (a.contains(b) || b.contains(a)) return shorter.toFloat() / longer
+        if (longer - shorter > longer * 0.62f) return 0f
+
+        var previous = IntArray(b.length + 1) { it }
+        var current = IntArray(b.length + 1)
+        for (i in a.indices) {
+            current[0] = i + 1
+            for (j in b.indices) {
+                val substitution = if (a[i] == b[j]) 0 else 1
+                current[j + 1] = minOf(
+                    current[j] + 1,
+                    previous[j + 1] + 1,
+                    previous[j] + substitution
+                )
+            }
+            val swap = previous
+            previous = current
+            current = swap
+        }
+        return 1f - previous[b.length].toFloat() / longer
+    }
+
     private fun mergeOcrCandidates(input: List<OcrCandidate>): List<OcrCandidate> {
         val merged = ArrayList<OcrCandidate>()
         fun overlaps(a: Rect, b: Rect): Boolean {
@@ -3224,44 +3255,35 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             val containedOverlap = intersection.toFloat() / smallerArea.toFloat()
             return intersectionOverUnion(a, b) >= 0.22f || containedOverlap >= 0.76f
         }
+
         input.asSequence()
             .filter { it.text.isNotBlank() && it.bounds?.let { box -> box.width() > 2 && box.height() > 2 } == true }
             .sortedByDescending { candidateQuality(it) }
             .forEach { candidate ->
                 val box = candidate.bounds ?: return@forEach
                 val conflicts = merged.filter { old -> old.bounds?.let { overlaps(it, box) } == true }
-                if (conflicts.isEmpty()) {
+                val duplicateConflicts = conflicts.filter { old ->
+                    ocrTextSimilarity(old.text, candidate.text) >= 0.52f
+                }
+                if (duplicateConflicts.isEmpty()) {
+                    // Spatial overlap alone is not enough to discard text: two separate
+                    // stylized effects can touch or cross. Keep genuinely different text.
                     merged.add(candidate)
                 } else {
-                    val normalized = candidate.text.lowercase().filter { it.isLetterOrDigit() }
-                    val duplicateConflicts = conflicts.filter { old ->
-                        val prior = old.text.lowercase().filter { it.isLetterOrDigit() }
-                        if (normalized.isBlank() || prior.isBlank()) false
-                        else normalized == prior || normalized.contains(prior) || prior.contains(normalized) ||
-                            run {
-                                val common = normalized.toSet().intersect(prior.toSet()).size
-                                common.toFloat() / max(1, min(normalized.length, prior.length)) >= 0.82f &&
-                                    abs(normalized.length - prior.length) <= max(2, min(normalized.length, prior.length) / 5)
-                            }
-                    }
-                    if (duplicateConflicts.isEmpty()) {
-                        // Overlapping boxes can contain different words (especially
-                        // stylized lettering); preserve both instead of discarding text.
-                        merged.add(candidate)
-                    } else {
-                        val group = duplicateConflicts + candidate
-                        val winner = group.maxByOrNull { candidateQuality(it) } ?: candidate
-                        val bubbleMetadata = group.firstOrNull { it.containerBounds != null }
-                        merged.removeAll { old -> duplicateConflicts.contains(old) }
-                        merged.add(winner.copy(
-                            containerBounds = bubbleMetadata?.containerBounds?.let(::Rect),
-                            bubbleId = bubbleMetadata?.bubbleId
-                        ))
-                    }
+                    val group = duplicateConflicts + candidate
+                    val winner = group.maxByOrNull { candidateEngineQuality(it) } ?: candidate
+                    val bubbleMetadata = group.firstOrNull { it.containerBounds != null }
+                    merged.removeAll { old -> duplicateConflicts.contains(old) }
+                    merged.add(winner.copy(
+                        containerBounds = bubbleMetadata?.containerBounds?.let(::Rect),
+                        bubbleId = bubbleMetadata?.bubbleId
+                    ))
                 }
             }
-        // Preserve independent overlapping OCR detections. Downstream bubble grouping
-        // and quality checks can resolve layout; deleting a lower-ranked box here loses text.
+
+        // Do not run a geometry-only non-overlap filter here. It erased legitimate
+        // adjacent/overprinted lettering; duplicate OCR variants were already clustered
+        // using both their geometry and their normalized edit-distance similarity.
         return merged.sortedWith(
             compareBy<OcrCandidate> { it.bounds?.top ?: Int.MAX_VALUE }
                 .thenByDescending { it.bounds?.right ?: Int.MIN_VALUE }
@@ -3591,29 +3613,73 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         return associated
     }
 
-    /** Combines all OCR line fragments belonging to one detected balloon into one paragraph. */
+    /**
+     * Consolidates a detected balloon without concatenating duplicate readings from
+     * multiple OCR engines. ML Kit TextBlocks already contain their own ordered lines;
+     * when several engines see the same balloon, select the most script-compatible
+     * engine result instead of treating alternate OCR readings as extra dialogue.
+     */
+    private fun candidateEngineQuality(candidate: OcrCandidate): Int {
+        val text = candidate.text
+        val latin = text.count { it in 'A'..'Z' || it in 'a'..'z' }
+        val kana = text.count { it in '\u3040'..'\u30FF' }
+        val hangul = text.count { it in '\uAC00'..'\uD7AF' || it in '\u1100'..'\u11FF' }
+        val han = text.count { it in '\u4E00'..'\u9FFF' }
+        val scriptFit = when (candidate.engineLanguage) {
+            "en" -> latin * 5 - (kana + hangul + han) * 8
+            "ja" -> kana * 9 + han * 2 - hangul * 8
+            "ko" -> hangul * 10 - (kana + han) * 5
+            "zh" -> han * 4 - (kana + hangul) * 7
+            else -> 0
+        }
+        val noisePenalty = text.count { it == '\uFFFD' || it == '\u0000' || it == '\u25A1' } * 18
+        return candidateQuality(candidate) * 2 + scriptFit - noisePenalty
+    }
+
     private fun consolidateBubbleCandidates(candidates: List<OcrCandidate>): List<OcrCandidate> {
         val output = ArrayList<OcrCandidate>()
         val contained = candidates.filter { it.bubbleId != null && it.containerBounds != null }
         val uncontained = candidates.filter { it.bubbleId == null || it.containerBounds == null }
+
         contained.groupBy { it.bubbleId }.values.forEach { group ->
-            if (group.size == 1) {
-                output.add(group.first())
-            } else {
-                val ordered = group.sortedWith(
+            // Keep one recognizer's reading for this balloon. Combining EN/JA/KO/ZH
+            // strings unconditionally was the direct source of duplicated overlapping
+            // Arabic text in pages where all four recognizers partially read the same line.
+            val bestEngine = group.groupBy { it.engineLanguage }.maxByOrNull { (_, items) ->
+                items.sumOf { candidateEngineQuality(it) }
+            }?.value ?: group
+            val bestLanguage = bestEngine.firstOrNull()?.engineLanguage ?: "und"
+            val ordered = if (bestLanguage == "ja" || bestLanguage == "zh") {
+                bestEngine.sortedWith(
                     compareBy<OcrCandidate> { it.bounds?.top ?: Int.MAX_VALUE }
                         .thenByDescending { it.bounds?.right ?: Int.MIN_VALUE }
                 )
-                val bounds = ordered.mapNotNull { it.bounds }.reduceOrNull { acc, rect -> Rect(acc).apply { union(rect) } }
-                val container = ordered.firstNotNullOfOrNull { it.containerBounds?.let(::Rect) }
-                val text = ordered.joinToString(" ") { it.text.trim() }.replace(Regex("\\s+"), " ").trim()
-                val engine = ordered.groupingBy { it.engineLanguage }.eachCount().maxByOrNull { it.value }?.key ?: ordered.first().engineLanguage
-                if (bounds != null && text.isNotBlank()) output.add(OcrCandidate(bounds, text, engine, container, ordered.first().bubbleId))
+            } else {
+                bestEngine.sortedWith(
+                    compareBy<OcrCandidate> { it.bounds?.top ?: Int.MAX_VALUE }
+                        .thenBy { it.bounds?.left ?: Int.MAX_VALUE }
+                )
+            }
+
+            // A single TextBlock is already a paragraph. If the same engine emitted
+            // multiple distinct blocks inside a balloon, join those blocks once.
+            val bounds = ordered.mapNotNull { it.bounds }
+                .reduceOrNull { acc, rect -> Rect(acc).apply { union(rect) } }
+            val container = ordered.firstNotNullOfOrNull { it.containerBounds?.let(::Rect) }
+            val text = ordered.map { it.text.trim() }
+                .filter { it.isNotBlank() }
+                .distinctBy { it.lowercase().filter(Char::isLetterOrDigit) }
+                .joinToString(" ")
+                .replace(Regex("\\s+"), " ").trim()
+            val engine = ordered.firstOrNull()?.engineLanguage ?: "und"
+            val bubbleId = ordered.firstOrNull()?.bubbleId
+            if (bounds != null && text.isNotBlank()) {
+                output.add(OcrCandidate(bounds, text, engine, container, bubbleId))
             }
         }
-        // Do not merge uncontained boxes solely because they are close: separate
-        // speech balloons often sit on adjacent panel lines. Their TextBlocks were
-        // already consolidated by collectCandidates where ML Kit supplied grouping.
+
+        // Uncontained TextBlocks remain independent. The spatial deduplication pass in
+        // mergeOcrCandidates has already removed overlapping cross-engine duplicates.
         output.addAll(uncontained)
         return output.sortedWith(
             compareBy<OcrCandidate> { it.bounds?.top ?: Int.MAX_VALUE }
