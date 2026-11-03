@@ -3383,7 +3383,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 val chroma = max(red, max(green, blue)) - min(red, min(green, blue))
                 // Includes white/gray and pale pastel speech balloons, while avoiding
                 // treating every saturated colorful drawing as a balloon interior.
-                luminance >= 198 && (chroma <= 82 || luminance >= 232)
+                return luminance >= 198 && (chroma <= 82 || luminance >= 232)
             }
 
             for (start in 0 until total) {
