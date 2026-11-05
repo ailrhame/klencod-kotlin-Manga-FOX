@@ -126,8 +126,7 @@ internal const val PREF_ONBOARDING_SEEN = "onboarding_seen_v1"
 internal const val PREF_TRANSLATE_SFX = "translate_japanese_sfx"
 internal const val PREF_LEARNED_TRANSLATIONS = "learned_translation_dictionary"
 internal const val PREF_AI_ZH_ENABLED = "ai_chinese_translation_enabled"
-internal const val PREF_AI_ENDPOINT = "ai_translation_endpoint"
-internal const val PREF_AI_MODEL = "ai_translation_model"
+internal const val PREF_ZH_SCRIPT = "chinese_script_variant"
 internal const val PREF_AI_SECRET_CIPHER = "ai_translation_secret_cipher"
 internal const val PREF_AI_SECRET_IV = "ai_translation_secret_iv"
 internal const val MAX_CAPTURE_FRAMES = 120
@@ -1109,7 +1108,7 @@ class MainActivity : android.app.Activity() {
             buttonTintList = android.content.res.ColorStateList.valueOf(gold)
             setOnCheckedChangeListener { _, checked ->
                 preferences.edit().putBoolean(PREF_AUTO_FONT_FIT, checked).apply()
-                toast(if (checked) "الملاءمة التلقائية مفعّلة" else "تم إيقاف الملاءمة التلقائية؛ سيُستخدم الحجم المحدد")
+                toast(if (checked) "الملاءمة التلقائية مفعّلة للترجمات الجديدة" else "تم إيقاف الملاءمة التلقائية؛ سيُستخدم الحجم المحدد")
             }
         }
         settingsCard.addView(autoFitCheck, matchWrap(dp(2)))
@@ -1156,6 +1155,26 @@ class MainActivity : android.app.Activity() {
                 }.show()
         }
         settingsCard.addView(sourceLanguageButton, matchWrap(dp(4)))
+        val chineseScriptModes = listOf(
+            "auto" to "اكتشاف تلقائي (مبسطة أو تقليدية)",
+            "Hans" to "الصينية المبسطة · 简体中文",
+            "Hant" to "الصينية التقليدية · 繁體中文"
+        )
+        val currentChineseScript = preferences.getString(PREF_ZH_SCRIPT, "auto") ?: "auto"
+        val chineseScriptButton = actionButton(
+            "نوع الكتابة الصينية: ${chineseScriptModes.firstOrNull { it.first == currentChineseScript }?.second ?: chineseScriptModes.first().second}",
+            false
+        ) { }
+        chineseScriptButton.setOnClickListener {
+            AlertDialog.Builder(this).setTitle("حدد نوع الكتابة الصينية")
+                .setItems(chineseScriptModes.map { it.second }.toTypedArray()) { _, which ->
+                    val selected = chineseScriptModes[which]
+                    preferences.edit().putString(PREF_ZH_SCRIPT, selected.first).apply()
+                    chineseScriptButton.text = "نوع الكتابة الصينية: ${selected.second}"
+                    toast("تم ضبط نوع الكتابة الصينية: ${selected.second}")
+                }.show()
+        }
+        settingsCard.addView(chineseScriptButton, matchWrap(dp(4)))
         addChineseAiSettings(settingsCard)
         val sfxOption = CheckBox(this).apply {
             text = "ترجمة المؤثرات اليابانية الشائعة (SFX) عند اكتشافها"
@@ -1199,40 +1218,17 @@ class MainActivity : android.app.Activity() {
         root.addView(text("محرك الترجمة الذكي للصينية · MAX", 16f, gold, true).apply {
             setPadding(0, dp(14), 0, dp(3))
         }, matchWrap())
-        root.addView(text("يُستخدم نموذج الذكاء الاصطناعي للنص الصيني، بينما يبقى Google ML Kit محركاً محلياً احتياطياً. أدخل بيانات مزود متوافق مع واجهة OpenAI Chat Completions.", 11f, Color.LTGRAY), matchWrap(dp(5)))
+        root.addView(text("أدخل مفتاح OpenAI API فقط. يستخدم التطبيق عنوان الخدمة والنموذج الافتراضيين داخلياً، ويبقى ML Kit بديلاً محلياً عند تعذر AI.", 11f, Color.LTGRAY), matchWrap(dp(5)))
 
-        val endpoint = EditText(this).apply {
-            setSingleLine(true)
-            textSize = 13f
-            hint = "رابط API — يجب أن يبدأ بـ https://"
-            setText(preferences.getString(PREF_AI_ENDPOINT, "https://api.openai.com/v1/chat/completions"))
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
-            setPadding(dp(10), dp(9), dp(10), dp(9))
-            background = rounded(Color.rgb(38, 38, 46), 10)
-        }
-        val model = EditText(this).apply {
-            setSingleLine(true)
-            textSize = 13f
-            hint = "اسم النموذج"
-            setText(preferences.getString(PREF_AI_MODEL, "gpt-4o-mini"))
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
-            setPadding(dp(10), dp(9), dp(10), dp(9))
-            background = rounded(Color.rgb(38, 38, 46), 10)
-        }
         val apiKey = EditText(this).apply {
             setSingleLine(true)
-            textSize = 13f
             hint = if (MangaFoxSecureSecretStore.get(this@MainActivity).isNullOrBlank()) "مفتاح API" else "مفتاح API محفوظ ومشفّر — أدخل بديلاً للتغيير"
             inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
             setTextColor(Color.WHITE)
             setHintTextColor(Color.GRAY)
-            setPadding(dp(10), dp(9), dp(10), dp(9))
+            setPadding(dp(10), dp(11), dp(10), dp(11))
             background = rounded(Color.rgb(38, 38, 46), 10)
         }
-        root.addView(endpoint, matchWrap(dp(6)))
-        root.addView(model, matchWrap(dp(6)))
         root.addView(apiKey, matchWrap(dp(6)))
 
         val enabled = CheckBox(this).apply {
@@ -1248,14 +1244,7 @@ class MainActivity : android.app.Activity() {
         }
         root.addView(enabled, matchWrap(dp(5)))
 
-        fun saveConfig(showMessage: Boolean): Boolean {
-            val url = endpoint.text.toString().trim()
-            val modelName = model.text.toString().trim()
-            if (!url.startsWith("https://", true) || modelName.isBlank()) {
-                if (showMessage) toast("أدخل رابط HTTPS صحيحاً واسم النموذج")
-                return false
-            }
-            preferences.edit().putString(PREF_AI_ENDPOINT, url).putString(PREF_AI_MODEL, modelName).apply()
+        fun saveKey(showMessage: Boolean): Boolean {
             val newKey = apiKey.text.toString().trim()
             if (newKey.isNotBlank()) {
                 val stored = runCatching { MangaFoxSecureSecretStore.put(this@MainActivity, newKey) }.isSuccess
@@ -1266,27 +1255,33 @@ class MainActivity : android.app.Activity() {
                 apiKey.setText("")
                 apiKey.hint = "مفتاح API محفوظ ومشفّر — أدخل بديلاً للتغيير"
             }
-            if (showMessage) toast("حُفظت إعدادات محرك MAX داخل التطبيق")
+            val existing = MangaFoxSecureSecretStore.get(this@MainActivity)
+            if (existing.isNullOrBlank()) {
+                if (showMessage) toast("أدخل مفتاح API أولاً")
+                return false
+            }
+            if (showMessage) toast("حُفظ مفتاح API مشفّراً داخل التطبيق")
             return true
         }
 
-        root.addView(actionButton("حفظ إعدادات API", true) { saveConfig(true) }, matchWrap(dp(3)))
+        root.addView(actionButton("حفظ مفتاح API", true) { saveKey(true) }, matchWrap(dp(3)))
         root.addView(actionButton("حذف مفتاح API المحفوظ", false) {
             MangaFoxSecureSecretStore.clear(this)
+            apiKey.setText("")
+            apiKey.hint = "مفتاح API"
             toast("تم حذف مفتاح API المشفّر من بيانات التطبيق")
         }, matchWrap(dp(3)))
         root.addView(actionButton("اختبار اتصال API", false) {
-            if (!saveConfig(false)) return@actionButton
-            val secret = MangaFoxSecureSecretStore.get(this)
-            if (secret.isNullOrBlank()) {
-                toast("أدخل مفتاح API أولاً ثم احفظه")
+            if (!saveKey(false)) {
+                toast("أدخل مفتاح API واحفظه أولاً")
                 return@actionButton
             }
             toast("جارٍ اختبار الاتصال…")
             fontDownloadExecutor.execute {
                 val result = runCatching {
                     MangaFoxAiTranslator.translate(
-                        this, "你是谁？", emptyList(), emptyList(), testRequest = true
+                        this, "你是谁？", emptyList(), emptyList(), testRequest = true,
+                        scriptMode = preferences.getString(PREF_ZH_SCRIPT, "auto") ?: "auto"
                     )
                 }
                 runOnUiThread {
@@ -1298,7 +1293,7 @@ class MainActivity : android.app.Activity() {
                 }
             }
         }, matchWrap(dp(4)))
-        root.addView(text("تنبيه: نصوص الصفحات ستُرسل إلى مزود API عند تفعيل هذا الخيار. لا تضع مفتاحاً لا تملك حق استخدامه. يتطلب الاتصال إذن INTERNET في AndroidManifest.xml.", 10f, Color.LTGRAY), matchWrap(dp(4)))
+        root.addView(text("يتطلب الاتصال بالإنترنت. تُرسل النصوص الصينية إلى مزود الخدمة عند تفعيل AI. المفتاح مشفّر باستخدام Android Keystore.", 10f, Color.LTGRAY), matchWrap(dp(4)))
     }
 
     private fun showLearnedTranslationDialog(sourceText: String) {
@@ -4193,7 +4188,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             if (!apiKey.isNullOrBlank()) {
                 val knowledge = MangaFoxKnowledgeStore(this)
                 val aiResult = runCatching {
-                    MangaFoxAiTranslator.translate(this, sourceText, knowledge.glossary(), knowledge.characters())
+                    MangaFoxAiTranslator.translate(
+                        this, sourceText, knowledge.glossary(), knowledge.characters(),
+                        scriptMode = prefs.getString(PREF_ZH_SCRIPT, "auto") ?: "auto"
+                    )
                 }.getOrNull()
                 if (!aiResult.isNullOrBlank() && isUsefulArabicTranslation(sourceText, aiResult) &&
                     !hasUntranslatedLatinRuns(aiResult, 5)) return cleanArabicTranslation(aiResult)
@@ -4683,49 +4681,48 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
     }
 
-    /** Conservative local glyph eraser. It never fills the whole OCR rectangle. */
-    private fun eraseTextPixels(bitmap: Bitmap, area: Rect) {
+    /** Removes only high-contrast source glyph pixels; it never paints a rectangular plate. */
+    private fun eraseTextPixels(bitmap: Bitmap, area: Rect, fillColor: Int) {
         val r = Rect(area)
         if (!r.intersect(0, 0, bitmap.width, bitmap.height) || r.width() < 5 || r.height() < 5) return
-        val w = r.width(); val h = r.height()
+        val w = r.width()
+        val h = r.height()
         val pixels = IntArray(w * h)
         bitmap.getPixels(pixels, 0, w, r.left, r.top, w, h)
-        val marginX = max(1, w / 18); val marginY = max(1, h / 14)
-        val buckets = HashMap<Int, MutableList<Int>>()
-        for (y in marginY until (h - marginY).coerceAtLeast(marginY + 1) step max(1, h / 28)) {
-            for (x in marginX until (w - marginX).coerceAtLeast(marginX + 1) step max(1, w / 28)) {
-                val c = pixels[y * w + x]
-                val key = ((Color.red(c) shr 4) shl 8) or ((Color.green(c) shr 4) shl 4) or (Color.blue(c) shr 4)
-                buckets.getOrPut(key) { ArrayList() }.add(c)
-            }
-        }
-        val dominant = buckets.values.maxByOrNull { it.size } ?: return
-        if (dominant.size < 4) return
-        val br = dominant.map { Color.red(it) }.sorted()[dominant.size / 2]
-        val bg = dominant.map { Color.green(it) }.sorted()[dominant.size / 2]
-        val bb = dominant.map { Color.blue(it) }.sorted()[dominant.size / 2]
         val out = pixels.copyOf()
-        // Restrict detection to the central 88% so balloon borders are not touched.
-        val left = max(1, w / 16); val right = min(w - 1, w - left)
-        val top = max(1, h / 14); val bottom = min(h - 1, h - top)
+        val baseR = Color.red(fillColor)
+        val baseG = Color.green(fillColor)
+        val baseB = Color.blue(fillColor)
+        val baseLum = (baseR * 30 + baseG * 59 + baseB * 11) / 100
+        val left = max(1, w / 16)
+        val right = min(w - 1, w - left)
+        val top = max(1, h / 14)
+        val bottom = min(h - 1, h - top)
         for (y in top until bottom) for (x in left until right) {
-            val idx = y * w + x; val c = pixels[idx]
-            val dr = abs(Color.red(c) - br); val dg = abs(Color.green(c) - bg); val db = abs(Color.blue(c) - bb)
-            val distance = dr + dg + db
-            // Only remove near-neutral/dark ink against a stable local dominant fill.
-            val luminance = (Color.red(c) * 30 + Color.green(c) * 59 + Color.blue(c) * 11) / 100
-            val baseLum = (br * 30 + bg * 59 + bb * 11) / 100
-            val likelyInk = distance >= 95 && abs(baseLum - luminance) >= 42
-            if (likelyInk) {
-                // Feather a one-pixel antialias fringe, not a 5x5 rectangle.
-                out[idx] = Color.rgb(br, bg, bb)
+            val index = y * w + x
+            val color = pixels[index]
+            val red = Color.red(color)
+            val green = Color.green(color)
+            val blue = Color.blue(color)
+            val distance = abs(red - baseR) + abs(green - baseG) + abs(blue - baseB)
+            val luminance = (red * 30 + green * 59 + blue * 11) / 100
+            val luminanceDelta = abs(baseLum - luminance)
+            if (distance >= 92 && luminanceDelta >= 38) {
+                out[index] = fillColor
+                // Replace only the one-pixel anti-alias fringe around a confirmed glyph.
                 for (dy in -1..1) for (dx in -1..1) {
                     if (dx == 0 && dy == 0) continue
-                    val nx = x + dx; val ny = y + dy
+                    val nx = x + dx
+                    val ny = y + dy
                     if (nx !in left until right || ny !in top until bottom) continue
-                    val ni = ny * w + nx; val n = pixels[ni]
-                    val nd = abs(Color.red(n) - br) + abs(Color.green(n) - bg) + abs(Color.blue(n) - bb)
-                    if (nd in 45..150) out[ni] = Color.rgb(br, bg, bb)
+                    val neighborIndex = ny * w + nx
+                    val neighbor = pixels[neighborIndex]
+                    val neighborDistance = abs(Color.red(neighbor) - baseR) +
+                        abs(Color.green(neighbor) - baseG) + abs(Color.blue(neighbor) - baseB)
+                    val neighborLum = (Color.red(neighbor) * 30 + Color.green(neighbor) * 59 + Color.blue(neighbor) * 11) / 100
+                    if (neighborDistance in 38..150 && abs(baseLum - neighborLum) >= 14) {
+                        out[neighborIndex] = fillColor
+                    }
                 }
             }
         }
@@ -4783,10 +4780,12 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
         // Pass 1: erase every source text region first. This avoids a later bubble's
         // background rectangle overwriting Arabic text drawn for an earlier bubble.
-        renderItems.forEach { (item, eraseRect, _) ->
-            // Never paint a rectangular/oval plate over artwork. Remove only high-contrast
-            // glyph pixels inside the OCR box, preserving balloon outlines and tails.
-            eraseTextPixels(output, eraseRect)
+        renderItems.forEach { (item, eraseRect, layoutRect) ->
+            // Estimate the balloon fill from the original page, then erase glyph pixels
+            // with that same fill. This avoids a second, inconsistent color estimate
+            // that can leave a visible patch/halo behind the translated lettering.
+            val fillColor = estimateBubbleFillColor(source, layoutRect, item.bounds)
+            eraseTextPixels(output, eraseRect, fillColor)
         }
         // Pass 2: draw text only after all backgrounds are ready; clipping keeps
         // long words/layouts from spilling into neighboring bubbles.
@@ -4794,7 +4793,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             if (!item.eraseOnly && item.translated.isNotBlank()) {
                 canvas.save()
                 canvas.clipRect(layoutRect)
-                drawArabicText(canvas, item.translated, layoutRect, item.vertical)
+                val fillColor = estimateBubbleFillColor(source, layoutRect, item.bounds)
+                val textColor = readableTextColor(fillColor)
+                drawArabicText(canvas, item.translated, layoutRect, item.vertical, textColor)
                 canvas.restore()
             }
         }
@@ -4805,9 +4806,31 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private fun sampleBubbleColor(bitmap: Bitmap, rect: Rect): Int =
         MangaFoxBubbleRepair.sampleBackground(bitmap, rect)
 
-    private fun drawArabicText(canvas: Canvas, text: String, rect: Rect, vertical: Boolean = false) {
+    private fun estimateBubbleFillColor(bitmap: Bitmap, layoutRect: Rect, textRect: Rect): Int {
+        val centralGlyphArea = Rect(textRect).apply {
+            inset(max(1, width() / 4), max(1, height() / 4))
+        }
+        return runCatching {
+            MangaFoxBubbleRepair.sampleInteriorColor(bitmap, layoutRect, centralGlyphArea)
+        }.getOrDefault(Color.WHITE)
+    }
+
+    private fun readableTextColor(backgroundColor: Int): Int {
+        fun linear(channel: Int): Double {
+            val value = channel / 255.0
+            return if (value <= 0.04045) value / 12.92 else Math.pow((value + 0.055) / 1.055, 2.4)
+        }
+        val luminance = 0.2126 * linear(Color.red(backgroundColor)) +
+            0.7152 * linear(Color.green(backgroundColor)) +
+            0.0722 * linear(Color.blue(backgroundColor))
+        val blackContrast = (luminance + 0.05) / 0.05
+        val whiteContrast = 1.05 / (luminance + 0.05)
+        return if (whiteContrast > blackContrast) Color.WHITE else Color.rgb(18, 18, 20)
+    }
+
+    private fun drawArabicText(canvas: Canvas, text: String, rect: Rect, vertical: Boolean = false, textColor: Int = Color.rgb(20, 20, 22)) {
         if (vertical) {
-            drawArabicTextTopToBottom(canvas, text, rect)
+            drawArabicTextTopToBottom(canvas, text, rect, textColor)
             return
         }
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -4822,9 +4845,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         )
         val automatic = prefs.getBoolean(PREF_AUTO_FONT_FIT, true)
         val layout = if (automatic) {
-            findLargestArabicLayout(text, availableWidth, availableHeight, maxPx, 7.5f * density)
+            findLargestArabicLayout(text, availableWidth, availableHeight, maxPx, 6.5f * density, textColor)
         } else {
-            buildArabicLayout(text, availableWidth, maxPx)
+            buildArabicLayout(text, availableWidth, maxPx, textColor)
         }
         val x = rect.left + insetX
         val y = rect.top + ((rect.height() - layout.height) / 2f).coerceAtLeast(insetY.toFloat())
@@ -4837,16 +4860,16 @@ class MangaFoxAccessibilityService : AccessibilityService() {
 
     /** Binary-searches the largest type size whose shaped RTL layout fits both dimensions. */
     private fun findLargestArabicLayout(
-        value: String, width: Int, height: Int, maxSizePx: Float, minSizePx: Float
+        value: String, width: Int, height: Int, maxSizePx: Float, minSizePx: Float, textColor: Int
     ): android.text.StaticLayout {
         val lower = min(minSizePx, maxSizePx).coerceAtLeast(5f)
         var low = lower
         var high = maxSizePx.coerceAtLeast(lower)
-        var best = buildArabicLayout(value, width, lower)
+        var best = buildArabicLayout(value, width, lower, textColor)
         var bestFits = best.height <= height && (0 until best.lineCount).all { best.getLineWidth(it) <= width + 1f }
-        repeat(14) {
+        repeat(20) {
             val middle = (low + high) / 2f
-            val candidate = buildArabicLayout(value, width, middle)
+            val candidate = buildArabicLayout(value, width, middle, textColor)
             val fits = candidate.height <= height && (0 until candidate.lineCount).all {
                 candidate.getLineWidth(it) <= width + 1f
             }
@@ -4854,12 +4877,12 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
         // Keep the complete text at the minimum readable size if exceptionally long copy
         // cannot fully fit; the caller clips to the speech region rather than spilling outside.
-        if (!bestFits) return buildArabicLayout(value, width, lower)
+        if (!bestFits) return buildArabicLayout(value, width, lower, textColor)
         return best
     }
 
     /** Stacks Arabic words from top to bottom while preserving each word's connected shaping. */
-    private fun drawArabicTextTopToBottom(canvas: Canvas, value: String, rect: Rect) {
+    private fun drawArabicTextTopToBottom(canvas: Canvas, value: String, rect: Rect, textColor: Int) {
         val words = value.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
         if (words.isEmpty()) return
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -4871,10 +4894,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         var layouts = emptyList<android.text.StaticLayout>()
         var heights = emptyList<Int>()
         val autoFit = prefs.getBoolean(PREF_AUTO_FONT_FIT, true)
-        val floor = 7.5f * density
+        val floor = 6.5f * density
         for (attempt in 0 until if (autoFit) 36 else 1) {
             val paint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.rgb(20, 20, 22); typeface = resolveArabicTypeface(prefs)
+                color = textColor; typeface = resolveArabicTypeface(prefs)
                 textSize = chosenSize; style = Paint.Style.FILL
             }
             layouts = words.map { word ->
@@ -4905,10 +4928,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         canvas.restore()
     }
 
-    private fun buildArabicLayout(value: String, width: Int, size: Float): android.text.StaticLayout {
+    private fun buildArabicLayout(value: String, width: Int, size: Float, textColor: Int): android.text.StaticLayout {
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val paint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(20, 20, 22)
+            color = textColor
             textSize = size
             typeface = resolveArabicTypeface(prefs)
             style = Paint.Style.FILL
@@ -4983,7 +5006,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
 
     /** Keep the single overlay attached regardless of which app/window is in front. */
     fun refreshLensAppFilter() {
-        if (!this::windowManager.isInitialized) return
+        if (!this::windowManager.isInitialized || captureRunning) return
         val overlayAllowed = Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)
         if (!overlayAllowed) {
             MangaFoxRuntime.status = "يلزم السماح بالظهور فوق التطبيقات"
@@ -5133,6 +5156,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     private fun showFloatingBubble() {
+        if (captureRunning) return
         if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) return
         if (bubbleWasAdded || !this::windowManager.isInitialized) return
         val lensPrefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -5840,15 +5864,14 @@ internal object MangaFoxAiTranslator {
         source: String,
         glossary: List<MangaFoxKnowledgeStore.GlossaryEntry>,
         characters: List<MangaFoxKnowledgeStore.CharacterEntry>,
-        testRequest: Boolean = false
+        testRequest: Boolean = false,
+        scriptMode: String = "auto"
     ): String {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val key = MangaFoxSecureSecretStore.get(context)?.takeIf { it.isNotBlank() }
             ?: throw IllegalStateException("مفتاح API غير محفوظ")
-        val endpoint = (prefs.getString(PREF_AI_ENDPOINT, "https://api.openai.com/v1/chat/completions")
-            ?: "https://api.openai.com/v1/chat/completions").trim()
+        val endpoint = "https://api.openai.com/v1/chat/completions"
         require(endpoint.startsWith("https://", true)) { "يُسمح بعنوان HTTPS فقط" }
-        val model = (prefs.getString(PREF_AI_MODEL, "gpt-4o-mini") ?: "gpt-4o-mini").trim()
+        val model = "gpt-4o-mini"
         require(model.isNotBlank()) { "اسم النموذج فارغ" }
 
         val glossaryText = glossary.take(100).joinToString("\n") {
@@ -5868,6 +5891,12 @@ internal object MangaFoxAiTranslator {
 5) إذا كان النص ناقصاً أو غامضاً، اختر أقرب معنى تدعمه الكلمات ولا تخترع سياقاً. حافظ على علامات الوقف والانفعال عند الحاجة.
 6) أخرج الترجمة العربية فقط، دون شرح أو مقدمات أو علامات اقتباس زائدة. لا تكرر النص الصيني.
 7) المؤثرات الصوتية تُصاغ عربياً بإيجاز بما يناسب المشهد، ولا تحولها إلى جملة حوار.
+
+نوع الكتابة الصينية المطلوب التعامل معه: ${when (scriptMode) {
+            "Hans" -> "الصينية المبسطة (简体中文)"
+            "Hant" -> "الصينية التقليدية (繁體中文)"
+            else -> "اكتشف تلقائياً من الحروف والسياق إن كانت مبسطة أم تقليدية"
+        }}. لا تحوّل أسماء الأعلام أو المصطلحات لمجرد اختلاف شكل الكتابة.
 
 ذاكرة المصطلحات:
 $glossaryText
