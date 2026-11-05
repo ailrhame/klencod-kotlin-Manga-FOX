@@ -373,6 +373,9 @@ class MainActivity : android.app.Activity() {
         intro.addView(text("التقط لقطات متتابعة أثناء القراءة، ثم اجمع النصوص من أكثر من محرك OCR وحدد لغة كل كتلة بشكل مستقل قبل ترجمتها إلى العربية.", 13f, Color.LTGRAY))
         intro.addView(text("تعمل المعالجة على الجهاز بعد تنزيل نماذج اللغات. يلزم الإنترنت لتنزيل النموذج أول مرة.", 12f, Color.rgb(195, 185, 165)))
         root.addView(intro, matchWrap(dp(12)))
+        root.addView(actionButton("☰  لوحة FOX الجانبية السريعة", false) {
+            showQuickSidePanel()
+        }, matchWrap(dp(12)))
 
         val onboarding = card()
         onboarding.addView(text("دليل التفعيل والتحقق التلقائي", 17f, Color.WHITE, true))
@@ -443,10 +446,116 @@ class MainActivity : android.app.Activity() {
         root.addView(statusCard, matchWrap(dp(10)))
     }
 
+    /** A compact, app-native side drawer with one-tap capture and export actions. */
+    private fun showQuickSidePanel() {
+        val dialog = android.app.Dialog(this)
+        val panelView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(18), dp(22), dp(18), dp(18))
+            setBackgroundColor(Color.rgb(20, 20, 25))
+        }
+        panelView.addView(text("FOX · لوحة جانبية", 20f, gold, true), matchWrap(dp(12)))
+        panelView.addView(text("اختصارات سريعة دون التنقل بين التبويبات.", 12f, Color.LTGRAY), matchWrap(dp(12)))
+        fun item(label: String, action: () -> Unit) {
+            panelView.addView(actionButton(label, false) { dialog.dismiss(); action() }, matchWrap(dp(7)))
+        }
+        item("التقاط الشاشة الحالية · ترجمة") {
+            MangaFoxAccessibilityService.instance?.startSingleCapture(250L) ?: toast("فعّل خدمة Manga FOX أولاً")
+            moveTaskToBack(true)
+        }
+        item("التقاط الفصل · ترجمة") {
+            MangaFoxAccessibilityService.instance?.startFullChapterCapture(500L) ?: toast("فعّل خدمة Manga FOX أولاً")
+            moveTaskToBack(true)
+        }
+        item("التقاط الفصل · دون ترجمة") {
+            MangaFoxAccessibilityService.instance?.startFullChapterCaptureOnly(500L) ?: toast("فعّل خدمة Manga FOX أولاً")
+            moveTaskToBack(true)
+        }
+        item("إيقاف الالتقاط") { MangaFoxAccessibilityService.instance?.stopCaptureByUser() }
+        item("مركز الالتقاط") { showCaptureHub() }
+        item("فتح النتائج") { showResults() }
+        item("تصدير PDF") { exportResultsAsPdf() }
+        item("إعدادات العدسة") { selectedHomeTab = "settings"; showHome() }
+        item("إغلاق") {}
+        dialog.setContentView(panelView)
+        dialog.window?.apply {
+            setBackgroundDrawableResource(android.R.color.transparent)
+            setLayout(dp(320), WindowManager.LayoutParams.MATCH_PARENT)
+            setGravity(Gravity.START)
+            attributes = attributes.apply { dimAmount = 0.55f; flags = flags or WindowManager.LayoutParams.FLAG_DIM_BEHIND }
+        }
+        dialog.show()
+        dialog.window?.setLayout(dp(320), WindowManager.LayoutParams.MATCH_PARENT)
+    }
+
+    private fun appStorageBytes(): Long {
+        return runCatching {
+            fun size(file: File): Long = if (!file.exists()) 0L else if (file.isFile) file.length()
+                else file.listFiles()?.sumOf(::size) ?: 0L
+            size(filesDir) + size(cacheDir)
+        }.getOrDefault(0L)
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val units = arrayOf("KB", "MB", "GB", "TB")
+        var value = bytes.toDouble() / 1024.0
+        var unit = 0
+        while (value >= 1024 && unit < units.lastIndex) { value /= 1024.0; unit++ }
+        return String.format(java.util.Locale.US, "%.1f %s", value, units[unit])
+    }
+
+    private fun showStorageAnalyzer() {
+        val root = File(filesDir, ".")
+        val files = root.walkTopDown().filter { it.isFile }.toList()
+        val total = files.sumOf { it.length() }
+        val images = files.filter { it.extension.lowercase() in setOf("jpg", "jpeg", "png", "webp") }.sumOf { it.length() }
+        val pdf = files.filter { it.extension.equals("pdf", true) }.sumOf { it.length() }
+        val archives = files.filter { it.extension.equals("zip", true) }.sumOf { it.length() }
+        AlertDialog.Builder(this).setTitle("تحليل التخزين · FOX")
+            .setMessage("إجمالي ملفات التطبيق: ${formatBytes(total)}\nصور: ${formatBytes(images)}\nPDF: ${formatBytes(pdf)}\nZIP: ${formatBytes(archives)}\nعدد الملفات: ${files.size}")
+            .setPositiveButton("حسنًا", null).show()
+    }
+
+    private fun showCaptureHub() {
+        val pages = MangaFoxRuntime.resultPages
+        if (pages.isEmpty()) { toast("لا توجد صفحات في الجلسة الحالية"); return }
+        val labels = pages.mapIndexed { index, path ->
+            val file = File(path)
+            "${(index + 1).toString().padStart(3, '0')} · ${file.name} · ${formatBytes(file.length())}"
+        }.toTypedArray()
+        AlertDialog.Builder(this).setTitle("Capture Hub · ${pages.size} صفحة")
+            .setItems(labels) { _, index ->
+                val pageFile = File(pages[index])
+                val bitmap = BitmapFactory.decodeFile(pageFile.absolutePath)
+                if (bitmap == null) toast("تعذر فتح الصفحة")
+                else {
+                    val preview = ImageView(this).apply {
+                        setImageBitmap(bitmap)
+                        adjustViewBounds = true
+                        scaleType = ImageView.ScaleType.FIT_CENTER
+                        setBackgroundColor(Color.BLACK)
+                    }
+                    AlertDialog.Builder(this).setTitle("صفحة ${index + 1}")
+                        .setView(preview).setPositiveButton("إغلاق") { _, _ -> bitmap.recycle() }
+                        .setNeutralButton("فتح النتائج") { _, _ -> bitmap.recycle(); showResults() }
+                        .show()
+                }
+            }.setNegativeButton("إغلاق", null).show()
+    }
+
     private fun addLibraryTab(root: LinearLayout) {
         val library = card()
-        library.addView(text("مكتبة النتائج", 19f, gold, true))
-        library.addView(text("آخر فصل مترجم: ${MangaFoxRuntime.resultTitle}", 13f, Color.LTGRAY))
+        library.addView(text("مكتبة النتائج · Capture Hub", 19f, gold, true))
+        library.addView(text("آخر فصل: ${MangaFoxRuntime.resultTitle}", 13f, Color.LTGRAY))
+        val captureHub = card()
+        captureHub.addView(text("مركز الالتقاط", 16f, gold, true))
+        captureHub.addView(text("الصفحات: ${MangaFoxRuntime.resultPages.size}  •  الوضع: ${if (MangaFoxRuntime.captureOnlyResult) "صور أصلية بلا ترجمة" else "نتيجة معالجة"}", 13f, Color.LTGRAY))
+        captureHub.addView(text("المساحة التقريبية لملفات التطبيق: ${formatBytes(appStorageBytes())}", 12f, Color.rgb(190,190,200)))
+        captureHub.addView(actionButton("معاينة قائمة الصفحات", true) { showCaptureHub() }, matchWrap(dp(5)))
+        captureHub.addView(actionButton("تحليل مساحة التخزين", false) { showStorageAnalyzer() }, matchWrap())
+        root.addView(captureHub, matchWrap(dp(10)))
         library.addView(text("عدد المقاطع: ${MangaFoxRuntime.resultPages.size}", 13f, Color.LTGRAY))
         library.addView(text("تقرير الجودة: ${MangaFoxRuntime.qualitySummary}", 13f, Color.rgb(235, 210, 160)))
         library.addView(actionButton("فتح آخر نتيجة", true) { showResults() }, matchWrap(dp(6)))
