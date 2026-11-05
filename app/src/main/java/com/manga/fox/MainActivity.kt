@@ -2199,7 +2199,7 @@ class MainActivity : android.app.Activity() {
         return file to array
     }
 
-    private fun saveLayerChanges(file: File, layers: org.json.JSONArray, refresh: Boolean = false) {
+        private fun saveLayerChanges(file: File, layers: org.json.JSONArray, refresh: Boolean = true) {
         runCatching {
             val historyPageIndex = MangaFoxRuntime.translationLayerFiles.indexOf(file.absolutePath)
             if (historyPageIndex >= 0) MangaFoxLayerHistory(this).push(historyPageIndex, file)
@@ -2211,14 +2211,13 @@ class MainActivity : android.app.Activity() {
             }
             MangaFoxRuntime.persist(this)
         }.onSuccess {
-        if (refresh) {
-            val service = MangaFoxAccessibilityService.instance
-            if (service == null) toast("تم حفظ الطبقة. افتح الخدمة لإعادة رسم الصورة")
-            else service.rerenderLastResultsFromLayers { showResults() }
-        } else {
-            toast("تم حفظ التعديل. اضغط «تطبيق الخط والملاءمة الجديدة» عند الانتهاء")
-        }
-    }.onFailure { toast("تعذر حفظ الطبقة: ${it.localizedMessage ?: "خطأ في الملف"}") }
+            if (refresh) {
+                val service = MangaFoxAccessibilityService.instance
+                if (service == null) toast("تم حفظ الطبقة. افتح الخدمة لإعادة رسم الصورة")
+                else service.rerenderLastResultsFromLayers { showResults() }
+            }
+        }.onFailure { toast("تعذر حفظ الطبقة: ${it.localizedMessage ?: "خطأ في الملف"}") }
+    }
 
     private fun editTranslationLayer(pageIndex: Int) {
         val pair = readLayerArray(pageIndex)
