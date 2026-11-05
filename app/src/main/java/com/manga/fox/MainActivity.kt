@@ -21,6 +21,8 @@ import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
 import android.graphics.RectF
+import android.graphics.drawable.Drawable
+import android.graphics.ColorFilter
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.pdf.PdfDocument
@@ -100,6 +102,7 @@ import java.util.zip.ZipOutputStream
 
 
 // ============================================================
+// @N5CR4 · Manga FOX custom development
 // MERGED FROM: MangaFox_V3_0_3_MainActivity.kt
 // ============================================================
 
@@ -115,8 +118,10 @@ internal const val PREF_AUTO_FONT_FIT = "auto_font_fit_enabled"
 internal const val PREF_TRANSLATED_TEXT_COLOR = "translated_text_color"
 internal const val PREF_TRANSLATED_OUTLINE_COLOR = "translated_text_outline_color"
 internal const val PREF_TRANSLATED_OUTLINE_WIDTH = "translated_text_outline_width"
+internal const val PREF_LENS_IMAGE_PATH = "lens_custom_background_image_path"
 internal const val PREF_RESULTS_EDIT_MODE = "results_edit_mode"
 internal const val REQUEST_PICK_FONT = 713
+internal const val REQUEST_PICK_LENS_IMAGE = 717
 internal const val REQUEST_SAVE_PDF = 714
 internal const val REQUEST_EXPORT_PHANTOM_PROJECT = 715
 internal const val REQUEST_IMPORT_PHANTOM_PROJECT = 716
@@ -1065,31 +1070,7 @@ class MainActivity : android.app.Activity() {
         }
         settingsCard.addView(boldButton, matchWrap(dp(4)))
 
-        // User-controlled translated lettering colors and outline.
-        settingsCard.addView(text("ألوان النص وإطاره", 14f, gold, true).apply {
-            setPadding(0, dp(12), 0, dp(3))
-        }, matchWrap())
-        val textColorButton = actionButton("لون النص المترجم: ${colorLabel(preferences.getInt(PREF_TRANSLATED_TEXT_COLOR, Color.WHITE))}", false) { }
-        textColorButton.setOnClickListener {
-            showTranslationColorPicker("اختر لون النص", preferences.getInt(PREF_TRANSLATED_TEXT_COLOR, Color.WHITE)) { color ->
-                preferences.edit().putInt(PREF_TRANSLATED_TEXT_COLOR, color).apply()
-                textColorButton.text = "لون النص المترجم: ${colorLabel(color)}"
-            }
-        }
-        settingsCard.addView(textColorButton, matchWrap(dp(4)))
-        val outlineColorButton = actionButton("لون إطار النص: ${colorLabel(preferences.getInt(PREF_TRANSLATED_OUTLINE_COLOR, Color.BLACK))}", false) { }
-        outlineColorButton.setOnClickListener {
-            showTranslationColorPicker("اختر لون إطار النص", preferences.getInt(PREF_TRANSLATED_OUTLINE_COLOR, Color.BLACK)) { color ->
-                preferences.edit().putInt(PREF_TRANSLATED_OUTLINE_COLOR, color).apply()
-                outlineColorButton.text = "لون إطار النص: ${colorLabel(color)}"
-            }
-        }
-        settingsCard.addView(outlineColorButton, matchWrap(dp(4)))
-        addSettingSlider(settingsCard, "سُمك إطار النص", 0, 6,
-            preferences.getInt(PREF_TRANSLATED_OUTLINE_WIDTH, 2), " dp") { value ->
-            preferences.edit().putInt(PREF_TRANSLATED_OUTLINE_WIDTH, value).apply()
-        }
-        settingsCard.addView(text("يمكنك اختيار لون الحروف ولون الحد المحيط بها بشكل مستقل. اجعل سُمك الإطار صفراً لإخفائه.", 11f, Color.LTGRAY), matchWrap(dp(6)))
+        settingsCard.addView(text("ألوان النص وحجمه تُخصّص لكل فقاعة من شاشة المعاينة، حتى لا تتأثر الفقاعات ذات الخلفيات المختلفة.", 11f, Color.LTGRAY), matchWrap(dp(6)))
 
         settingsCard.addView(text("خطوط عربية قابلة للتنزيل", 14f, gold, true).apply {
             setPadding(0, dp(12), 0, dp(4))
@@ -1238,6 +1219,14 @@ class MainActivity : android.app.Activity() {
         settingsCard.addView(actionButton("فتح استوديو تصميم العدسة", true) {
             openLensStudio()
         }, matchWrap(dp(4)))
+        settingsCard.addView(actionButton("اختيار صورة من الاستوديو كخلفية للعدسة", false) {
+            pickLensBackgroundImage()
+        }, matchWrap(dp(4)))
+        settingsCard.addView(actionButton("إزالة صورة الخلفية والعودة إلى اللون", false) {
+            preferences.edit().remove(PREF_LENS_IMAGE_PATH).apply()
+            MangaFoxAccessibilityService.instance?.applyLensSettings()
+            toast("تمت إزالة صورة خلفية العدسة")
+        }, matchWrap(dp(4)))
         settingsCard.addView(text("العدسة العائمة تعمل دائماً وتبقى ظاهرة فوق التطبيقات، بما فيها Manga FOX، ما دامت خدمة إمكانية الوصول وإذن الظهور فوق التطبيقات مفعّلين.", 11f, Color.LTGRAY), matchWrap(dp(6)))
         updateFontPreview()
         root.addView(settingsCard, matchWrap(dp(16)))
@@ -1351,6 +1340,42 @@ class MainActivity : android.app.Activity() {
                     toast("حُفظ التصحيح وسيُستخدم تلقائياً مع النص نفسه")
                 }
             }.show()
+    }
+
+    private fun pickLensBackgroundImage() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "image/*"
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runCatching { startActivityForResult(intent, REQUEST_PICK_LENS_IMAGE) }
+            .onFailure { toast("تعذر فتح الاستوديو لاختيار الصورة") }
+    }
+
+    private fun saveLensBackgroundImage(uri: android.net.Uri) {
+        runCatching {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                ?: error("تعذر قراءة الصورة")
+            require(bounds.outWidth in 1..12000 && bounds.outHeight in 1..12000) { "أبعاد الصورة غير مدعومة" }
+            val folder = File(filesDir, "lens_backgrounds").apply { mkdirs() }
+            val target = File(folder, "lens_${System.currentTimeMillis()}.img")
+            val input = contentResolver.openInputStream(uri) ?: error("تعذر فتح الصورة")
+            input.use { source -> FileOutputStream(target).use { destination ->
+                val buffer = ByteArray(8192)
+                var total = 0L
+                while (true) {
+                    val count = source.read(buffer)
+                    if (count < 0) break
+                    total += count
+                    require(total <= 25L * 1024L * 1024L) { "حجم الصورة يتجاوز 25 ميغابايت" }
+                    destination.write(buffer, 0, count)
+                }
+            } }
+            preferences.edit().putString(PREF_LENS_IMAGE_PATH, target.absolutePath).apply()
+            MangaFoxAccessibilityService.instance?.applyLensSettings()
+            toast("تم حفظ صورة العدسة وتطبيقها كخلفية")
+        }.onFailure { toast("تعذر استخدام الصورة: ${it.localizedMessage ?: "ملف غير صالح"}") }
     }
 
     private fun openLensStudio() {
@@ -1509,6 +1534,14 @@ class MainActivity : android.app.Activity() {
                 }.onSuccess {
                     runOnUiThread { toast("تم استعادة المشروع والطبقات والمعجم"); showResults() }
                 }.onFailure { error -> runOnUiThread { toast("فشل الاستيراد: ${error.localizedMessage ?: "نسخة غير صالحة"}") } }
+            }
+            return
+        }
+        if (requestCode == REQUEST_PICK_LENS_IMAGE) {
+            if (resultCode == RESULT_OK) {
+                val selectedImage = data?.data
+                if (selectedImage != null) saveLensBackgroundImage(selectedImage)
+                else toast("لم يتم اختيار صورة")
             }
             return
         }
@@ -2193,6 +2226,7 @@ class MainActivity : android.app.Activity() {
                     "إخفاء النص الأصلي داخل المنطقة (مسح)",
                     "تغيير موضع وحجم المنطقة",
                     "تبديل شكل الفقاعة (بيضاوي / مستطيل)",
+                    "تخصيص لون النص والإطار وحجمه لهذه الفقاعة",
                     "حذف هذه الطبقة"
                 )
                 AlertDialog.Builder(this)
@@ -2246,7 +2280,8 @@ class MainActivity : android.app.Activity() {
                                 item.put("shape", if (item.optString("shape", "round") == "oval") "rect" else "oval")
                                 saveLayerChanges(file, layers)
                             }
-                            5 -> AlertDialog.Builder(this).setTitle("حذف الطبقة؟")
+                            5 -> openLayerTextStyleEditor(file, layers, actualIndex)
+                            6 -> AlertDialog.Builder(this).setTitle("حذف الطبقة؟")
                                 .setMessage("سيتم حذف هذه الطبقة من قائمة التعديلات. لحذف النص الأصلي من الصورة استخدم أداة المسح.")
                                 .setNegativeButton("إلغاء", null)
                                 .setPositiveButton("حذف") { _, _ ->
@@ -2261,6 +2296,84 @@ class MainActivity : android.app.Activity() {
             .setNeutralButton("مسح نص من الصورة") { _, _ -> openLayerRegionSelection(pageIndex, null, true) }
             .setNegativeButton("إغلاق", null)
             .show()
+    }
+
+    private fun openLayerTextStyleEditor(file: File, layers: org.json.JSONArray, layerIndex: Int) {
+        val item = layers.optJSONObject(layerIndex) ?: return
+        if (item.optBoolean("eraseOnly", false) || item.optString("translated").isBlank()) {
+            toast("هذه الطبقة لا تحتوي على نص مترجم لتخصيصه")
+            return
+        }
+        var textColor = if (item.has("textColor")) item.optInt("textColor") else Color.WHITE
+        var outlineColor = if (item.has("outlineColor")) item.optInt("outlineColor") else Color.BLACK
+        val automaticTextColor = CheckBox(this).apply {
+            text = "اختيار لون النص تلقائياً حسب لون هذه الفقاعة"
+            isChecked = !item.has("textColor")
+            setTextColor(Color.WHITE)
+        }
+        val sizeSeek = SeekBar(this).apply { max = 150; progress = ((item.optDouble("fontScale", 1.0) * 100).toInt() - 50).coerceIn(0, 150) }
+        val outlineSeek = SeekBar(this).apply { max = 8; progress = item.optInt("outlineWidth", 2).coerceIn(0, 8) }
+        val sizeLabel = text("حجم النص: ${sizeSeek.progress + 50}%", 13f, Color.WHITE, true)
+        val outlineLabel = text("سُمك الإطار: ${outlineSeek.progress} dp", 13f, Color.WHITE, true)
+        val textColorButton = actionButton(
+            if (item.has("textColor")) "لون النص: ${colorLabel(textColor)}" else "لون النص: تلقائي",
+            false
+        ) { }
+        val outlineColorButton = actionButton("لون الإطار: ${colorLabel(outlineColor)}", false) { }
+        textColorButton.setOnClickListener {
+            showTranslationColorPicker("لون نص هذه الفقاعة", textColor) { selected ->
+                textColor = selected
+                automaticTextColor.isChecked = false
+                textColorButton.text = "لون النص: ${colorLabel(selected)}"
+            }
+        }
+        outlineColorButton.setOnClickListener {
+            showTranslationColorPicker("لون إطار هذه الفقاعة", outlineColor) { selected ->
+                outlineColor = selected
+                outlineColorButton.text = "لون الإطار: ${colorLabel(selected)}"
+            }
+        }
+        sizeSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) { sizeLabel.text = "حجم النص: ${progress + 50}%" }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+            override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+        })
+        outlineSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) { outlineLabel.text = "سُمك الإطار: $progress dp" }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+            override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+        })
+        val reset = actionButton("استعادة القيم الافتراضية لهذه الفقاعة", false) {
+            automaticTextColor.isChecked = true
+            textColor = Color.WHITE
+            outlineColor = Color.BLACK
+            textColorButton.text = "لون النص: تلقائي"
+            outlineColorButton.text = "لون الإطار: ${colorLabel(Color.BLACK)}"
+            sizeSeek.progress = 50
+            outlineSeek.progress = 2
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(4))
+            addView(automaticTextColor, matchWrap(dp(4)))
+            addView(textColorButton, matchWrap(dp(4)))
+            addView(outlineColorButton, matchWrap(dp(4)))
+            addView(sizeLabel, matchWrap())
+            addView(sizeSeek, matchWrap(dp(8)))
+            addView(outlineLabel, matchWrap())
+            addView(outlineSeek, matchWrap(dp(8)))
+            addView(reset, matchWrap())
+        }
+        AlertDialog.Builder(this).setTitle("مظهر الفقاعة ${layerIndex + 1}")
+            .setMessage("هذه الإعدادات تخص الفقاعة المحددة فقط. بقية الفقاعات تحتفظ بألوانها وأحجامها.")
+            .setView(content).setNegativeButton("إلغاء", null)
+            .setPositiveButton("حفظ وتطبيق") { _, _ ->
+                if (automaticTextColor.isChecked) item.remove("textColor") else item.put("textColor", textColor)
+                item.put("outlineColor", outlineColor)
+                    .put("outlineWidth", outlineSeek.progress.coerceIn(0, 8))
+                    .put("fontScale", ((sizeSeek.progress + 50) / 100.0).coerceIn(0.5, 2.0))
+                saveLayerChanges(file, layers)
+            }.show()
     }
 
     /** Selects an editable rectangle on the original page, then adds an overlay/mask or resizes one. */
@@ -2460,6 +2573,38 @@ class MainActivity : android.app.Activity() {
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
 }
 
+private class LensImageBackgroundDrawable(
+    private val bitmap: Bitmap,
+    private val borderColor: Int
+) : Drawable() {
+    private val imagePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = borderColor
+        style = Paint.Style.STROKE
+        strokeWidth = 2.5f
+    }
+    override fun draw(canvas: Canvas) {
+        val b = bounds
+        if (b.width() <= 0 || b.height() <= 0 || bitmap.isRecycled) return
+        val side = min(bitmap.width, bitmap.height)
+        val left = (bitmap.width - side) / 2
+        val top = (bitmap.height - side) / 2
+        val source = Rect(left, top, left + side, top + side)
+        val target = RectF(b)
+        val save = canvas.save()
+        val clip = Path().apply { addOval(target, Path.Direction.CW) }
+        canvas.clipPath(clip)
+        canvas.drawBitmap(bitmap, source, target, imagePaint)
+        canvas.restoreToCount(save)
+        val half = borderPaint.strokeWidth / 2f
+        canvas.drawOval(RectF(b.left + half, b.top + half, b.right - half, b.bottom - half), borderPaint)
+    }
+    override fun setAlpha(alpha: Int) { imagePaint.alpha = alpha; borderPaint.alpha = alpha; invalidateSelf() }
+    override fun setColorFilter(colorFilter: ColorFilter?) { imagePaint.colorFilter = colorFilter; invalidateSelf() }
+    @Suppress("DEPRECATION")
+    override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+}
+
 internal fun resolveArabicTypeface(prefs: SharedPreferences): Typeface {
     val boldPreferred = prefs.getBoolean(PREF_FONT_BOLD, true)
     val customPath = prefs.getString(PREF_FONT_FILE, null)
@@ -2500,6 +2645,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private lateinit var windowManager: WindowManager
     private var bubble: TextView? = null
     private var bubbleParams: WindowManager.LayoutParams? = null
+    private var lensBackgroundBitmap: Bitmap? = null
+    private var lensBackgroundBitmapPath: String? = null
     // Separate overlay for the lens action menu. It is kept independent from the
     // bubble so the menu can be dismissed without recreating or moving the lens.
     private var floatingOptionsView: View? = null
@@ -3188,6 +3335,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                         .put("source", line.sourceText).put("translated", line.translated)
                         .put("language", line.language).put("vertical", line.vertical)
                         .put("eraseOnly", line.eraseOnly).put("shape", line.shape)
+                    line.textColor?.let { layer.put("textColor", it) }
+                    line.outlineColor?.let { layer.put("outlineColor", it) }
+                    line.outlineWidthDp?.let { layer.put("outlineWidth", it) }
+                    if (line.fontScale != 1f) layer.put("fontScale", line.fontScale.toDouble())
                     line.containerBounds?.let { container ->
                         val mappedContainer = Rect(container).apply { offset(safe.left, safe.top) }
                         layer.put("containerLeft", mappedContainer.left)
@@ -3300,7 +3451,11 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                                     if (item.has("containerLeft")) Rect(
                                         item.optInt("containerLeft"), item.optInt("containerTop"),
                                         item.optInt("containerRight"), item.optInt("containerBottom")
-                                    ).takeIf { it.width() > 8 && it.height() > 8 } else null
+                                    ).takeIf { it.width() > 8 && it.height() > 8 } else null,
+                                    if (item.has("textColor")) item.optInt("textColor") else null,
+                                    if (item.has("outlineColor")) item.optInt("outlineColor") else null,
+                                    if (item.has("outlineWidth")) item.optInt("outlineWidth").coerceIn(0, 8) else null,
+                                    item.optDouble("fontScale", 1.0).toFloat().coerceIn(0.5f, 2f)
                                 ))
                             }
                         }
@@ -3452,6 +3607,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                                     .put("source", line.sourceText).put("translated", line.translated)
                                     .put("language", line.language).put("vertical", line.vertical)
                                     .put("eraseOnly", line.eraseOnly).put("shape", line.shape).also { layer ->
+                                        line.textColor?.let { layer.put("textColor", it) }
+                                        line.outlineColor?.let { layer.put("outlineColor", it) }
+                                        line.outlineWidthDp?.let { layer.put("outlineWidth", it) }
+                                        if (line.fontScale != 1f) layer.put("fontScale", line.fontScale.toDouble())
                                         line.containerBounds?.let { container ->
                                             layer.put("containerLeft", container.left)
                                                 .put("containerTop", container.top)
@@ -3551,7 +3710,11 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val eraseOnly: Boolean = false,
         val shape: String = "round",
         /** Bubble interior used for typesetting; source bounds remain the erase-only area. */
-        val containerBounds: Rect? = null
+        val containerBounds: Rect? = null,
+        val textColor: Int? = null,
+        val outlineColor: Int? = null,
+        val outlineWidthDp: Int? = null,
+        val fontScale: Float = 1f
     )
     private data class OcrCandidate(
         val bounds: Rect?, val text: String, val engineLanguage: String,
@@ -4863,11 +5026,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 canvas.save()
                 canvas.clipRect(layoutRect)
                 val fillColor = estimateBubbleFillColor(source, layoutRect, item.bounds)
-                val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                val textColor = prefs.getInt(PREF_TRANSLATED_TEXT_COLOR, readableTextColor(fillColor))
-                val outlineColor = prefs.getInt(PREF_TRANSLATED_OUTLINE_COLOR, Color.BLACK)
-                val outlineWidth = prefs.getInt(PREF_TRANSLATED_OUTLINE_WIDTH, 2).coerceIn(0, 6) * resources.displayMetrics.density
-                drawArabicText(canvas, item.translated, layoutRect, item.vertical, textColor, outlineColor, outlineWidth)
+                val textColor = item.textColor ?: readableTextColor(fillColor)
+                val outlineColor = item.outlineColor ?: Color.BLACK
+                val outlineWidth = (item.outlineWidthDp ?: 2).coerceIn(0, 8) * resources.displayMetrics.density
+                drawArabicText(canvas, item.translated, layoutRect, item.vertical, textColor, outlineColor, outlineWidth, item.fontScale)
                 canvas.restore()
             }
         }
@@ -4900,9 +5062,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         return if (whiteContrast > blackContrast) Color.WHITE else Color.rgb(18, 18, 20)
     }
 
-    private fun drawArabicText(canvas: Canvas, text: String, rect: Rect, vertical: Boolean = false, textColor: Int = Color.rgb(20, 20, 22), outlineColor: Int = Color.BLACK, outlineWidthPx: Float = 0f) {
+    private fun drawArabicText(canvas: Canvas, text: String, rect: Rect, vertical: Boolean = false, textColor: Int = Color.rgb(20, 20, 22), outlineColor: Int = Color.BLACK, outlineWidthPx: Float = 0f, fontScale: Float = 1f) {
         if (vertical) {
-            drawArabicTextTopToBottom(canvas, text, rect, textColor, outlineColor, outlineWidthPx)
+            drawArabicTextTopToBottom(canvas, text, rect, textColor, outlineColor, outlineWidthPx, fontScale)
             return
         }
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -4912,7 +5074,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val availableWidth = (rect.width() - insetX * 2).coerceAtLeast(12)
         val availableHeight = (rect.height() - insetY * 2).coerceAtLeast(12)
         val maxPx = min(
-            prefs.getInt(PREF_FONT_SIZE, 22).coerceIn(10, 72) * density,
+            prefs.getInt(PREF_FONT_SIZE, 22).coerceIn(10, 72) * density * fontScale.coerceIn(0.5f, 2f),
             (availableHeight * 0.78f).coerceAtLeast(8f * density)
         )
         val automatic = prefs.getBoolean(PREF_AUTO_FONT_FIT, true)
@@ -4954,14 +5116,14 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     /** Stacks Arabic words from top to bottom while preserving each word's connected shaping. */
-    private fun drawArabicTextTopToBottom(canvas: Canvas, value: String, rect: Rect, textColor: Int, outlineColor: Int, outlineWidthPx: Float) {
+    private fun drawArabicTextTopToBottom(canvas: Canvas, value: String, rect: Rect, textColor: Int, outlineColor: Int, outlineWidthPx: Float, fontScale: Float = 1f) {
         val words = value.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
         if (words.isEmpty()) return
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val maxWidth = (rect.width() - 10).coerceAtLeast(10)
         val maxHeight = (rect.height() - 10).coerceAtLeast(10)
         val density = resources.displayMetrics.density.coerceAtLeast(1f)
-        val configured = prefs.getInt(PREF_FONT_SIZE, 22).coerceIn(10, 72) * density
+        val configured = prefs.getInt(PREF_FONT_SIZE, 22).coerceIn(10, 72) * density * fontScale.coerceIn(0.5f, 2f)
         var chosenSize = min(configured, maxWidth * 0.90f).coerceAtLeast(7f * density)
         var layouts = emptyList<android.text.StaticLayout>()
         var heights = emptyList<Int>()
@@ -5090,7 +5252,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         view.textSize = (size * 0.40f).coerceIn(18f, 38f)
         view.alpha = prefs.getInt(PREF_LENS_ALPHA, 100).coerceIn(35, 100) / 100f
         view.text = prefs.getString(PREF_LENS_GLYPH, "狐") ?: "狐"
-        view.background = lensBackground(prefs.getInt(PREF_LENS_COLOR, Color.rgb(255, 190, 65)))
+        view.background = lensBackgroundForPrefs(prefs)
         if (bubbleWasAdded) runCatching { windowManager.updateViewLayout(view, params) }
     }
 
@@ -5098,6 +5260,28 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         shape = GradientDrawable.OVAL
         setColor(color)
         setStroke(dp(2), Color.WHITE)
+    }
+
+    private fun lensBackgroundForPrefs(prefs: SharedPreferences): Drawable {
+        val path = prefs.getString(PREF_LENS_IMAGE_PATH, null).orEmpty()
+        if (path.isBlank() || !File(path).isFile) {
+            lensBackgroundBitmap?.let { if (!it.isRecycled) it.recycle() }
+            lensBackgroundBitmap = null
+            lensBackgroundBitmapPath = null
+            return lensBackground(prefs.getInt(PREF_LENS_COLOR, Color.rgb(255, 190, 65)))
+        }
+        if (lensBackgroundBitmapPath != path || lensBackgroundBitmap?.isRecycled != false) {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(path, bounds)
+            var sample = 1
+            while (bounds.outWidth / sample > 768 || bounds.outHeight / sample > 768) sample *= 2
+            val decoded = BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample.coerceAtLeast(1) })
+            lensBackgroundBitmap?.let { if (!it.isRecycled) it.recycle() }
+            lensBackgroundBitmap = decoded
+            lensBackgroundBitmapPath = path
+        }
+        return lensBackgroundBitmap?.let { LensImageBackgroundDrawable(it, Color.WHITE) }
+            ?: lensBackground(prefs.getInt(PREF_LENS_COLOR, Color.rgb(255, 190, 65)))
     }
 
     /** Keep the single overlay attached regardless of which app/window is in front. */
@@ -5264,7 +5448,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             typeface = Typeface.create("sans-serif-black", Typeface.BOLD)
             setTextColor(Color.BLACK)
             gravity = Gravity.CENTER
-            background = lensBackground(lensPrefs.getInt(PREF_LENS_COLOR, Color.rgb(255, 190, 65)))
+            background = lensBackgroundForPrefs(lensPrefs)
             elevation = dp(8).toFloat()
             alpha = lensAlpha
             contentDescription = "Manga Fox Translator. اضغط لفتح خيارات الترجمة واسحب لتحريك العدسة"
