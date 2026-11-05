@@ -2417,6 +2417,46 @@ class MainActivity : android.app.Activity() {
         }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+    private fun colorLabel(color: Int): String = String.format(Locale.US, "#%06X", 0xFFFFFF and color)
+
+    private fun showTranslationColorPicker(title: String, current: Int, onSelected: (Int) -> Unit) {
+        val labels = arrayOf("أبيض", "أسود", "أحمر", "برتقالي", "أصفر", "أخضر", "سماوي", "أزرق", "بنفسجي", "وردي", "رمادي", "لون مخصص (HEX)")
+        val colors = intArrayOf(
+            Color.WHITE, Color.BLACK, Color.RED, Color.rgb(255, 125, 35), Color.YELLOW,
+            Color.rgb(40, 190, 100), Color.CYAN, Color.BLUE, Color.rgb(150, 85, 220),
+            Color.rgb(255, 105, 180), Color.GRAY
+        )
+        AlertDialog.Builder(this).setTitle(title).setItems(labels) { _, which ->
+            if (which < colors.size) {
+                onSelected(colors[which])
+            } else {
+                val hexInput = EditText(this).apply {
+                    setSingleLine(true)
+                    hint = "#RRGGBB أو #AARRGGBB"
+                    setText(colorLabel(current))
+                    inputType = android.text.InputType.TYPE_CLASS_TEXT
+                    setSelection(text.length)
+                }
+                AlertDialog.Builder(this).setTitle("لون مخصص")
+                    .setView(hexInput)
+                    .setNegativeButton("إلغاء", null)
+                    .setPositiveButton("تطبيق") { _, _ ->
+                        val raw = hexInput.text.toString().trim().removePrefix("#")
+                        val parsed = runCatching {
+                            when (raw.length) {
+                                6 -> Color.parseColor("#$raw")
+                                8 -> Color.parseColor("#$raw")
+                                else -> throw IllegalArgumentException("صيغة اللون غير صحيحة")
+                            }
+                        }.getOrNull()
+                        if (parsed == null) toast("صيغة اللون غير صحيحة. استخدم #RRGGBB")
+                        else onSelected(parsed)
+                    }.show()
+            }
+        }.show()
+    }
+
+
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
 }
 
@@ -4983,44 +5023,6 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         layout.draw(canvas)
     }
 
-    private fun colorLabel(color: Int): String = String.format(Locale.US, "#%06X", 0xFFFFFF and color)
-
-    private fun showTranslationColorPicker(title: String, current: Int, onSelected: (Int) -> Unit) {
-        val labels = arrayOf("أبيض", "أسود", "أحمر", "برتقالي", "أصفر", "أخضر", "سماوي", "أزرق", "بنفسجي", "وردي", "رمادي", "لون مخصص (HEX)")
-        val colors = intArrayOf(
-            Color.WHITE, Color.BLACK, Color.RED, Color.rgb(255, 125, 35), Color.YELLOW,
-            Color.rgb(40, 190, 100), Color.CYAN, Color.BLUE, Color.rgb(150, 85, 220),
-            Color.rgb(255, 105, 180), Color.GRAY
-        )
-        AlertDialog.Builder(this).setTitle(title).setItems(labels) { _, which ->
-            if (which < colors.size) {
-                onSelected(colors[which])
-            } else {
-                val hexInput = EditText(this).apply {
-                    setSingleLine(true)
-                    hint = "#RRGGBB أو #AARRGGBB"
-                    setText(colorLabel(current))
-                    inputType = android.text.InputType.TYPE_CLASS_TEXT
-                    setSelection(text.length)
-                }
-                AlertDialog.Builder(this).setTitle("لون مخصص")
-                    .setView(hexInput)
-                    .setNegativeButton("إلغاء", null)
-                    .setPositiveButton("تطبيق") { _, _ ->
-                        val raw = hexInput.text.toString().trim().removePrefix("#")
-                        val parsed = runCatching {
-                            when (raw.length) {
-                                6 -> Color.parseColor("#$raw")
-                                8 -> Color.parseColor("#$raw")
-                                else -> throw IllegalArgumentException("صيغة اللون غير صحيحة")
-                            }
-                        }.getOrNull()
-                        if (parsed == null) toast("صيغة اللون غير صحيحة. استخدم #RRGGBB")
-                        else onSelected(parsed)
-                    }.show()
-            }
-        }.show()
-    }
 
     private fun buildArabicLayout(value: String, width: Int, size: Float, textColor: Int): android.text.StaticLayout {
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
