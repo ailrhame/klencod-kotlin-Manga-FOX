@@ -112,6 +112,9 @@ internal const val PREF_FONT_BOLD = "font_bold"
 internal const val PREF_FONT_FILE = "font_file_path"
 internal const val PREF_FONT_LABEL = "font_file_label"
 internal const val PREF_AUTO_FONT_FIT = "auto_font_fit_enabled"
+internal const val PREF_TRANSLATED_TEXT_COLOR = "translated_text_color"
+internal const val PREF_TRANSLATED_OUTLINE_COLOR = "translated_text_outline_color"
+internal const val PREF_TRANSLATED_OUTLINE_WIDTH = "translated_text_outline_width"
 internal const val PREF_RESULTS_EDIT_MODE = "results_edit_mode"
 internal const val REQUEST_PICK_FONT = 713
 internal const val REQUEST_SAVE_PDF = 714
@@ -1061,6 +1064,32 @@ class MainActivity : android.app.Activity() {
             updateFontPreview()
         }
         settingsCard.addView(boldButton, matchWrap(dp(4)))
+
+        // User-controlled translated lettering colors and outline.
+        settingsCard.addView(text("ألوان النص وإطاره", 14f, gold, true).apply {
+            setPadding(0, dp(12), 0, dp(3))
+        }, matchWrap())
+        val textColorButton = actionButton("لون النص المترجم: ${colorLabel(preferences.getInt(PREF_TRANSLATED_TEXT_COLOR, Color.WHITE))}", false) { }
+        textColorButton.setOnClickListener {
+            showTranslationColorPicker("اختر لون النص", preferences.getInt(PREF_TRANSLATED_TEXT_COLOR, Color.WHITE)) { color ->
+                preferences.edit().putInt(PREF_TRANSLATED_TEXT_COLOR, color).apply()
+                textColorButton.text = "لون النص المترجم: ${colorLabel(color)}"
+            }
+        }
+        settingsCard.addView(textColorButton, matchWrap(dp(4)))
+        val outlineColorButton = actionButton("لون إطار النص: ${colorLabel(preferences.getInt(PREF_TRANSLATED_OUTLINE_COLOR, Color.BLACK))}", false) { }
+        outlineColorButton.setOnClickListener {
+            showTranslationColorPicker("اختر لون إطار النص", preferences.getInt(PREF_TRANSLATED_OUTLINE_COLOR, Color.BLACK)) { color ->
+                preferences.edit().putInt(PREF_TRANSLATED_OUTLINE_COLOR, color).apply()
+                outlineColorButton.text = "لون إطار النص: ${colorLabel(color)}"
+            }
+        }
+        settingsCard.addView(outlineColorButton, matchWrap(dp(4)))
+        addSettingSlider(settingsCard, "سُمك إطار النص", 0, 6,
+            preferences.getInt(PREF_TRANSLATED_OUTLINE_WIDTH, 2), " dp") { value ->
+            preferences.edit().putInt(PREF_TRANSLATED_OUTLINE_WIDTH, value).apply()
+        }
+        settingsCard.addView(text("يمكنك اختيار لون الحروف ولون الحد المحيط بها بشكل مستقل. اجعل سُمك الإطار صفراً لإخفائه.", 11f, Color.LTGRAY), matchWrap(dp(6)))
 
         settingsCard.addView(text("خطوط عربية قابلة للتنزيل", 14f, gold, true).apply {
             setPadding(0, dp(12), 0, dp(4))
@@ -4794,8 +4823,11 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 canvas.save()
                 canvas.clipRect(layoutRect)
                 val fillColor = estimateBubbleFillColor(source, layoutRect, item.bounds)
-                val textColor = readableTextColor(fillColor)
-                drawArabicText(canvas, item.translated, layoutRect, item.vertical, textColor)
+                val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                val textColor = prefs.getInt(PREF_TRANSLATED_TEXT_COLOR, readableTextColor(fillColor))
+                val outlineColor = prefs.getInt(PREF_TRANSLATED_OUTLINE_COLOR, Color.BLACK)
+                val outlineWidth = prefs.getInt(PREF_TRANSLATED_OUTLINE_WIDTH, 2).coerceIn(0, 6) * resources.displayMetrics.density
+                drawArabicText(canvas, item.translated, layoutRect, item.vertical, textColor, outlineColor, outlineWidth)
                 canvas.restore()
             }
         }
@@ -4828,9 +4860,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         return if (whiteContrast > blackContrast) Color.WHITE else Color.rgb(18, 18, 20)
     }
 
-    private fun drawArabicText(canvas: Canvas, text: String, rect: Rect, vertical: Boolean = false, textColor: Int = Color.rgb(20, 20, 22)) {
+    private fun drawArabicText(canvas: Canvas, text: String, rect: Rect, vertical: Boolean = false, textColor: Int = Color.rgb(20, 20, 22), outlineColor: Int = Color.BLACK, outlineWidthPx: Float = 0f) {
         if (vertical) {
-            drawArabicTextTopToBottom(canvas, text, rect, textColor)
+            drawArabicTextTopToBottom(canvas, text, rect, textColor, outlineColor, outlineWidthPx)
             return
         }
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -4854,7 +4886,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         canvas.save()
         canvas.clipRect(rect)
         canvas.translate(x.toFloat(), y)
-        layout.draw(canvas)
+        drawOutlinedLayout(canvas, layout, textColor, outlineColor, outlineWidthPx)
         canvas.restore()
     }
 
@@ -4882,7 +4914,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     /** Stacks Arabic words from top to bottom while preserving each word's connected shaping. */
-    private fun drawArabicTextTopToBottom(canvas: Canvas, value: String, rect: Rect, textColor: Int) {
+    private fun drawArabicTextTopToBottom(canvas: Canvas, value: String, rect: Rect, textColor: Int, outlineColor: Int, outlineWidthPx: Float) {
         val words = value.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
         if (words.isEmpty()) return
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -4921,11 +4953,73 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         layouts.forEachIndexed { index, layout ->
             canvas.save()
             canvas.translate(rect.left + (rect.width() - layout.width) / 2f, y)
-            layout.draw(canvas)
+            drawOutlinedLayout(canvas, layout, textColor, outlineColor, outlineWidthPx)
             canvas.restore()
             y += heights[index] + spacing
         }
         canvas.restore()
+    }
+
+    /** Draws a rounded outline pass first, then the requested fill color. */
+    private fun drawOutlinedLayout(
+        canvas: Canvas,
+        layout: android.text.StaticLayout,
+        fillColor: Int,
+        outlineColor: Int,
+        outlineWidthPx: Float
+    ) {
+        val paint = layout.paint
+        if (outlineWidthPx > 0f && Color.alpha(outlineColor) > 0) {
+            paint.color = outlineColor
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = outlineWidthPx
+            paint.strokeJoin = Paint.Join.ROUND
+            paint.strokeCap = Paint.Cap.ROUND
+            layout.draw(canvas)
+        }
+        paint.color = fillColor
+        paint.style = Paint.Style.FILL
+        paint.strokeWidth = 0f
+        layout.draw(canvas)
+    }
+
+    private fun colorLabel(color: Int): String = String.format(Locale.US, "#%06X", 0xFFFFFF and color)
+
+    private fun showTranslationColorPicker(title: String, current: Int, onSelected: (Int) -> Unit) {
+        val labels = arrayOf("أبيض", "أسود", "أحمر", "برتقالي", "أصفر", "أخضر", "سماوي", "أزرق", "بنفسجي", "وردي", "رمادي", "لون مخصص (HEX)")
+        val colors = intArrayOf(
+            Color.WHITE, Color.BLACK, Color.RED, Color.rgb(255, 125, 35), Color.YELLOW,
+            Color.rgb(40, 190, 100), Color.CYAN, Color.BLUE, Color.rgb(150, 85, 220),
+            Color.rgb(255, 105, 180), Color.GRAY
+        )
+        AlertDialog.Builder(this).setTitle(title).setItems(labels) { _, which ->
+            if (which < colors.size) {
+                onSelected(colors[which])
+            } else {
+                val hexInput = EditText(this).apply {
+                    setSingleLine(true)
+                    hint = "#RRGGBB أو #AARRGGBB"
+                    setText(colorLabel(current))
+                    inputType = android.text.InputType.TYPE_CLASS_TEXT
+                    setSelection(text.length)
+                }
+                AlertDialog.Builder(this).setTitle("لون مخصص")
+                    .setView(hexInput)
+                    .setNegativeButton("إلغاء", null)
+                    .setPositiveButton("تطبيق") { _, _ ->
+                        val raw = hexInput.text.toString().trim().removePrefix("#")
+                        val parsed = runCatching {
+                            when (raw.length) {
+                                6 -> Color.parseColor("#$raw")
+                                8 -> Color.parseColor("#$raw")
+                                else -> throw IllegalArgumentException("صيغة اللون غير صحيحة")
+                            }
+                        }.getOrNull()
+                        if (parsed == null) toast("صيغة اللون غير صحيحة. استخدم #RRGGBB")
+                        else onSelected(parsed)
+                    }.show()
+            }
+        }.show()
     }
 
     private fun buildArabicLayout(value: String, width: Int, size: Float, textColor: Int): android.text.StaticLayout {
