@@ -2792,7 +2792,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                         source.delete()
                         target.absolutePath
                     }
-                    runOnUiThread {
+                    Handler(Looper.getMainLooper()).post {
                         MangaFoxRuntime.sourcePages = saved
                         MangaFoxRuntime.resultPages = saved
                         MangaFoxRuntime.translationLayerFiles = saved.map { "" }
@@ -2813,7 +2813,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     }
                 } catch (e: Exception) {
                     workPages.forEach { runCatching { it.delete() } }
-                    runOnUiThread { finishCaptureWithError("تعذر تجهيز الصور: ${e.localizedMessage ?: "خطأ"}") }
+                    Handler(Looper.getMainLooper()).post {
+                        finishCaptureWithError("تعذر تجهيز الصور: ${e.localizedMessage ?: "خطأ"}")
+                    }
                 }
             }
         } else {
