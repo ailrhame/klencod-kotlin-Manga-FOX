@@ -35,6 +35,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import android.provider.OpenableColumns
 import android.view.Gravity
 import android.view.MotionEvent
@@ -73,6 +75,12 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.URL
 import java.net.HttpURLConnection
+import java.security.KeyStore
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
+import android.util.Base64
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -117,6 +125,11 @@ internal const val PREF_SOURCE_LANGUAGE = "translation_source_language"
 internal const val PREF_ONBOARDING_SEEN = "onboarding_seen_v1"
 internal const val PREF_TRANSLATE_SFX = "translate_japanese_sfx"
 internal const val PREF_LEARNED_TRANSLATIONS = "learned_translation_dictionary"
+internal const val PREF_AI_ZH_ENABLED = "ai_chinese_translation_enabled"
+internal const val PREF_AI_ENDPOINT = "ai_translation_endpoint"
+internal const val PREF_AI_MODEL = "ai_translation_model"
+internal const val PREF_AI_SECRET_CIPHER = "ai_translation_secret_cipher"
+internal const val PREF_AI_SECRET_IV = "ai_translation_secret_iv"
 internal const val MAX_CAPTURE_FRAMES = 120
 
 class MainActivity : android.app.Activity() {
@@ -1143,6 +1156,7 @@ class MainActivity : android.app.Activity() {
                 }.show()
         }
         settingsCard.addView(sourceLanguageButton, matchWrap(dp(4)))
+        addChineseAiSettings(settingsCard)
         val sfxOption = CheckBox(this).apply {
             text = "ترجمة المؤثرات اليابانية الشائعة (SFX) عند اكتشافها"
             textSize = 13f
@@ -1179,6 +1193,112 @@ class MainActivity : android.app.Activity() {
         settingsCard.addView(text("العدسة العائمة تعمل دائماً وتبقى ظاهرة فوق التطبيقات، بما فيها Manga FOX، ما دامت خدمة إمكانية الوصول وإذن الظهور فوق التطبيقات مفعّلين.", 11f, Color.LTGRAY), matchWrap(dp(6)))
         updateFontPreview()
         root.addView(settingsCard, matchWrap(dp(16)))
+    }
+
+    private fun addChineseAiSettings(root: LinearLayout) {
+        root.addView(text("محرك الترجمة الذكي للصينية · MAX", 16f, gold, true).apply {
+            setPadding(0, dp(14), 0, dp(3))
+        }, matchWrap())
+        root.addView(text("يُستخدم نموذج الذكاء الاصطناعي للنص الصيني، بينما يبقى Google ML Kit محركاً محلياً احتياطياً. أدخل بيانات مزود متوافق مع واجهة OpenAI Chat Completions.", 11f, Color.LTGRAY), matchWrap(dp(5)))
+
+        val endpoint = EditText(this).apply {
+            setSingleLine(true)
+            textSize = 13f
+            hint = "رابط API — يجب أن يبدأ بـ https://"
+            setText(preferences.getString(PREF_AI_ENDPOINT, "https://api.openai.com/v1/chat/completions"))
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            setPadding(dp(10), dp(9), dp(10), dp(9))
+            background = rounded(Color.rgb(38, 38, 46), 10)
+        }
+        val model = EditText(this).apply {
+            setSingleLine(true)
+            textSize = 13f
+            hint = "اسم النموذج"
+            setText(preferences.getString(PREF_AI_MODEL, "gpt-4o-mini"))
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            setPadding(dp(10), dp(9), dp(10), dp(9))
+            background = rounded(Color.rgb(38, 38, 46), 10)
+        }
+        val apiKey = EditText(this).apply {
+            setSingleLine(true)
+            textSize = 13f
+            hint = if (MangaFoxSecureSecretStore.get(this@MainActivity).isNullOrBlank()) "مفتاح API" else "مفتاح API محفوظ ومشفّر — أدخل بديلاً للتغيير"
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            setPadding(dp(10), dp(9), dp(10), dp(9))
+            background = rounded(Color.rgb(38, 38, 46), 10)
+        }
+        root.addView(endpoint, matchWrap(dp(6)))
+        root.addView(model, matchWrap(dp(6)))
+        root.addView(apiKey, matchWrap(dp(6)))
+
+        val enabled = CheckBox(this).apply {
+            text = "تفعيل الذكاء الاصطناعي للصينية مع الرجوع للمحرك المحلي عند الفشل"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            buttonTintList = android.content.res.ColorStateList.valueOf(gold)
+            isChecked = preferences.getBoolean(PREF_AI_ZH_ENABLED, true)
+            setOnCheckedChangeListener { _, checked ->
+                preferences.edit().putBoolean(PREF_AI_ZH_ENABLED, checked).apply()
+                toast(if (checked) "تم تفعيل مسار AI للصينية" else "تم إيقاف AI؛ سيعمل المحرك المحلي")
+            }
+        }
+        root.addView(enabled, matchWrap(dp(5)))
+
+        fun saveConfig(showMessage: Boolean): Boolean {
+            val url = endpoint.text.toString().trim()
+            val modelName = model.text.toString().trim()
+            if (!url.startsWith("https://", true) || modelName.isBlank()) {
+                if (showMessage) toast("أدخل رابط HTTPS صحيحاً واسم النموذج")
+                return false
+            }
+            preferences.edit().putString(PREF_AI_ENDPOINT, url).putString(PREF_AI_MODEL, modelName).apply()
+            val newKey = apiKey.text.toString().trim()
+            if (newKey.isNotBlank()) {
+                val stored = runCatching { MangaFoxSecureSecretStore.put(this@MainActivity, newKey) }.isSuccess
+                if (!stored) {
+                    if (showMessage) toast("تعذر تشفير المفتاح على هذا الجهاز؛ لم يُحفظ")
+                    return false
+                }
+                apiKey.setText("")
+                apiKey.hint = "مفتاح API محفوظ ومشفّر — أدخل بديلاً للتغيير"
+            }
+            if (showMessage) toast("حُفظت إعدادات محرك MAX داخل التطبيق")
+            return true
+        }
+
+        root.addView(actionButton("حفظ إعدادات API", true) { saveConfig(true) }, matchWrap(dp(3)))
+        root.addView(actionButton("حذف مفتاح API المحفوظ", false) {
+            MangaFoxSecureSecretStore.clear(this)
+            toast("تم حذف مفتاح API المشفّر من بيانات التطبيق")
+        }, matchWrap(dp(3)))
+        root.addView(actionButton("اختبار اتصال API", false) {
+            if (!saveConfig(false)) return@actionButton
+            val secret = MangaFoxSecureSecretStore.get(this)
+            if (secret.isNullOrBlank()) {
+                toast("أدخل مفتاح API أولاً ثم احفظه")
+                return@actionButton
+            }
+            toast("جارٍ اختبار الاتصال…")
+            fontDownloadExecutor.execute {
+                val result = runCatching {
+                    MangaFoxAiTranslator.translate(
+                        this, "你是谁？", emptyList(), emptyList(), testRequest = true
+                    )
+                }
+                runOnUiThread {
+                    if (result.isSuccess && result.getOrNull().orEmpty().isNotBlank()) {
+                        toast("نجح اتصال API. استجابة الاختبار: ${result.getOrNull()?.take(90)}")
+                    } else {
+                        toast("فشل اختبار API: ${result.exceptionOrNull()?.message?.take(180) ?: "استجابة فارغة"}")
+                    }
+                }
+            }
+        }, matchWrap(dp(4)))
+        root.addView(text("تنبيه: نصوص الصفحات ستُرسل إلى مزود API عند تفعيل هذا الخيار. لا تضع مفتاحاً لا تملك حق استخدامه. يتطلب الاتصال إذن INTERNET في AndroidManifest.xml.", 10f, Color.LTGRAY), matchWrap(dp(4)))
     }
 
     private fun showLearnedTranslationDialog(sourceText: String) {
@@ -4067,6 +4187,19 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     private fun translateWithLanguage(sourceText: String, languageCode: String): String {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        if (languageCode == "zh" && prefs.getBoolean(PREF_AI_ZH_ENABLED, true)) {
+            val apiKey = MangaFoxSecureSecretStore.get(this)
+            if (!apiKey.isNullOrBlank()) {
+                val knowledge = MangaFoxKnowledgeStore(this)
+                val aiResult = runCatching {
+                    MangaFoxAiTranslator.translate(this, sourceText, knowledge.glossary(), knowledge.characters())
+                }.getOrNull()
+                if (!aiResult.isNullOrBlank() && isUsefulArabicTranslation(sourceText, aiResult) &&
+                    !hasUntranslatedLatinRuns(aiResult, 5)) return cleanArabicTranslation(aiResult)
+                // A rejected/failed AI result never replaces the original; local ML Kit remains the fallback.
+            }
+        }
         val translator = translatorFor(languageCode)
         Tasks.await(translator.downloadModelIfNeeded(DownloadConditions.Builder().build()))
         return Tasks.await(translator.translate(sourceText))
@@ -5653,6 +5786,138 @@ object MangaFoxLayoutEngine {
 }
 
 /** Runtime profile helper; it never starts more than one CPU-heavy page job per configured worker. */
+/** Encrypted API-secret storage backed by Android Keystore; the raw key is never written to a plain-text preference. */
+internal object MangaFoxSecureSecretStore {
+    private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+    private const val KEY_ALIAS = "manga_fox_ai_api_aes_v1"
+    private const val TRANSFORMATION = "AES/GCM/NoPadding"
+
+    @Synchronized private fun getOrCreateKey(): SecretKey {
+        val store = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        val existing = store.getKey(KEY_ALIAS, null) as? SecretKey
+        if (existing != null) return existing
+        val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+        generator.init(
+            KeyGenParameterSpec.Builder(KEY_ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setRandomizedEncryptionRequired(true)
+                .build()
+        )
+        return generator.generateKey()
+    }
+
+    fun put(context: Context, secret: String) {
+        require(secret.isNotBlank()) { "مفتاح API فارغ" }
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
+        val encrypted = cipher.doFinal(secret.toByteArray(Charsets.UTF_8))
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putString(PREF_AI_SECRET_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
+            .putString(PREF_AI_SECRET_CIPHER, Base64.encodeToString(encrypted, Base64.NO_WRAP))
+            .apply()
+    }
+
+    fun get(context: Context): String? = runCatching {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val iv = Base64.decode(prefs.getString(PREF_AI_SECRET_IV, null), Base64.NO_WRAP)
+        val encrypted = Base64.decode(prefs.getString(PREF_AI_SECRET_CIPHER, null), Base64.NO_WRAP)
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), GCMParameterSpec(128, iv))
+        String(cipher.doFinal(encrypted), Charsets.UTF_8).takeIf { it.isNotBlank() }
+    }.getOrNull()
+
+    fun clear(context: Context) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .remove(PREF_AI_SECRET_IV).remove(PREF_AI_SECRET_CIPHER).apply()
+    }
+}
+
+/** OpenAI-compatible Chat Completions adapter specialized for Chinese-to-Arabic manhua dialogue. */
+internal object MangaFoxAiTranslator {
+    fun translate(
+        context: Context,
+        source: String,
+        glossary: List<MangaFoxKnowledgeStore.GlossaryEntry>,
+        characters: List<MangaFoxKnowledgeStore.CharacterEntry>,
+        testRequest: Boolean = false
+    ): String {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val key = MangaFoxSecureSecretStore.get(context)?.takeIf { it.isNotBlank() }
+            ?: throw IllegalStateException("مفتاح API غير محفوظ")
+        val endpoint = (prefs.getString(PREF_AI_ENDPOINT, "https://api.openai.com/v1/chat/completions")
+            ?: "https://api.openai.com/v1/chat/completions").trim()
+        require(endpoint.startsWith("https://", true)) { "يُسمح بعنوان HTTPS فقط" }
+        val model = (prefs.getString(PREF_AI_MODEL, "gpt-4o-mini") ?: "gpt-4o-mini").trim()
+        require(model.isNotBlank()) { "اسم النموذج فارغ" }
+
+        val glossaryText = glossary.take(100).joinToString("\n") {
+            "${it.source} = ${it.arabic}" + if (it.note.isBlank()) "" else " (${it.note})"
+        }.ifBlank { "لا توجد مصطلحات محفوظة." }
+        val characterText = characters.take(60).joinToString("\n") {
+            "${it.name}" + if (it.voice.isBlank() && it.notes.isBlank()) "" else " | ${it.voice} | ${it.notes}"
+        }.ifBlank { "لا توجد بيانات شخصيات محفوظة." }
+
+        val systemPrompt = """
+أنت مترجم مانها صينية محترف إلى العربية الفصحى. مهمتك نقل المعنى المقصود بدقة، لا الترجمة الحرفية العمياء.
+قواعد إلزامية:
+1) افهم تركيب الصينية المبسطة أو التقليدية، الضمائر المحذوفة، السياق، التلميح، السخرية، الأمثال والتعابير الاصطلاحية.
+2) اكتب عربية فصحى طبيعية ومتماسكة تناسب حوار المانهوا، مع الحفاظ على نبرة المتحدث (تهديد، احترام، غضب، دهشة، مزاح...).
+3) لا تضف أحداثاً أو معلومات غير موجودة، ولا تحذف معنى أو شرطاً أو نفياً أو درجة احترام.
+4) ثبّت أسماء الشخصيات والأماكن والمهارات والألقاب وفق المعجم المرفق. لا تترجم الاسم العلم ترجمة وصفية.
+5) إذا كان النص ناقصاً أو غامضاً، اختر أقرب معنى تدعمه الكلمات ولا تخترع سياقاً. حافظ على علامات الوقف والانفعال عند الحاجة.
+6) أخرج الترجمة العربية فقط، دون شرح أو مقدمات أو علامات اقتباس زائدة. لا تكرر النص الصيني.
+7) المؤثرات الصوتية تُصاغ عربياً بإيجاز بما يناسب المشهد، ولا تحولها إلى جملة حوار.
+
+ذاكرة المصطلحات:
+$glossaryText
+
+ذاكرة الشخصيات ونبراتها:
+$characterText
+""".trimIndent()
+
+        val body = JSONObject()
+            .put("model", model)
+            .put("temperature", 0.15)
+            .put("messages", JSONArray()
+                .put(JSONObject().put("role", "system").put("content", systemPrompt))
+                .put(JSONObject().put("role", "user").put("content", if (testRequest) "你是谁？请用阿拉伯语回答。" else source)))
+        val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 18000
+            readTimeout = 45000
+            doOutput = true
+            setRequestProperty("Authorization", "Bearer $key")
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            setRequestProperty("Accept", "application/json")
+        }
+        try {
+            connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            val status = connection.responseCode
+            val stream = if (status in 200..299) connection.inputStream else connection.errorStream
+            val response = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            if (status !in 200..299) {
+                val detail = runCatching { JSONObject(response).optJSONObject("error")?.optString("message") }.getOrNull()
+                throw IllegalStateException("HTTP $status${detail?.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""}")
+            }
+            val json = JSONObject(response)
+            val content = json.optJSONArray("choices")?.optJSONObject(0)
+                ?.optJSONObject("message")?.opt("content")
+            val translated = when (content) {
+                is String -> content.trim()
+                is JSONArray -> (0 until content.length()).mapNotNull { i ->
+                    content.optJSONObject(i)?.optString("text")?.takeIf { it.isNotBlank() }
+                }.joinToString(" ").trim()
+                else -> ""
+            }
+            if (translated.isBlank()) throw IllegalStateException("أعاد API استجابة بلا نص مترجم")
+            translated
+        } finally {
+            connection.disconnect()
+        }
+    }
+}
+
 object MangaFoxPerformanceAdvisor {
     data class Profile(val name: String, val maxImageSide: Int, val workerCount: Int, val highContrastPass: Boolean)
     fun forDevice(availableMemoryMb: Int, cpuCores: Int): Profile = when {
