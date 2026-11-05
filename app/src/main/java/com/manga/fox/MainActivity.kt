@@ -5911,7 +5911,7 @@ $characterText
                 else -> ""
             }
             if (translated.isBlank()) throw IllegalStateException("أعاد API استجابة بلا نص مترجم")
-            translated
+            return translated
         } finally {
             connection.disconnect()
         }
