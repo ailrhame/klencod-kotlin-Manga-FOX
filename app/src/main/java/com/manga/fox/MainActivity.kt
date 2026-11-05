@@ -1060,10 +1060,10 @@ class MainActivity : android.app.Activity() {
         settingsCard.addView(familyButton, matchWrap(dp(4)))
 
         val boldButton = actionButton(
-            if (preferences.getBoolean(PREF_FONT_BOLD, true)) "نمط الخط: عريض ✓" else "نمط الخط: عادي", false
+            if (preferences.getBoolean(PREF_FONT_BOLD, false)) "نمط الخط: عريض ✓" else "نمط الخط: عادي", false
         ) { }
         boldButton.setOnClickListener {
-            val enabled = !preferences.getBoolean(PREF_FONT_BOLD, true)
+            val enabled = !preferences.getBoolean(PREF_FONT_BOLD, false)
             preferences.edit().putBoolean(PREF_FONT_BOLD, enabled).apply()
             boldButton.text = if (enabled) "نمط الخط: عريض ✓" else "نمط الخط: عادي"
             updateFontPreview()
@@ -1353,16 +1353,22 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun saveLensBackgroundImage(uri: android.net.Uri) {
+        var temp: File? = null
+        var target: File? = null
         runCatching {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-                ?: error("تعذر قراءة الصورة")
-            require(bounds.outWidth in 1..12000 && bounds.outHeight in 1..12000) { "أبعاد الصورة غير مدعومة" }
+            // Persist access when the document provider supports it; the copied file remains
+            // usable even after Android revokes the temporary URI grant.
+            runCatching {
+                contentResolver.takePersistableUriPermission(
+                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
             val folder = File(filesDir, "lens_backgrounds").apply { mkdirs() }
-            val target = File(folder, "lens_${System.currentTimeMillis()}.img")
-            val input = contentResolver.openInputStream(uri) ?: error("تعذر فتح الصورة")
-            input.use { source -> FileOutputStream(target).use { destination ->
-                val buffer = ByteArray(8192)
+            temp = File(folder, "lens_${System.currentTimeMillis()}.tmp")
+            target = File(folder, "lens_${System.currentTimeMillis()}.img")
+            val input = contentResolver.openInputStream(uri) ?: error("تعذر فتح الصورة من مزود الملفات")
+            input.use { source -> FileOutputStream(temp!!).use { destination ->
+                val buffer = ByteArray(16 * 1024)
                 var total = 0L
                 while (true) {
                     val count = source.read(buffer)
@@ -1372,10 +1378,31 @@ class MainActivity : android.app.Activity() {
                     destination.write(buffer, 0, count)
                 }
             } }
-            preferences.edit().putString(PREF_LENS_IMAGE_PATH, target.absolutePath).apply()
+            require(temp!!.length() > 0L) { "ملف الصورة فارغ" }
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(temp!!.absolutePath, bounds)
+            require(bounds.outWidth in 1..12000 && bounds.outHeight in 1..12000 && bounds.outMimeType != null) {
+                "صيغة الصورة غير مدعومة أو الملف تالف"
+            }
+            // Decode a sampled bitmap now to catch unsupported/corrupt image content before saving.
+            var sample = 1
+            while (bounds.outWidth / sample > 768 || bounds.outHeight / sample > 768) sample *= 2
+            val testBitmap = BitmapFactory.decodeFile(temp!!.absolutePath, BitmapFactory.Options().apply {
+                inSampleSize = sample.coerceAtLeast(1)
+            }) ?: error("تعذر فك ترميز الصورة")
+            testBitmap.recycle()
+            if (!temp!!.renameTo(target!!)) {
+                temp!!.copyTo(target!!, overwrite = true)
+                temp!!.delete()
+            }
+            preferences.edit().putString(PREF_LENS_IMAGE_PATH, target!!.absolutePath).apply()
             MangaFoxAccessibilityService.instance?.applyLensSettings()
             toast("تم حفظ صورة العدسة وتطبيقها كخلفية")
-        }.onFailure { toast("تعذر استخدام الصورة: ${it.localizedMessage ?: "ملف غير صالح"}") }
+        }.onFailure {
+            temp?.delete()
+            target?.delete()
+            toast("تعذر استخدام الصورة: ${it.localizedMessage ?: "ملف غير صالح"}")
+        }
     }
 
     private fun openLensStudio() {
@@ -2606,7 +2633,7 @@ private class LensImageBackgroundDrawable(
 }
 
 internal fun resolveArabicTypeface(prefs: SharedPreferences): Typeface {
-    val boldPreferred = prefs.getBoolean(PREF_FONT_BOLD, true)
+    val boldPreferred = prefs.getBoolean(PREF_FONT_BOLD, false)
     val customPath = prefs.getString(PREF_FONT_FILE, null)
     if (!customPath.isNullOrBlank()) {
         val custom = runCatching {
@@ -6206,8 +6233,18 @@ $characterText
             val stream = if (status in 200..299) connection.inputStream else connection.errorStream
             val response = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
             if (status !in 200..299) {
-                val detail = runCatching { JSONObject(response).optJSONObject("error")?.optString("message") }.getOrNull()
-                throw IllegalStateException("HTTP $status${detail?.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""}")
+                val detail = runCatching {
+                    JSONObject(response).optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() }
+                }.getOrNull()
+                val explanation = when (status) {
+                    401 -> "مفتاح API غير صحيح أو منتهي الصلاحية (401)"
+                    403 -> "المفتاح لا يملك صلاحية استخدام النموذج (403)"
+                    404 -> "النموذج أو مسار API غير موجود (404)"
+                    429 -> "تجاوزت الحصة أو حد الطلبات؛ تحقق من الفوترة والرصيد (429)"
+                    in 500..599 -> "خلل مؤقت لدى خادم API ($status)"
+                    else -> "رفض خادم API الطلب (HTTP $status)"
+                }
+                throw IllegalStateException(explanation + (detail?.let { " — $it" } ?: ""))
             }
             val json = JSONObject(response)
             val content = json.optJSONArray("choices")?.optJSONObject(0)
