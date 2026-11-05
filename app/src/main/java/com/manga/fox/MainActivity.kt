@@ -53,6 +53,7 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import android.speech.tts.TextToSpeech
 import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.nl.languageid.LanguageIdentification
 import com.google.mlkit.common.model.DownloadConditions
@@ -138,6 +139,9 @@ class MainActivity : android.app.Activity() {
     private var accessPermissionText: TextView? = null
     private var overlayPermissionText: TextView? = null
     private var notificationPermissionText: TextView? = null
+    private var textToSpeech: TextToSpeech? = null
+    private var textToSpeechReady = false
+    private var pendingSpeechText: String = ""
     private var homeVisible = false
     private val homeUiHandler = Handler(Looper.getMainLooper())
     private val homeUiTick = object : Runnable {
@@ -190,6 +194,88 @@ class MainActivity : android.app.Activity() {
         homeUiHandler.removeCallbacks(homeUiTick)
         MangaFoxAccessibilityService.instance?.onHostActivityPaused()
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        homeUiHandler.removeCallbacks(homeUiTick)
+        textToSpeech?.stop()
+        textToSpeech?.shutdown()
+        textToSpeech = null
+        super.onDestroy()
+    }
+
+    /** Reads the saved Arabic translation layers in page and bubble order. */
+    private fun speakResultsAloud() {
+        if (textToSpeech?.isSpeaking == true) {
+            textToSpeech?.stop()
+            toast("تم إيقاف القراءة الصوتية")
+            return
+        }
+        val extracted = ArrayList<String>()
+        MangaFoxRuntime.translationLayerFiles.forEach { path ->
+            val file = path.takeIf { it.isNotBlank() }?.let(::File)?.takeIf { it.isFile } ?: return@forEach
+            val layers = runCatching { org.json.JSONArray(file.readText(Charsets.UTF_8)) }.getOrNull() ?: return@forEach
+            for (index in 0 until layers.length()) {
+                val translated = layers.optJSONObject(index)?.optString("translated", "")?.trim().orEmpty()
+                if (translated.isNotBlank()) extracted.add(translated)
+            }
+        }
+        val speechText = extracted.joinToString(". ")
+        if (speechText.isBlank()) {
+            toast("لا توجد طبقات ترجمة نصية لهذه النتيجة. أعد OCR والترجمة أولاً")
+            return
+        }
+        pendingSpeechText = speechText
+        val existing = textToSpeech
+        if (existing != null && textToSpeechReady) {
+            speakTextInChunks(speechText)
+            return
+        }
+        if (existing == null) {
+            textToSpeechReady = false
+            textToSpeech = TextToSpeech(this) { status ->
+                runOnUiThread {
+                    val engine = textToSpeech
+                    if (status != TextToSpeech.SUCCESS || engine == null) {
+                        textToSpeechReady = false
+                        toast("تعذر تشغيل محرك القراءة الصوتية على هذا الجهاز")
+                        return@runOnUiThread
+                    }
+                    val languageStatus = engine.setLanguage(Locale("ar"))
+                    if (languageStatus == TextToSpeech.LANG_MISSING_DATA ||
+                        languageStatus == TextToSpeech.LANG_NOT_SUPPORTED) {
+                        textToSpeechReady = false
+                        toast("محرك الصوت لا يدعم العربية حالياً؛ ثبّت بيانات الصوت العربي")
+                        return@runOnUiThread
+                    }
+                    textToSpeechReady = true
+                    speakTextInChunks(pendingSpeechText)
+                }
+            }
+        } else {
+            toast("يجري تجهيز محرك القراءة الصوتية")
+        }
+    }
+
+    private fun speakTextInChunks(value: String) {
+        val engine = textToSpeech ?: return
+        if (!textToSpeechReady) return
+        val chunks = ArrayList<String>()
+        var remaining = value.trim()
+        while (remaining.length > 3000) {
+            var cut = remaining.lastIndexOf(' ', 3000).takeIf { it > 1200 } ?: 3000
+            val sentenceCut = remaining.lastIndexOfAny(charArrayOf('.', '؟', '!', '؛'), cut)
+            if (sentenceCut > 1200) cut = sentenceCut + 1
+            chunks.add(remaining.substring(0, cut).trim())
+            remaining = remaining.substring(cut).trim()
+        }
+        if (remaining.isNotBlank()) chunks.add(remaining)
+        engine.stop()
+        chunks.forEachIndexed { index, chunk ->
+            val queue = if (index == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+            engine.speak(chunk, queue, null, "mfox_read_$index")
+        }
+        toast("بدأت القراءة الصوتية للترجمة العربية")
     }
 
     private fun applySystemBars() {
@@ -1768,6 +1854,7 @@ class MainActivity : android.app.Activity() {
         }
         topBar.addView(compactButton("الرئيسية") { showHome() })
         topBar.addView(compactButton("PDF") { exportResultsAsPdf() })
+        topBar.addView(compactButton("صوت") { speakResultsAloud() })
         topBar.addView(compactButton(if (editMode) "معاينة متصلة" else "أدوات التحرير") {
             preferences.edit().putBoolean(PREF_RESULTS_EDIT_MODE, !editMode).apply()
             showResults()
@@ -1811,7 +1898,7 @@ class MainActivity : android.app.Activity() {
         if (pages.isEmpty()) {
             root.addView(text(
                 if (MangaFoxRuntime.lastError.isNotBlank()) MangaFoxRuntime.lastError
-                else "لا توجد نتيجة بعد. افتح فصلاً واضغط العدسة العائمة مطولاً لترجمة الفصل كاملاً.",
+                else "لا توجد نتيجة بعد. افتح فصلاً واضغط العدسة العائمة، ثم اختر ترجمة الفصل العمودي كاملاً.",
                 15f, Color.LTGRAY
             ).apply { setPadding(dp(12), dp(30), dp(12), dp(30)) }, matchWrap())
         } else {
@@ -2229,6 +2316,10 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private lateinit var windowManager: WindowManager
     private var bubble: TextView? = null
     private var bubbleParams: WindowManager.LayoutParams? = null
+    // Separate overlay for the lens action menu. It is kept independent from the
+    // bubble so the menu can be dismissed without recreating or moving the lens.
+    private var floatingOptionsView: View? = null
+    private var floatingOptionsParams: WindowManager.LayoutParams? = null
     @Volatile private var currentForegroundPackage: String? = null
     @Volatile private var hostActivityResumed: Boolean = false
     private var captureRunning = false
@@ -4611,53 +4702,26 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         canvas.restore()
     }
 
-    /**
-     * Finds the largest Arabic text layout that fits the actual bubble bounds.
-     * The configured font size is a ceiling, never a forced drawing size.
-     */
+    /** Binary-searches the largest type size whose shaped RTL layout fits both dimensions. */
     private fun findLargestArabicLayout(
         value: String, width: Int, height: Int, maxSizePx: Float, minSizePx: Float
     ): android.text.StaticLayout {
-        val safeWidth = width.coerceAtLeast(8)
-        val safeHeight = height.coerceAtLeast(8)
-        val lower = min(minSizePx, maxSizePx).coerceAtLeast(3.5f)
+        val lower = min(minSizePx, maxSizePx).coerceAtLeast(5f)
         var low = lower
         var high = maxSizePx.coerceAtLeast(lower)
-
-        fun fits(layout: android.text.StaticLayout): Boolean {
-            if (layout.height > safeHeight) return false
-            for (line in 0 until layout.lineCount) {
-                // Check the shaped line bounds, not only its advance width. This is
-                // important for Arabic glyph overhang and custom typefaces.
-                if (layout.getLineLeft(line) < -1f || layout.getLineRight(line) > safeWidth + 1f) return false
-            }
-            return true
-        }
-
-        var best = buildArabicLayout(value, safeWidth, lower)
-        var bestSize = lower
-        var foundFit = fits(best)
-        if (!foundFit) {
-            // Long translated sentences may need to go below the old 7.5sp floor.
-            // Search downward in small steps before accepting a clipped layout.
-            var size = lower
-            repeat(18) {
-                if (foundFit) return@repeat
-                size = (size - 0.35f).coerceAtLeast(2.5f)
-                val candidate = buildArabicLayout(value, safeWidth, size)
-                if (fits(candidate)) { best = candidate; bestSize = size; foundFit = true }
-                if (size <= 2.5f) return@repeat
-            }
-        }
-
-        if (!foundFit) return best
-        // Binary search the remaining interval for the largest readable size.
-        low = bestSize
-        repeat(24) {
+        var best = buildArabicLayout(value, width, lower)
+        var bestFits = best.height <= height && (0 until best.lineCount).all { best.getLineWidth(it) <= width + 1f }
+        repeat(14) {
             val middle = (low + high) / 2f
-            val candidate = buildArabicLayout(value, safeWidth, middle)
-            if (fits(candidate)) { best = candidate; bestSize = middle; low = middle } else high = middle
+            val candidate = buildArabicLayout(value, width, middle)
+            val fits = candidate.height <= height && (0 until candidate.lineCount).all {
+                candidate.getLineWidth(it) <= width + 1f
+            }
+            if (fits) { best = candidate; bestFits = true; low = middle } else high = middle
         }
+        // Keep the complete text at the minimum readable size if exceptionally long copy
+        // cannot fully fit; the caller clips to the speech region rather than spilling outside.
+        if (!bestFits) return buildArabicLayout(value, width, lower)
         return best
     }
 
@@ -4746,7 +4810,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             } else if (percent < 0) {
                 "Manga Fox: حدث خطأ أثناء الترجمة"
             } else {
-                "Manga Fox Translator. اضغط لترجمة الجزء، واضغط مطولاً لترجمة الفصل"
+                "Manga Fox Translator. اضغط لفتح خيارات الترجمة واسحب لتحريك العدسة"
             }
             val params = bubbleParams
             if (bubbleWasAdded && params != null) runCatching { windowManager.updateViewLayout(view, params) }
@@ -4759,7 +4823,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                 text = prefs.getString(PREF_LENS_GLYPH, "狐") ?: "狐"
                 textSize = (prefs.getInt(PREF_LENS_SIZE, 58) * 0.40f).coerceIn(18f, 38f)
-                contentDescription = "Manga Fox Translator. اضغط لترجمة الجزء، واضغط مطولاً لترجمة الفصل"
+                contentDescription = "Manga Fox Translator. اضغط لفتح خيارات الترجمة واسحب لتحريك العدسة"
             }
         }
     }
@@ -4799,6 +4863,142 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         showFloatingBubble()
     }
 
+    /** Opens the action menu. A lens tap must never start capture directly. */
+    private fun showFloatingOptions() {
+        if (!this::windowManager.isInitialized) return
+        if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+            toast("اسمح لـ Manga FOX بالظهور فوق التطبيقات لفتح قائمة العدسة")
+            return
+        }
+        removeFloatingOptions()
+
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(24, 24, 31))
+                cornerRadius = dp(20).toFloat()
+                setStroke(dp(1), Color.rgb(190, 145, 65))
+            }
+            elevation = dp(18).toFloat()
+        }
+        panel.addView(TextView(this).apply {
+            text = "MANGA FOX  ·  خيارات العدسة"
+            textSize = 17f
+            typeface = Typeface.create("sans-serif-black", Typeface.BOLD)
+            setTextColor(Color.rgb(255, 198, 92))
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, dp(4))
+        }, LinearLayout.LayoutParams(-1, -2))
+        panel.addView(TextView(this).apply {
+            text = "اختر العملية التي تريد تنفيذها"
+            textSize = 12f
+            setTextColor(Color.LTGRAY)
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, dp(10))
+        }, LinearLayout.LayoutParams(-1, -2))
+
+        fun addAction(title: String, detail: String, accent: Boolean = false, action: () -> Unit) {
+            val item = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(13), dp(9), dp(13), dp(9))
+                background = GradientDrawable().apply {
+                    setColor(if (accent) Color.rgb(76, 57, 29) else Color.rgb(37, 37, 47))
+                    cornerRadius = dp(12).toFloat()
+                    setStroke(dp(1), if (accent) Color.rgb(210, 164, 77) else Color.rgb(65, 65, 78))
+                }
+                isClickable = true
+                isFocusable = true
+                setOnClickListener {
+                    removeFloatingOptions()
+                    action()
+                }
+            }
+            item.addView(TextView(this).apply {
+                text = title
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.WHITE)
+            }, LinearLayout.LayoutParams(-1, -2))
+            item.addView(TextView(this).apply {
+                text = detail
+                textSize = 11f
+                setTextColor(Color.LTGRAY)
+            }, LinearLayout.LayoutParams(-1, -2))
+            panel.addView(item, LinearLayout.LayoutParams(-1, -2).apply {
+                bottomMargin = dp(7)
+            })
+        }
+
+        addAction("ترجمة الشاشة الحالية", "التقاط الشاشة الظاهرة ثم تحليل النصوص وترجمتها", true) {
+            startSingleCapture(500L)
+        }
+        addAction("ترجمة الفصل العمودي كاملاً", "تمرير الفصل والتقاط صفحاته ثم ترجمتها بأعلى جودة متاحة") {
+            startFullChapterCapture(800L)
+        }
+        addAction("التقاط الفصل دون ترجمة", "حفظ صور الفصل الأصلية لتصديرها أو معالجتها لاحقاً") {
+            startFullChapterCaptureOnly(800L)
+        }
+        addAction("إيقاف الالتقاط الحالي", "إيقاف الالتقاط والاحتفاظ بالمقاطع التي جُمعت") {
+            stopCaptureByUser()
+        }
+        addAction("عرض آخر نتيجة مترجمة", "فتح الصور والطبقات والترجمة المحفوظة") {
+            runCatching {
+                startActivity(Intent(this, MainActivity::class.java).apply {
+                    action = ACTION_SHOW_RESULTS
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                })
+            }.onFailure { toast("تعذر فتح آخر نتيجة: ${it.localizedMessage ?: "خطأ"}") }
+        }
+
+        val close = TextView(this).apply {
+            text = "إغلاق"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.rgb(255, 198, 92))
+            gravity = Gravity.CENTER
+            setPadding(0, dp(7), 0, dp(2))
+            setOnClickListener { removeFloatingOptions() }
+        }
+        panel.addView(close, LinearLayout.LayoutParams(-1, -2))
+
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            isVerticalScrollBarEnabled = false
+            addView(panel, android.widget.FrameLayout.LayoutParams(-1, -2))
+        }
+        val params = WindowManager.LayoutParams(
+            min(dp(330), (resources.displayMetrics.widthPixels * 0.90f).toInt()),
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.CENTER
+            dimAmount = 0f
+        }
+        floatingOptionsView = scroll
+        floatingOptionsParams = params
+        runCatching { windowManager.addView(scroll, params) }
+            .onFailure {
+                floatingOptionsView = null
+                floatingOptionsParams = null
+                toast("تعذر فتح قائمة العدسة. تحقق من إذن الظهور فوق التطبيقات")
+            }
+    }
+
+    private fun removeFloatingOptions() {
+        val view = floatingOptionsView
+        if (view != null && this::windowManager.isInitialized) {
+            runCatching { windowManager.removeView(view) }
+        }
+        floatingOptionsView = null
+        floatingOptionsParams = null
+    }
+
     private fun showFloatingBubble() {
         if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) return
         if (bubbleWasAdded || !this::windowManager.isInitialized) return
@@ -4814,7 +5014,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             background = lensBackground(lensPrefs.getInt(PREF_LENS_COLOR, Color.rgb(255, 190, 65)))
             elevation = dp(8).toFloat()
             alpha = lensAlpha
-            contentDescription = "Manga Fox Translator. اضغط لترجمة الجزء، واضغط مطولاً لترجمة الفصل"
+            contentDescription = "Manga Fox Translator. اضغط لفتح خيارات الترجمة واسحب لتحريك العدسة"
         }
         val params = WindowManager.LayoutParams(
             dp(lensSize), dp(lensSize),
@@ -4856,8 +5056,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     if (moved) {
                         lensPrefs.edit().putInt("lens_x", params.x).putInt("lens_y", params.y).apply()
                     } else {
-                        if (event.eventTime - event.downTime > 550L) startFullChapterCapture()
-                        else startSingleCapture()
+                        // A tap only opens the menu. Capture begins exclusively after
+                        // the user selects one of the menu actions.
+                        showFloatingOptions()
                     }
                     true
                 }
@@ -4886,6 +5087,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     private fun removeFloatingBubble() {
+        removeFloatingOptions()
         val view = bubble
         if (view != null && bubbleWasAdded) runCatching { windowManager.removeView(view) }
         // Drop the detached View reference. Keeping it made the re-enable path
