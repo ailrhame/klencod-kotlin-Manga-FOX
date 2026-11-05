@@ -908,8 +908,7 @@ class MainActivity : android.app.Activity() {
                 val changed = if (which == 0) history.undo(pageIndex, file) else history.redo(pageIndex, file)
                 if (changed) {
                     MangaFoxRuntime.persist(this)
-                    MangaFoxAccessibilityService.instance?.rerenderLastResultsFromLayers { showResults() }
-                        ?: run { toast("تمت استعادة ملف الطبقات؛ افتح خدمة Manga FOX لإعادة الرسم") }
+                                  toast("تم التراجع/الإعادة. اضغط «تطبيق الخط والملاءمة الجديدة» عند الانتهاء")
                 } else toast(if (which == 0) "لا توجد خطوة سابقة للتراجع" else "لا توجد خطوة لإعادتها")
             }.setNegativeButton("إغلاق", null).show()
     }
@@ -2200,7 +2199,7 @@ class MainActivity : android.app.Activity() {
         return file to array
     }
 
-    private fun saveLayerChanges(file: File, layers: org.json.JSONArray, refresh: Boolean = true) {
+    private fun saveLayerChanges(file: File, layers: org.json.JSONArray, refresh: Boolean = false) {
         runCatching {
             val historyPageIndex = MangaFoxRuntime.translationLayerFiles.indexOf(file.absolutePath)
             if (historyPageIndex >= 0) MangaFoxLayerHistory(this).push(historyPageIndex, file)
@@ -2212,13 +2211,14 @@ class MainActivity : android.app.Activity() {
             }
             MangaFoxRuntime.persist(this)
         }.onSuccess {
-            if (refresh) {
-                val service = MangaFoxAccessibilityService.instance
-                if (service == null) toast("تم حفظ الطبقة. افتح الخدمة لإعادة رسم الصورة")
-                else service.rerenderLastResultsFromLayers { showResults() }
-            }
-        }.onFailure { toast("تعذر حفظ الطبقة: ${it.localizedMessage ?: "خطأ في الملف"}") }
-    }
+        if (refresh) {
+            val service = MangaFoxAccessibilityService.instance
+            if (service == null) toast("تم حفظ الطبقة. افتح الخدمة لإعادة رسم الصورة")
+            else service.rerenderLastResultsFromLayers { showResults() }
+        } else {
+            toast("تم حفظ التعديل. اضغط «تطبيق الخط والملاءمة الجديدة» عند الانتهاء")
+        }
+    }.onFailure { toast("تعذر حفظ الطبقة: ${it.localizedMessage ?: "خطأ في الملف"}") }
 
     private fun editTranslationLayer(pageIndex: Int) {
         val pair = readLayerArray(pageIndex)
