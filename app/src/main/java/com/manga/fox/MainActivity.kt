@@ -410,6 +410,13 @@ class MainActivity : android.app.Activity() {
                 window.decorView.postDelayed({ moveTaskToBack(true) }, 120L)
             }
         }, matchWrap(dp(5)))
+        actions.addView(actionButton("التقاط الفصل دون ترجمة · PDF", false) {
+            val service = MangaFoxAccessibilityService.instance
+            if (service == null) toast("فعّل خدمة Manga Fox أولاً، ثم افتح فصل المانجا") else {
+                service.startFullChapterCaptureOnly(1300L)
+                window.decorView.postDelayed({ moveTaskToBack(true) }, 120L)
+            }
+        }, matchWrap(dp(5)))
         actions.addView(actionButton("إيقاف الالتقاط الحالي", false) {
             MangaFoxAccessibilityService.instance?.let { it.stopCaptureByUser() } ?: toast("خدمة Manga Fox غير متصلة")
         }, matchWrap(dp(5)))
@@ -1205,6 +1212,10 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun exportResultsAsPdf() {
+        if (MangaFoxRuntime.captureOnlyResult) {
+            exportResultsAsPdfAfterAudit()
+            return
+        }
         val audit = MangaFoxQualityGuard.inspect(MangaFoxRuntime.resultPages, MangaFoxRuntime.translationLayerFiles)
         if (audit.errorCount > 0 || audit.warningCount > 0) {
             AlertDialog.Builder(this)
@@ -2113,6 +2124,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     @Volatile private var hostActivityResumed: Boolean = false
     private var captureRunning = false
     private var fullChapterMode = false
+    private var captureOnlyMode = false
     private var captureCount = 0
     private var unchangedFrameCount = 0
     private var screenshotRetryCount = 0
@@ -2299,6 +2311,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
         captureRunning = true
         fullChapterMode = true
+        captureOnlyMode = false
         captureCount = 0
         unchangedFrameCount = 0
         screenshotRetryCount = 0
@@ -2308,6 +2321,37 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         capturedSegments.forEach { runCatching { it.delete() } }
         capturedSegments.clear()
         MangaFoxRuntime.status = "بدء التقاط الفصل العمودي..."
+        removeFloatingBubble()
+        notifyCaptureProgress()
+        mainHandler.postDelayed({ captureNextFrame() }, startDelayMs.coerceIn(250L, 5000L))
+    }
+
+    fun startFullChapterCaptureOnly(startDelayMs: Long = 450L) {
+        if (captureRunning || translationRunning) {
+            toast("هناك عملية ترجمة أو التقاط قيد التنفيذ")
+            return
+        }
+        if (pendingCaptureFiles().isNotEmpty()) {
+            recoverInterruptedCapture()
+            toast("توجد مقاطع محفوظة من جلسة سابقة؛ تتم استعادتها أولاً")
+            return
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            toast("التقاط الفصل الكامل يحتاج Android 11 أو أحدث")
+            return
+        }
+        captureRunning = true
+        fullChapterMode = true
+        captureOnlyMode = true
+        captureCount = 0
+        unchangedFrameCount = 0
+        screenshotRetryCount = 0
+        gestureFailureCount = 0
+        previousFrame?.recycle()
+        previousFrame = null
+        capturedSegments.forEach { runCatching { it.delete() } }
+        capturedSegments.clear()
+        MangaFoxRuntime.status = "بدء التقاط الفصل دون ترجمة..."
         removeFloatingBubble()
         notifyCaptureProgress()
         mainHandler.postDelayed({ captureNextFrame() }, startDelayMs.coerceIn(250L, 5000L))
@@ -2629,7 +2673,43 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
         val workPages = ArrayList(capturedSegments)
         capturedSegments.clear()
-        translateSavedSegments(workPages, note, if (workPages.size > 1) "الفصل العمودي" else "الصفحة الحالية")
+        if (captureOnlyMode) {
+            captureOnlyMode = false
+            worker.execute {
+                try {
+                    val saved = workPages.mapIndexed { index, source ->
+                        val target = File(filesDir, "mfox_result_capture_${System.currentTimeMillis()}_$index.jpg")
+                        if (!source.renameTo(target)) source.copyTo(target, overwrite = true)
+                        source.delete()
+                        target.absolutePath
+                    }
+                    runOnUiThread {
+                        MangaFoxRuntime.sourcePages = saved
+                        MangaFoxRuntime.resultPages = saved
+                        MangaFoxRuntime.translationLayerFiles = saved.map { "" }
+                        MangaFoxRuntime.resultTitle = "فصل ملتقط دون ترجمة"
+                        MangaFoxRuntime.captureOnlyResult = true
+                        MangaFoxRuntime.qualitySummary = "صور أصلية دون OCR أو ترجمة"
+                        MangaFoxRuntime.progressPercent = 100
+                        MangaFoxRuntime.progressDetail = "اكتمل الالتقاط: ${saved.size} صورة"
+                        MangaFoxRuntime.status = "تم التقاط الفصل دون ترجمة؛ يمكنك تصديره PDF"
+                        MangaFoxRuntime.persist(this)
+                        toast("اكتمل التقاط ${saved.size} صورة دون ترجمة")
+                        val host = applicationContext
+                        // Open the result screen through the existing activity action.
+                        startActivity(Intent(host, MainActivity::class.java).apply {
+                            action = ACTION_SHOW_RESULTS
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                        })
+                    }
+                } catch (e: Exception) {
+                    workPages.forEach { runCatching { it.delete() } }
+                    runOnUiThread { finishCaptureWithError("تعذر تجهيز الصور: ${e.localizedMessage ?: "خطأ"}") }
+                }
+            }
+        } else {
+            translateSavedSegments(workPages, note, if (workPages.size > 1) "الفصل العمودي" else "الصفحة الحالية")
+        }
     }
 
     private fun pendingCaptureFiles(): List<File> {
@@ -5450,6 +5530,7 @@ object MangaFoxRuntime {
                 .put("sources", org.json.JSONArray(sourcePages))
                 .put("results", org.json.JSONArray(resultPages))
                 .put("layers", org.json.JSONArray(translationLayerFiles))
+                .put("captureOnly", captureOnlyResult)
             val target = File(context.filesDir, SESSION_MANIFEST)
             val temp = File(context.filesDir, "$SESSION_MANIFEST.tmp")
             temp.writeText(root.toString(), Charsets.UTF_8)
@@ -5499,6 +5580,7 @@ object MangaFoxRuntime {
             translationLayerFiles = (0 until count).map { layers.getOrNull(it).orEmpty() }
             resultTitle = root.optString("title", "الفصل المترجم")
             qualitySummary = root.optString("quality", qualitySummary)
+            captureOnlyResult = root.optBoolean("captureOnly", false)
             if (resultPages.none { File(it).isFile }) {
                 sourcePages = emptyList()
                 resultPages = emptyList()
@@ -5534,4 +5616,5 @@ object MangaFoxRuntime {
     @Volatile var failedBlockSamples: List<String> = emptyList()
     // Per-page OCR/translation layers are stored separately from the rendered JPG.
     @Volatile var translationLayerFiles: List<String> = emptyList()
+    @Volatile var captureOnlyResult: Boolean = false
 }
