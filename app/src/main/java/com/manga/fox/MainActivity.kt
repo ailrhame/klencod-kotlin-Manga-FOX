@@ -5054,8 +5054,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 canvas.clipRect(layoutRect)
                 val fillColor = estimateBubbleFillColor(source, layoutRect, item.bounds)
                 val textColor = item.textColor ?: readableTextColor(fillColor)
-                val outlineColor = item.outlineColor ?: Color.BLACK
-                val outlineWidth = (item.outlineWidthDp ?: 2).coerceIn(0, 8) * resources.displayMetrics.density
+                val outlineColor = Color.BLACK
+val outlineWidth = 0f
                 drawArabicText(canvas, item.translated, layoutRect, item.vertical, textColor, outlineColor, outlineWidth, item.fontScale)
                 canvas.restore()
             }
