@@ -1,0 +1,96 @@
+
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Black background -->
+    <path
+        android:fillColor="#111111"
+        android:pathData="M0,0 H108 V108 H0 Z"/>
+
+    <!-- Fox mask outer shape -->
+    <path
+        android:fillColor="#F57C00"
+        android:pathData="
+            M12,18
+            L38,27
+            L54,19
+            L70,27
+            L96,18
+            L91,54
+            Q86,79 54,94
+            Q22,79 17,54
+            Z"/>
+
+    <!-- Upper dark mask details -->
+    <path
+        android:fillColor="#171717"
+        android:pathData="
+            M12,18
+            L38,27
+            L48,43
+            L25,50
+            Z
+            M96,18
+            L70,27
+            L60,43
+            L83,50
+            Z"/>
+
+    <!-- Eyes -->
+    <path
+        android:fillColor="#FFF3E0"
+        android:pathData="
+            M23,48
+            L48,43
+            L39,59
+            Z
+            M85,48
+            L60,43
+            L69,59
+            Z"/>
+
+    <!-- Eye pupils -->
+    <path
+        android:fillColor="#171717"
+        android:pathData="
+            M34,49 L43,47 L39,55 Z
+            M74,49 L65,47 L69,55 Z"/>
+
+    <!-- Nose -->
+    <path
+        android:fillColor="#171717"
+        android:pathData="
+            M48,66
+            L60,66
+            L54,73
+            Z"/>
+
+    <!-- Lower mask -->
+    <path
+        android:fillColor="#FFF3E0"
+        android:pathData="
+            M25,67
+            L47,72
+            L54,88
+            L33,77
+            Z
+            M83,67
+            L61,72
+            L54,88
+            L75,77
+            Z"/>
+
+    <!-- Center details -->
+    <path
+        android:fillColor="#171717"
+        android:pathData="
+            M48,74
+            L54,80
+            L60,74
+            L54,91
+            Z"/>
+
+</vector>
