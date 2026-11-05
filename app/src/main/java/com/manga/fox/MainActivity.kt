@@ -4611,26 +4611,53 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         canvas.restore()
     }
 
-    /** Binary-searches the largest type size whose shaped RTL layout fits both dimensions. */
+    /**
+     * Finds the largest Arabic text layout that fits the actual bubble bounds.
+     * The configured font size is a ceiling, never a forced drawing size.
+     */
     private fun findLargestArabicLayout(
         value: String, width: Int, height: Int, maxSizePx: Float, minSizePx: Float
     ): android.text.StaticLayout {
-        val lower = min(minSizePx, maxSizePx).coerceAtLeast(5f)
+        val safeWidth = width.coerceAtLeast(8)
+        val safeHeight = height.coerceAtLeast(8)
+        val lower = min(minSizePx, maxSizePx).coerceAtLeast(3.5f)
         var low = lower
         var high = maxSizePx.coerceAtLeast(lower)
-        var best = buildArabicLayout(value, width, lower)
-        var bestFits = best.height <= height && (0 until best.lineCount).all { best.getLineWidth(it) <= width + 1f }
-        repeat(14) {
-            val middle = (low + high) / 2f
-            val candidate = buildArabicLayout(value, width, middle)
-            val fits = candidate.height <= height && (0 until candidate.lineCount).all {
-                candidate.getLineWidth(it) <= width + 1f
+
+        fun fits(layout: android.text.StaticLayout): Boolean {
+            if (layout.height > safeHeight) return false
+            for (line in 0 until layout.lineCount) {
+                // Check the shaped line bounds, not only its advance width. This is
+                // important for Arabic glyph overhang and custom typefaces.
+                if (layout.getLineLeft(line) < -1f || layout.getLineRight(line) > safeWidth + 1f) return false
             }
-            if (fits) { best = candidate; bestFits = true; low = middle } else high = middle
+            return true
         }
-        // Keep the complete text at the minimum readable size if exceptionally long copy
-        // cannot fully fit; the caller clips to the speech region rather than spilling outside.
-        if (!bestFits) return buildArabicLayout(value, width, lower)
+
+        var best = buildArabicLayout(value, safeWidth, lower)
+        var bestSize = lower
+        var foundFit = fits(best)
+        if (!foundFit) {
+            // Long translated sentences may need to go below the old 7.5sp floor.
+            // Search downward in small steps before accepting a clipped layout.
+            var size = lower
+            repeat(18) {
+                if (foundFit) return@repeat
+                size = (size - 0.35f).coerceAtLeast(2.5f)
+                val candidate = buildArabicLayout(value, safeWidth, size)
+                if (fits(candidate)) { best = candidate; bestSize = size; foundFit = true }
+                if (size <= 2.5f) return@repeat
+            }
+        }
+
+        if (!foundFit) return best
+        // Binary search the remaining interval for the largest readable size.
+        low = bestSize
+        repeat(24) {
+            val middle = (low + high) / 2f
+            val candidate = buildArabicLayout(value, safeWidth, middle)
+            if (fits(candidate)) { best = candidate; bestSize = middle; low = middle } else high = middle
+        }
         return best
     }
 
