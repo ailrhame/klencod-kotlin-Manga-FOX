@@ -1774,8 +1774,7 @@ class MainActivity : android.app.Activity() {
             ?.takeIf { it.isNotBlank() }?.let { path -> File(path) }?.takeIf { it.isFile }
         if (current != null) return current
         val created = File(filesDir, "mfox_layers_editor_${System.currentTimeMillis()}_$pageIndex.json")
-        val marker = org.json.JSONArray().put(org.json.JSONObject().put("_mfoxKeepFlattenedBase", true))
-        runCatching { created.writeText(marker.toString(), Charsets.UTF_8) }.getOrElse { return null }
+        runCatching { created.writeText(org.json.JSONArray().toString(), Charsets.UTF_8) }.getOrElse { return null }
         val updated = MangaFoxRuntime.translationLayerFiles.toMutableList()
         while (updated.size < MangaFoxRuntime.resultPages.size) updated.add("")
         updated[pageIndex] = created.absolutePath
@@ -1818,7 +1817,8 @@ class MainActivity : android.app.Activity() {
         }
         val (file, layers) = pair
         val visibleIndexes = (0 until layers.length()).filter { index ->
-            layers.optJSONObject(index)?.optBoolean("_mfoxKeepFlattenedBase", false) != true
+            val item = layers.optJSONObject(index)
+            item != null && item.has("left") && item.has("top")
         }
         val labels = visibleIndexes.map { index ->
             val item = layers.optJSONObject(index)
@@ -2696,7 +2696,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 val saved = if (layerFile.isFile) {
                     org.json.JSONArray(layerFile.readText(Charsets.UTF_8))
                 } else {
-                    org.json.JSONArray().put(org.json.JSONObject().put("_mfoxKeepFlattenedBase", true))
+                    org.json.JSONArray()
                 }
                 val refreshed = ArrayList<org.json.JSONObject>()
                 for (i in 0 until saved.length()) {
@@ -2794,10 +2794,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             val existing: File? = layers.getOrNull(index)
             val usable = existing?.takeIf { it.isFile }
                 ?: File(filesDir, "mfox_layers_recovered_${System.currentTimeMillis()}_$index.json").apply {
-                    val marker = org.json.JSONArray().put(
-                        org.json.JSONObject().put("_mfoxKeepFlattenedBase", true)
-                    )
-                    writeText(marker.toString(), Charsets.UTF_8)
+                    writeText(org.json.JSONArray().toString(), Charsets.UTF_8)
                 }
             normalizedLayers.add(usable.absolutePath)
         }
@@ -2814,13 +2811,15 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     var rendered: Bitmap? = null
                     try {
                         val json = org.json.JSONArray(File(normalizedLayers[index]).readText(Charsets.UTF_8))
-                        val keepFlattenedBase = json.length() == 0 || json.optJSONObject(0)?.optBoolean("_mfoxKeepFlattenedBase", false) == true
-                        val basePath = if (keepFlattenedBase) targets[index].absolutePath else sources[index].absolutePath
+                        // Never use a previously rendered result as the next render base.
+                        // This prevents translated glyphs from accumulating after edits/font changes.
+                        val basePath = sources[index].absolutePath
                         original = BitmapFactory.decodeFile(basePath)
                             ?: throw IllegalStateException("تعذر قراءة الصورة الأساسية ${index + 1}")
                         val records = ArrayList<TranslationLine>(json.length())
                         for (recordIndex in 0 until json.length()) {
                             val item = json.optJSONObject(recordIndex) ?: continue
+                            if (!item.has("left") || !item.has("top") || !item.has("right") || !item.has("bottom")) continue
                             val rect = Rect(
                                 item.optInt("left"), item.optInt("top"),
                                 item.optInt("right"), item.optInt("bottom")
@@ -3558,6 +3557,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 region.contains(box.left, box.top, box.right, box.bottom) &&
                     !giantMarginComponent &&
                     regionArea <= pageArea * 6L / 100L &&
+                    regionArea <= box.width().toLong() * box.height().toLong() * 6L &&
                     region.width() <= box.width() * 4f &&
                     region.height() <= box.height() * 4f &&
                     region.width() >= box.width() * 1.22f &&
@@ -3703,6 +3703,14 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
         flush()
         return output.toString()
+    }
+
+    private fun softenAllCaps(value: String): String {
+        val letters = value.filter { it in 'A'..'Z' || it in 'a'..'z' }
+        if (letters.length < 4 || letters.count { it.isUpperCase() } < letters.length * 0.8) return value
+        return value.lowercase()
+            .replace(Regex("\\bi\\b"), "I")
+            .replace(Regex("(^|[.!?]\\s+)([a-z])")) { it.groupValues[1] + it.groupValues[2].uppercase() }
     }
 
     private fun correctLikelyOcrText(value: String, language: String): String {
@@ -4041,11 +4049,14 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         val blocks = ArrayList<BlockForTranslation>()
         val failedSamples = ArrayList<String>()
         var skippedCount = 0
-        // v3.0.6: geometric balloon clustering. The old container-key grouping never fired
-        // for multi-line balloons because attachSingleBlockBubbleContainers deliberately
-        // nulls shared containers. Cluster by nested boxes or strong horizontal overlap with
-        // a small vertical gap, then translate each cluster as ONE coherent dialogue.
+        // Balloon-aware paragraph clustering. Explicitly different bubble IDs are never merged.
+        // Bright-region detection is computed once and reused for the center-in-same-bubble rule.
         val candList = candidatesAfterMissed
+        val brightRegionsForJoin = detectBrightBubbleRegions(source)
+            .filter { region ->
+                val pageArea = source.width.toLong() * source.height.toLong()
+                region.width().toLong() * region.height().toLong() <= pageArea * 6L / 100L
+            }
         val parent = IntArray(candList.size) { it }
         fun findRoot(x: Int): Int {
             var r = x
@@ -4061,23 +4072,47 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             if (right <= left) return 0f
             return (right - left).toFloat() / max(1, min(a.width(), b.width()))
         }
+        fun shareSmallBubble(a: Rect, b: Rect): Boolean = brightRegionsForJoin.any { region ->
+            val area = region.width().toLong() * region.height().toLong()
+            val pageArea = source.width.toLong() * source.height.toLong()
+            area <= pageArea * 6L / 100L &&
+                region.contains(a.centerX(), a.centerY()) && region.contains(b.centerX(), b.centerY())
+        }
         for (i in candList.indices) {
             val a = candList[i].bounds ?: continue
             for (j in i + 1 until candList.size) {
                 val b = candList[j].bounds ?: continue
-                val nested = a.contains(b.centerX(), b.centerY()) || b.contains(a.centerX(), a.centerY())
+                val idA = candList[i].bubbleId
+                val idB = candList[j].bubbleId
+                if (idA != null && idB != null && idA != idB) continue
+                val sameKnownBubble = idA != null && idA == idB
                 val gap = when {
                     b.top >= a.bottom -> b.top - a.bottom
                     a.top >= b.bottom -> a.top - b.bottom
                     else -> 0
                 }
-                val sameBalloon = nested ||
-                    (horizontalOverlap(a, b) >= 0.55f && gap <= 0.45f * max(a.height(), b.height()))
+                val closeLines = horizontalOverlap(a, b) >= 0.55f &&
+                    gap <= 0.45f * max(a.height(), b.height())
+                val sameBalloon = sameKnownBubble || shareSmallBubble(a, b) ||
+                    (idA == null && idB == null && closeLines)
                 if (sameBalloon) join(i, j)
             }
         }
         val clusters = LinkedHashMap<Int, ArrayList<OcrCandidate>>()
         candList.forEachIndexed { i, c -> clusters.getOrPut(findRoot(i)) { ArrayList() }.add(c) }
+        fun isLikelyWatermark(text: String, bounds: Rect): Boolean {
+            val compact = text.trim().replace(Regex("\\s+"), "")
+            val known = setOf("快看", "快看漫画", "KuaiKan", "Kuaikan", "kuaikan", "快看漫画网")
+            if (known.any { compact.equals(it, ignoreCase = true) }) return true
+            val cjkCount = compact.count { it in '\u3040'..'\u30FF' || it in '\u4E00'..'\u9FFF' }
+            val shortCjk = cjkCount in 1..3 && compact.length <= 4
+            if (!shortCjk) return false
+            val nearLeft = bounds.left < source.width * 0.16f
+            val nearRight = bounds.right > source.width * 0.84f
+            val nearTop = bounds.top < source.height * 0.12f
+            val nearBottom = bounds.bottom > source.height * 0.86f
+            return (nearLeft || nearRight) && (nearTop || nearBottom)
+        }
         fun emitBlock(list: List<OcrCandidate>) {
             val withBounds = list.mapNotNull { c -> c.bounds?.let { Rect(it) to c } }
             if (withBounds.isEmpty()) {
@@ -4093,9 +4128,18 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 .joinToString(" ") { it.second.text.trim() }
                 .replace(Regex("\\s+"), " ").trim()
             if (joined.isBlank()) { skippedCount++; return }
+            if (isLikelyWatermark(joined, union)) { skippedCount++; return }
             val code = languageForBlock(joined, withBounds.first().second.engineLanguage, forcedLanguage)
             if (code == "ar") { skippedCount++; return }
-            val container = list.firstNotNullOfOrNull { it.containerBounds }?.let(::Rect)
+            val pageArea = source.width.toLong() * source.height.toLong()
+            val unionArea = union.width().toLong() * union.height().toLong().coerceAtLeast(1L)
+            val container = list.firstNotNullOfOrNull { candidate ->
+                candidate.containerBounds?.let { candidateBox ->
+                    val safe = Rect(candidateBox)
+                    val area = safe.width().toLong() * safe.height().toLong()
+                    if (safe.contains(union) && area <= pageArea * 6L / 100L && area <= unionArea * 6L) safe else null
+                }
+            }
             blocks.add(BlockForTranslation(union, joined, code, container, withBounds.size))
         }
         clusters.values.forEach { emitBlock(it) }
@@ -4111,7 +4155,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         blocks.forEachIndexed { index, item ->
             try {
                 onProgress(0.43f + (0.50f * index / blocks.size), "تجهيز نموذج ${item.language} ثم ترجمة الكتلة ${index + 1}/${blocks.size}")
-                val normalizedSource = correctLikelyOcrText(item.text, item.language)
+                val normalizedSource = softenAllCaps(correctLikelyOcrText(item.text, item.language))
                 val learned = learnedTranslationFor(item.text) ?: learnedTranslationFor(normalizedSource)
                 val sfx = if (getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(PREF_TRANSLATE_SFX, false)) {
                     dictionarySfxTranslation(item.text)
@@ -4224,24 +4268,78 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** Conservative local glyph eraser. It never fills the whole OCR rectangle. */
+    private fun eraseTextPixels(bitmap: Bitmap, area: Rect) {
+        val r = Rect(area)
+        if (!r.intersect(0, 0, bitmap.width, bitmap.height) || r.width() < 5 || r.height() < 5) return
+        val w = r.width(); val h = r.height()
+        val pixels = IntArray(w * h)
+        bitmap.getPixels(pixels, 0, w, r.left, r.top, w, h)
+        val marginX = max(1, w / 18); val marginY = max(1, h / 14)
+        val buckets = HashMap<Int, MutableList<Int>>()
+        for (y in marginY until (h - marginY).coerceAtLeast(marginY + 1) step max(1, h / 28)) {
+            for (x in marginX until (w - marginX).coerceAtLeast(marginX + 1) step max(1, w / 28)) {
+                val c = pixels[y * w + x]
+                val key = ((Color.red(c) shr 4) shl 8) or ((Color.green(c) shr 4) shl 4) or (Color.blue(c) shr 4)
+                buckets.getOrPut(key) { ArrayList() }.add(c)
+            }
+        }
+        val dominant = buckets.values.maxByOrNull { it.size } ?: return
+        if (dominant.size < 4) return
+        val br = dominant.map { Color.red(it) }.sorted()[dominant.size / 2]
+        val bg = dominant.map { Color.green(it) }.sorted()[dominant.size / 2]
+        val bb = dominant.map { Color.blue(it) }.sorted()[dominant.size / 2]
+        val out = pixels.copyOf()
+        // Restrict detection to the central 88% so balloon borders are not touched.
+        val left = max(1, w / 16); val right = min(w - 1, w - left)
+        val top = max(1, h / 14); val bottom = min(h - 1, h - top)
+        for (y in top until bottom) for (x in left until right) {
+            val idx = y * w + x; val c = pixels[idx]
+            val dr = abs(Color.red(c) - br); val dg = abs(Color.green(c) - bg); val db = abs(Color.blue(c) - bb)
+            val distance = dr + dg + db
+            // Only remove near-neutral/dark ink against a stable local dominant fill.
+            val luminance = (Color.red(c) * 30 + Color.green(c) * 59 + Color.blue(c) * 11) / 100
+            val baseLum = (br * 30 + bg * 59 + bb * 11) / 100
+            val likelyInk = distance >= 95 && abs(baseLum - luminance) >= 42
+            if (likelyInk) {
+                // Feather a one-pixel antialias fringe, not a 5x5 rectangle.
+                out[idx] = Color.rgb(br, bg, bb)
+                for (dy in -1..1) for (dx in -1..1) {
+                    if (dx == 0 && dy == 0) continue
+                    val nx = x + dx; val ny = y + dy
+                    if (nx !in left until right || ny !in top until bottom) continue
+                    val ni = ny * w + nx; val n = pixels[ni]
+                    val nd = abs(Color.red(n) - br) + abs(Color.green(n) - bg) + abs(Color.blue(n) - bb)
+                    if (nd in 45..150) out[ni] = Color.rgb(br, bg, bb)
+                }
+            }
+        }
+        bitmap.setPixels(out, 0, w, r.left, r.top, w, h)
+    }
+
     private fun drawTranslatedLines(source: Bitmap, translatedLines: List<TranslationLine>): Bitmap {
         val output = source.copy(Bitmap.Config.ARGB_8888, true)
             ?: throw IllegalStateException("تعذر إنشاء صورة الترجمة")
         val canvas = Canvas(output)
-        val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         val renderItems = translatedLines.mapNotNull { item ->
             val eraseRect = Rect(item.bounds).apply {
-                val padX = max(3, width() / 12)
-                val padY = max(3, height() / 8)
+                val padX = max(2, width() / 16)
+                val padY = max(2, height() / 12)
                 inset(-padX, -padY)
                 left = left.coerceIn(0, output.width)
                 top = top.coerceIn(0, output.height)
                 right = right.coerceIn(0, output.width)
                 bottom = bottom.coerceIn(0, output.height)
             }
-            val layoutRect = (item.containerBounds?.let(::Rect) ?: Rect(eraseRect)).apply {
+            val trustedContainer = item.containerBounds?.let { candidate ->
+                val area = candidate.width().toLong() * candidate.height().toLong()
+                val textArea = item.bounds.width().toLong() * item.bounds.height().toLong().coerceAtLeast(1L)
+                val pageArea = output.width.toLong() * output.height.toLong()
+                Rect(candidate).takeIf { it.contains(item.bounds) && area <= pageArea * 6L / 100L && area <= textArea * 6L }
+            }
+            val layoutRect = (trustedContainer ?: Rect(eraseRect)).apply {
                 // Stay inside the detected balloon outline; OCR text bounds remain the erase area.
-                if (item.containerBounds != null) {
+                if (trustedContainer != null) {
                     inset(max(4, width() / 14), max(4, height() / 14))
                     // HARD CLAMP: typesetting must stay near the OCR text box. Bright-region
                     // detection can return near-page-sized rectangles (white margins connect
@@ -4271,41 +4369,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         // Pass 1: erase every source text region first. This avoids a later bubble's
         // background rectangle overwriting Arabic text drawn for an earlier bubble.
         renderItems.forEach { (item, eraseRect, _) ->
-            val detectedBubble = item.containerBounds?.let { raw ->
-                Rect(raw).apply {
-                    // Keep the original dark outline/tail untouched; repaint only the inner face.
-                    inset(max(2, width() / 13), max(2, height() / 13))
-                    left = left.coerceIn(0, output.width)
-                    top = top.coerceIn(0, output.height)
-                    right = right.coerceIn(0, output.width)
-                    bottom = bottom.coerceIn(0, output.height)
-                }.takeIf { it.width() >= 12 && it.height() >= 12 }
-            }
-            if (detectedBubble != null) {
-                backgroundPaint.color = MangaFoxBubbleRepair.sampleInteriorColor(source, item.containerBounds!!, eraseRect)
-                val bubbleRect = RectF(detectedBubble)
-                val ratio = detectedBubble.width().toFloat() / detectedBubble.height().coerceAtLeast(1)
-                when {
-                    item.shape == "oval" || ratio in 0.82f..1.22f -> canvas.drawOval(bubbleRect, backgroundPaint)
-                    item.shape == "rect" -> canvas.drawRoundRect(bubbleRect, 4f, 4f, backgroundPaint)
-                    else -> {
-                        val radius = min(detectedBubble.width(), detectedBubble.height()) * 0.24f
-                        canvas.drawRoundRect(bubbleRect, radius, radius, backgroundPaint)
-                    }
-                }
-            } else {
-                // Fallback for undetected/complex bubbles: use a tight local patch only.
-                val patch = Rect(eraseRect).apply {
-                    left = left.coerceIn(0, output.width)
-                    top = top.coerceIn(0, output.height)
-                    right = right.coerceIn(0, output.width)
-                    bottom = bottom.coerceIn(0, output.height)
-                }
-                backgroundPaint.color = sampleBubbleColor(source, patch)
-                backgroundPaint.isAntiAlias = false
-                canvas.drawRect(RectF(patch), backgroundPaint)
-                backgroundPaint.isAntiAlias = true
-            }
+            // Never paint a rectangular/oval plate over artwork. Remove only high-contrast
+            // glyph pixels inside the OCR box, preserving balloon outlines and tails.
+            eraseTextPixels(output, eraseRect)
         }
         // Pass 2: draw text only after all backgrounds are ready; clipping keeps
         // long words/layouts from spilling into neighboring bubbles.
@@ -4836,7 +4902,7 @@ object MangaFoxQualityGuard {
             val layerFile = File(layerPath)
             val array = if (layerFile.isFile) runCatching { JSONArray(layerFile.readText(Charsets.UTF_8)) }.getOrNull() else null
             val layers = (0 until (array?.length() ?: 0)).mapNotNull { array?.optJSONObject(it) }
-                .filterNot { it.optBoolean("_mfoxKeepFlattenedBase", false) }
+                .filter { it.has("left") && it.has("top") && it.has("right") && it.has("bottom") }
             var outside = 0
             var overlap = 0
             var untranslated = 0
