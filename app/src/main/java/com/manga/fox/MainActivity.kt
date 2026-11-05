@@ -6280,77 +6280,30 @@ object MangaFoxPerformanceAdvisor {
 class RegionSelectionView(context: Context) : View(context) {
     private val density = resources.displayMetrics.density
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(70, 255, 190, 65)
+        color = Color.argb(70, 0, 220, 110)
         style = Paint.Style.FILL
     }
-    private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(255, 190, 65)
+    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(0, 220, 110)
         style = Paint.Style.STROKE
-        strokeWidth = 3f * density
+        strokeWidth = 4f * density
+        strokeJoin = Paint.Join.ROUND
+        strokeCap = Paint.Cap.ROUND
     }
-    private val handlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
-        style = Paint.Style.FILL
-    }
-    private val handleBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(255, 190, 65)
-        style = Paint.Style.STROKE
-        strokeWidth = 2.5f * density
-    }
-
-    private val touchSlop = 28f * density
-    private val handleRadius = 9f * density
-    private val minSize = 24f * density
-
-    private var selection = RectF()
+    private val path = Path()
+    private val bounds = RectF()
     private var hasSelection = false
-
-    private enum class Mode { NONE, CREATE, MOVE, LEFT, TOP, RIGHT, BOTTOM, TL, TR, BL, BR }
-    private var mode = Mode.NONE
-    private var lastX = 0f
-    private var lastY = 0f
-    private var anchorX = 0f
-    private var anchorY = 0f
+    private var minX = 0f
+    private var minY = 0f
+    private var maxX = 0f
+    private var maxY = 0f
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (!hasSelection) return
-        canvas.drawRect(selection, fillPaint)
-        canvas.drawRect(selection, borderPaint)
-        val cx = selection.centerX()
-        val cy = selection.centerY()
-        val points = listOf(
-            selection.left to selection.top, selection.right to selection.top,
-            selection.left to selection.bottom, selection.right to selection.bottom,
-            cx to selection.top, cx to selection.bottom,
-            selection.left to cy, selection.right to cy
-        )
-        points.forEach { (x, y) ->
-            canvas.drawCircle(x, y, handleRadius, handlePaint)
-            canvas.drawCircle(x, y, handleRadius, handleBorderPaint)
-        }
-    }
-
-    private fun hitTest(x: Float, y: Float): Mode {
-        if (!hasSelection) return Mode.CREATE
-        val nearLeft = abs(x - selection.left) <= touchSlop
-        val nearRight = abs(x - selection.right) <= touchSlop
-        val nearTop = abs(y - selection.top) <= touchSlop
-        val nearBottom = abs(y - selection.bottom) <= touchSlop
-        val withinX = x >= selection.left - touchSlop && x <= selection.right + touchSlop
-        val withinY = y >= selection.top - touchSlop && y <= selection.bottom + touchSlop
-        return when {
-            nearLeft && nearTop -> Mode.TL
-            nearRight && nearTop -> Mode.TR
-            nearLeft && nearBottom -> Mode.BL
-            nearRight && nearBottom -> Mode.BR
-            nearLeft && withinY -> Mode.LEFT
-            nearRight && withinY -> Mode.RIGHT
-            nearTop && withinX -> Mode.TOP
-            nearBottom && withinX -> Mode.BOTTOM
-            selection.contains(x, y) -> Mode.MOVE
-            else -> Mode.CREATE
-        }
+        val closed = Path(path).apply { close() }
+        canvas.drawPath(closed, fillPaint)
+        canvas.drawPath(path, strokePaint)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -6359,64 +6312,29 @@ class RegionSelectionView(context: Context) : View(context) {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 parent?.requestDisallowInterceptTouchEvent(true)
-                mode = hitTest(x, y)
-                lastX = x
-                lastY = y
-                if (mode == Mode.CREATE) {
-                    anchorX = x
-                    anchorY = y
-                    selection.set(x, y, x, y)
-                    hasSelection = true
-                }
+                path.reset()
+                path.moveTo(x, y)
+                minX = x; maxX = x; minY = y; maxY = y
+                hasSelection = true
                 invalidate()
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                val dx = x - lastX
-                val dy = y - lastY
-                when (mode) {
-                    Mode.CREATE -> selection.set(
-                        min(anchorX, x), min(anchorY, y), max(anchorX, x), max(anchorY, y)
-                    )
-                    Mode.MOVE -> {
-                        var mx = dx
-                        var my = dy
-                        if (selection.left + mx < 0f) mx = -selection.left
-                        if (selection.right + mx > width) mx = width - selection.right
-                        if (selection.top + my < 0f) my = -selection.top
-                        if (selection.bottom + my > height) my = height - selection.bottom
-                        selection.offset(mx, my)
-                    }
-                    Mode.LEFT -> selection.left = x.coerceAtMost(selection.right - minSize)
-                    Mode.RIGHT -> selection.right = x.coerceAtLeast(selection.left + minSize)
-                    Mode.TOP -> selection.top = y.coerceAtMost(selection.bottom - minSize)
-                    Mode.BOTTOM -> selection.bottom = y.coerceAtLeast(selection.top + minSize)
-                    Mode.TL -> {
-                        selection.left = x.coerceAtMost(selection.right - minSize)
-                        selection.top = y.coerceAtMost(selection.bottom - minSize)
-                    }
-                    Mode.TR -> {
-                        selection.right = x.coerceAtLeast(selection.left + minSize)
-                        selection.top = y.coerceAtMost(selection.bottom - minSize)
-                    }
-                    Mode.BL -> {
-                        selection.left = x.coerceAtMost(selection.right - minSize)
-                        selection.bottom = y.coerceAtLeast(selection.top + minSize)
-                    }
-                    Mode.BR -> {
-                        selection.right = x.coerceAtLeast(selection.left + minSize)
-                        selection.bottom = y.coerceAtLeast(selection.top + minSize)
-                    }
-                    Mode.NONE -> Unit
-                }
-                lastX = x
-                lastY = y
+                path.lineTo(x, y)
+                if (x < minX) minX = x
+                if (x > maxX) maxX = x
+                if (y < minY) minY = y
+                if (y > maxY) maxY = y
                 invalidate()
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 parent?.requestDisallowInterceptTouchEvent(false)
-                mode = Mode.NONE
+                path.lineTo(x, y)
+                if (x < minX) minX = x
+                if (x > maxX) maxX = x
+                if (y < minY) minY = y
+                if (y > maxY) maxY = y
                 invalidate()
                 return true
             }
@@ -6426,11 +6344,12 @@ class RegionSelectionView(context: Context) : View(context) {
 
     fun toSourceRect(sourceWidth: Int, sourceHeight: Int): Rect? {
         if (!hasSelection || width <= 0 || height <= 0) return null
+        bounds.set(minX, minY, maxX, maxY)
         val rect = Rect(
-            (selection.left / width * sourceWidth).roundToInt().coerceIn(0, sourceWidth - 1),
-            (selection.top / height * sourceHeight).roundToInt().coerceIn(0, sourceHeight - 1),
-            (selection.right / width * sourceWidth).roundToInt().coerceIn(1, sourceWidth),
-            (selection.bottom / height * sourceHeight).roundToInt().coerceIn(1, sourceHeight)
+            (bounds.left / width * sourceWidth).roundToInt().coerceIn(0, sourceWidth - 1),
+            (bounds.top / height * sourceHeight).roundToInt().coerceIn(0, sourceHeight - 1),
+            (bounds.right / width * sourceWidth).roundToInt().coerceIn(1, sourceWidth),
+            (bounds.bottom / height * sourceHeight).roundToInt().coerceIn(1, sourceHeight)
         )
         return rect.takeIf { it.width() > 0 && it.height() > 0 }
     }
