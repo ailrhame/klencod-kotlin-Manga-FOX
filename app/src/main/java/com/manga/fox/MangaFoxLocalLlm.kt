@@ -1,6 +1,7 @@
 package com.manga.fox
 
 import android.content.Context
+import android.app.ActivityManager
 import android.os.StatFs
 import org.json.JSONArray
 import org.json.JSONObject
@@ -19,6 +20,7 @@ object MangaFoxLocalLlm {
     @Volatile private var loadedPath: String? = null
     @Volatile private var nativeLibraryReady = false
     @Volatile private var nativeLibraryError: String? = null
+    @Volatile private var lastLoadFailure: String = "لم تبدأ محاولة تحميل النموذج بعد"
 
     // Load the optional native engine only when the user explicitly loads Qwen.
     // Opening Settings must never crash just because the .so is absent or incompatible.
@@ -40,6 +42,9 @@ object MangaFoxLocalLlm {
     private external fun nativeLoadModel(path: String, threads: Int, contextSize: Int): Boolean
     private external fun nativeGenerate(prompt: String, maxTokens: Int): String
     private external fun nativeRelease()
+    private external fun nativeLastError(): String
+
+    fun lastLoadError(): String = lastLoadFailure
 
     fun modelFile(context: Context) = File(context.filesDir, "ai_models/$MODEL_FILE")
     fun isModelDownloaded(context: Context) = modelFile(context).let { it.isFile && it.length() > 900_000_000L }
@@ -92,14 +97,43 @@ object MangaFoxLocalLlm {
 
     @Synchronized fun load(context: Context): Boolean {
         val file = modelFile(context)
-        if (!file.isFile || file.length() < 900_000_000L) return false
-        if (loadedPath == file.absolutePath) return true
-        if (!ensureNativeLibrary()) return false
-        if (nativeLibraryReady) nativeRelease()
-        val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
-        val ok = nativeLoadModel(file.absolutePath, threads, 4096)
-        loadedPath = if (ok) file.absolutePath else null
-        return ok
+        if (!file.isFile) {
+            lastLoadFailure = "ملف النموذج غير موجود في: ${file.absolutePath}"
+            return false
+        }
+        if (file.length() < 900_000_000L) {
+            lastLoadFailure = "حجم ملف النموذج غير مكتمل: ${file.length()} bytes"
+            return false
+        }
+        if (loadedPath == file.absolutePath) {
+            lastLoadFailure = "النموذج محمّل مسبقاً"
+            return true
+        }
+        if (!ensureNativeLibrary()) {
+            lastLoadFailure = "تعذر تحميل مكتبة mangallm: ${nativeLibraryError ?: "سبب غير معروف"}"
+            return false
+        }
+        return try {
+            if (nativeLibraryReady) nativeRelease()
+            val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+            // A 2K context substantially lowers KV-cache allocation on mid-range phones.
+            val ok = nativeLoadModel(file.absolutePath, threads, 2048)
+            if (ok) {
+                loadedPath = file.absolutePath
+                lastLoadFailure = "تم تحميل Qwen بنجاح"
+                true
+            } else {
+                loadedPath = null
+                lastLoadFailure = runCatching { nativeLastError() }.getOrNull()
+                    ?.takeIf { it.isNotBlank() }
+                    ?: "رفض محرك llama.cpp تحميل النموذج؛ افحص سجل MangaFoxLLM في Logcat"
+                false
+            }
+        } catch (error: Throwable) {
+            loadedPath = null
+            lastLoadFailure = "${error.javaClass.simpleName}: ${error.message ?: "فشل غير معروف أثناء تحميل النموذج"}"
+            false
+        }
     }
 
     data class Bubble(val id: Int, val language: String, val text: String)

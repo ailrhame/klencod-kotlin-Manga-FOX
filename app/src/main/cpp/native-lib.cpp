@@ -12,6 +12,7 @@
 static std::mutex g_mutex;
 static llama_model *g_model = nullptr;
 static llama_context *g_ctx = nullptr;
+static std::string g_last_error = "لم تبدأ عملية التحميل";
 
 static void release_locked() {
     if (g_ctx) { llama_free(g_ctx); g_ctx = nullptr; }
@@ -26,21 +27,36 @@ Java_com_manga_fox_MangaFoxLocalLlm_nativeLoadModel(JNIEnv *env, jobject,
     if (!path) return JNI_FALSE;
     std::lock_guard<std::mutex> lock(g_mutex);
     release_locked();
+    g_last_error.clear();
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.use_mmap = true;
     mp.use_mlock = false;
+    LOGE("Loading GGUF model from app-private storage");
     g_model = llama_model_load_from_file(path, mp);
     env->ReleaseStringUTFChars(model_path, path);
-    if (!g_model) { LOGE("Model load failed"); return JNI_FALSE; }
+    if (!g_model) {
+        g_last_error = "فشل llama_model_load_from_file: لم يتمكن المحرك من قراءة GGUF أو تخصيص الذاكرة";
+        LOGE("Model load failed: %s", g_last_error.c_str());
+        return JNI_FALSE;
+    }
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = static_cast<uint32_t>(std::max(1024, context_size));
     cp.n_batch = 512;
-    cp.n_ubatch = 512;
+    cp.n_ubatch = 128;
     cp.n_threads = std::max(1, threads);
     cp.n_threads_batch = std::max(1, threads);
+    LOGE("Creating context: n_ctx=%u n_batch=%u n_ubatch=%u threads=%d",
+         cp.n_ctx, cp.n_batch, cp.n_ubatch, cp.n_threads);
     g_ctx = llama_init_from_model(g_model, cp);
-    if (!g_ctx) { release_locked(); LOGE("Context creation failed"); return JNI_FALSE; }
+    if (!g_ctx) {
+        g_last_error = "تم فتح ملف النموذج، لكن إنشاء سياق التشغيل فشل؛ قد تكون الذاكرة المتاحة لحظياً غير كافية";
+        release_locked();
+        LOGE("Context creation failed");
+        return JNI_FALSE;
+    }
+    g_last_error = "OK";
+    LOGE("Qwen model loaded successfully");
     return JNI_TRUE;
 }
 
@@ -99,4 +115,10 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_manga_fox_MangaFoxLocalLlm_nativeRelease(JNIEnv *, jobject) {
     std::lock_guard<std::mutex> lock(g_mutex);
     release_locked();
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_manga_fox_MangaFoxLocalLlm_nativeLastError(JNIEnv *env, jobject) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return env->NewStringUTF(g_last_error.c_str());
 }

@@ -1805,10 +1805,14 @@ class MainActivity : android.app.Activity() {
             }
             toast("جارٍ تحميل النموذج محلياً…")
             fontDownloadExecutor.execute {
-                val loaded = runCatching { MangaFoxLocalLlm.load(this) }.getOrDefault(false)
+                val attempt = runCatching { MangaFoxLocalLlm.load(this) }
+                val loaded = attempt.getOrDefault(false)
+                val failure = if (loaded) "" else (MangaFoxLocalLlm.lastLoadError().ifBlank {
+                    attempt.exceptionOrNull()?.message ?: "سبب غير محدد"
+                }).take(220)
                 runOnUiThread {
-                    modelStatus.text = if (loaded) "حالة النموذج: يعمل محلياً وجاهز" else "حالة النموذج: تعذر التحميل؛ تحقق من ذاكرة الجهاز"
-                    toast(if (loaded) "Qwen جاهز. الترجمة السياقية تعمل دون إنترنت" else "تعذر تحميل Qwen؛ سيبقى ML Kit احتياطياً")
+                    modelStatus.text = if (loaded) "حالة النموذج: يعمل محلياً وجاهز" else "فشل تحميل Qwen: $failure"
+                    toast(if (loaded) "Qwen جاهز. الترجمة السياقية تعمل دون إنترنت" else "فشل تحميل Qwen: $failure")
                 }
             }
         }, matchWrap(dp(4)))
