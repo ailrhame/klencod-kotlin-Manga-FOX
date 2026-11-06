@@ -114,6 +114,8 @@ internal const val PREF_FONT_FAMILY = "font_family"
 internal const val PREF_FONT_BOLD = "font_bold"
 internal const val PREF_FONT_FILE = "font_file_path"
 internal const val PREF_FONT_LABEL = "font_file_label"
+internal const val PREF_CURRENT_WORK_NAME = "current_work_name_v1"
+internal const val PREF_CURRENT_CHAPTER_NAME = "current_chapter_name_v1"
 internal const val PREF_AUTO_FONT_FIT = "auto_font_fit_enabled"
 internal const val PREF_TRANSLATED_TEXT_COLOR = "translated_text_color"
 internal const val PREF_TRANSLATED_OUTLINE_COLOR = "translated_text_outline_color"
@@ -175,7 +177,30 @@ class MainActivity : android.app.Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        restoreFontSelectionFromDisk()
         MangaFoxRuntime.restore(this)
+        // Preserve a restored session if it is not already represented in the permanent archive.
+        // This also covers an upgrade where the catalog contains earlier chapters but the
+        // currently active legacy session has not yet been migrated.
+        val existingArchive = MangaFoxChapterArchive.list(this)
+        val currentSessionIsArchived = MangaFoxRuntime.activeArchiveId.isNotBlank() &&
+            existingArchive.any { it.id == MangaFoxRuntime.activeArchiveId }
+        if (MangaFoxRuntime.resultPages.isNotEmpty() &&
+            MangaFoxRuntime.resultPages.all { it.isNotBlank() && File(it).isFile } &&
+            !currentSessionIsArchived) {
+            val legacyTitle = MangaFoxRuntime.resultTitle.ifBlank { "الفصل السابق" }
+            val legacyWork = MangaFoxRuntime.activeWorkName.takeUnless { it.isBlank() || it == "عمل غير مصنف" }
+                ?: "أعمال سابقة"
+            val legacyChapter = MangaFoxRuntime.activeChapterName.takeUnless { it.isBlank() || it == "الفصل المترجم" }
+                ?: legacyTitle
+            MangaFoxChapterArchive.save(
+                this, legacyWork, legacyChapter, legacyTitle,
+                MangaFoxRuntime.sourcePages, MangaFoxRuntime.resultPages,
+                MangaFoxRuntime.translationLayerFiles, MangaFoxRuntime.captureOnlyResult,
+                MangaFoxRuntime.qualitySummary
+            )
+            MangaFoxRuntime.persist(this)
+        }
         applySystemBars()
         handleIntent(intent)
         // Notification permission is requested from the onboarding checklist so the user sees why it is needed.
@@ -381,7 +406,7 @@ class MainActivity : android.app.Activity() {
         }
         listOf(
             "translation" to "ترجمة", "studio" to "استوديو", "quality" to "الجودة",
-            "knowledge" to "المعجم", "settings" to "الإعدادات", "library" to "المكتبة"
+            "knowledge" to "المعجم", "settings" to "الإعدادات", "library" to "المكتبة", "archive" to "الأعمال"
         ).forEach { (key, label) ->
             val tab = Button(this).apply {
                 text = label
@@ -402,7 +427,10 @@ class MainActivity : android.app.Activity() {
             }
             tabs.addView(tab)
         }
-        root.addView(tabsScroll, matchWrap(dp(12)))
+        root.addView(tabsScroll, matchWrap(dp(8)))
+        root.addView(actionButton("☰  القائمة الجانبية · متاحة في جميع الأقسام", false) {
+            showQuickSidePanel()
+        }, matchWrap(dp(10)))
         homeContent = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_RTL
@@ -436,7 +464,7 @@ class MainActivity : android.app.Activity() {
     private fun updateHomeTabs(tabs: LinearLayout) {
         val items = listOf(
             "translation" to "ترجمة", "studio" to "استوديو", "quality" to "الجودة",
-            "knowledge" to "المعجم", "settings" to "الإعدادات", "library" to "المكتبة"
+            "knowledge" to "المعجم", "settings" to "الإعدادات", "library" to "المكتبة", "archive" to "الأعمال"
         )
         tabs.removeAllViews()
         items.forEach { (key, label) ->
@@ -468,6 +496,7 @@ class MainActivity : android.app.Activity() {
             "studio" -> addPhantomStudioTab(content)
             "quality" -> addQualityTab(content)
             "knowledge" -> addKnowledgeTab(content)
+            "archive" -> addArchiveTab(content)
             else -> addTranslationTab(content)
         }
         refreshHomeIndicators()
@@ -479,10 +508,6 @@ class MainActivity : android.app.Activity() {
         intro.addView(text("التقط لقطات متتابعة أثناء القراءة، ثم اجمع النصوص من أكثر من محرك OCR وحدد لغة كل كتلة بشكل مستقل قبل ترجمتها إلى العربية.", 13f, Color.LTGRAY))
         intro.addView(text("تعمل المعالجة على الجهاز بعد تنزيل نماذج اللغات. يلزم الإنترنت لتنزيل النموذج أول مرة.", 12f, Color.rgb(195, 185, 165)))
         root.addView(intro, matchWrap(dp(12)))
-        root.addView(actionButton("☰  لوحة FOX الجانبية السريعة", false) {
-            showQuickSidePanel()
-        }, matchWrap(dp(12)))
-
         val onboarding = card()
         onboarding.addView(text("دليل التفعيل والتحقق التلقائي", 17f, Color.WHITE, true))
         onboarding.addView(text("فعّل الأذونات التالية. تتحدث علاماتها تلقائياً عند الرجوع إلى التطبيق.", 12f, Color.LTGRAY))
@@ -503,9 +528,52 @@ class MainActivity : android.app.Activity() {
         }, matchWrap(dp(5)))
         root.addView(onboarding, matchWrap(dp(12)))
 
+        val metadataCard = card()
+        metadataCard.addView(text("تصنيف العمل والفصل", 17f, gold, true))
+        metadataCard.addView(text("يُحفظ كل فصل داخل العمل نفسه. أدخل اسم المانغا أو المانهوا ورقم الفصل قبل الالتقاط؛ ويمكنك تغيير رقم الفصل في المرة التالية دون فقد الفصول السابقة.", 12f, Color.LTGRAY), matchWrap(dp(6)))
+        val workNameInput = EditText(this).apply {
+            setText(preferences.getString(PREF_CURRENT_WORK_NAME, "").orEmpty())
+            hint = "اسم العمل · مثال: Solo Leveling"
+            setSingleLine(true)
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = rounded(panel, 12)
+            onFocusChangeListener = View.OnFocusChangeListener { _, hasFocus ->
+                if (!hasFocus) preferences.edit().putString(PREF_CURRENT_WORK_NAME, text.toString().trim()).apply()
+            }
+        }
+        val chapterNameInput = EditText(this).apply {
+            setText(preferences.getString(PREF_CURRENT_CHAPTER_NAME, "").orEmpty())
+            hint = "رقم / اسم الفصل · مثال: الفصل 01"
+            setSingleLine(true)
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = rounded(panel, 12)
+            onFocusChangeListener = View.OnFocusChangeListener { _, hasFocus ->
+                if (!hasFocus) preferences.edit().putString(PREF_CURRENT_CHAPTER_NAME, text.toString().trim()).apply()
+            }
+        }
+        metadataCard.addView(workNameInput, matchWrap(dp(6)))
+        metadataCard.addView(chapterNameInput, matchWrap(dp(6)))
+        metadataCard.addView(actionButton("حفظ اسم العمل والفصل", false) {
+            preferences.edit()
+                .putString(PREF_CURRENT_WORK_NAME, workNameInput.text.toString().trim())
+                .putString(PREF_CURRENT_CHAPTER_NAME, chapterNameInput.text.toString().trim())
+                .apply()
+            toast("تم حفظ تصنيف العمل والفصل")
+        }, matchWrap())
+        root.addView(metadataCard, matchWrap(dp(12)))
+
         val actions = card()
         actions.addView(text("الترجمة", 18f, Color.WHITE, true))
         actions.addView(actionButton("ترجمة الشاشة الحالية", true) {
+            preferences.edit()
+                .putString(PREF_CURRENT_WORK_NAME, workNameInput.text.toString().trim())
+                .putString(PREF_CURRENT_CHAPTER_NAME, chapterNameInput.text.toString().trim()).apply()
             val service = MangaFoxAccessibilityService.instance
             if (service == null) toast("فعّل خدمة Manga Fox أولاً") else {
                 service.startSingleCapture(900L)
@@ -513,6 +581,9 @@ class MainActivity : android.app.Activity() {
             }
         }, matchWrap(dp(5)))
         actions.addView(actionButton("ترجمة الفصل العمودي كاملاً", true) {
+            preferences.edit()
+                .putString(PREF_CURRENT_WORK_NAME, workNameInput.text.toString().trim())
+                .putString(PREF_CURRENT_CHAPTER_NAME, chapterNameInput.text.toString().trim()).apply()
             val service = MangaFoxAccessibilityService.instance
             if (service == null) toast("فعّل خدمة Manga Fox أولاً، ثم افتح فصل المانجا") else {
                 service.startFullChapterCapture(1300L)
@@ -520,6 +591,9 @@ class MainActivity : android.app.Activity() {
             }
         }, matchWrap(dp(5)))
         actions.addView(actionButton("التقاط الفصل دون ترجمة · PDF", false) {
+            preferences.edit()
+                .putString(PREF_CURRENT_WORK_NAME, workNameInput.text.toString().trim())
+                .putString(PREF_CURRENT_CHAPTER_NAME, chapterNameInput.text.toString().trim()).apply()
             val service = MangaFoxAccessibilityService.instance
             if (service == null) toast("فعّل خدمة Manga Fox أولاً، ثم افتح فصل المانجا") else {
                 service.startFullChapterCaptureOnly(1300L)
@@ -580,6 +654,10 @@ class MainActivity : android.app.Activity() {
         }
         item("إيقاف الالتقاط") { MangaFoxAccessibilityService.instance?.stopCaptureByUser() }
         item("مركز الالتقاط") { showCaptureHub() }
+        item("انجذاب العدسة إلى وسط الشاشة") {
+            MangaFoxAccessibilityService.instance?.centerFloatingBubble()
+                ?: toast("خدمة Manga FOX غير متصلة")
+        }
         item("فتح النتائج") { showResults() }
         item("تصدير PDF") { exportResultsAsPdf() }
         item("إعدادات العدسة") { selectedHomeTab = "settings"; showHome() }
@@ -649,6 +727,128 @@ class MainActivity : android.app.Activity() {
                         .show()
                 }
             }.setNegativeButton("إغلاق", null).show()
+    }
+
+    private fun addArchiveTab(root: LinearLayout) {
+        val chapters = MangaFoxChapterArchive.list(this)
+        val header = card()
+        header.addView(text("أرشيف الأعمال والفصول", 19f, gold, true))
+        header.addView(text("كل فصل محفوظ بصورة مستقلة داخل تصنيف العمل. يمكنك فتح أي فصل أو حذفه دون التأثير على الفصول الأخرى.", 12f, Color.LTGRAY))
+        header.addView(text("إجمالي الفصول المحفوظة: ${chapters.size}", 13f, Color.WHITE, true).apply { setPadding(0, dp(8), 0, 0) })
+        root.addView(header, matchWrap(dp(10)))
+        if (chapters.isEmpty()) {
+            root.addView(text("لا توجد فصول محفوظة بعد. افتح قسم الترجمة، واكتب اسم العمل ورقم الفصل قبل بدء الالتقاط.", 14f, Color.LTGRAY)
+                .apply { setPadding(dp(10), dp(18), dp(10), dp(18)) }, matchWrap())
+            return
+        }
+        chapters.groupBy { it.workName }.forEach { (workName, workChapters) ->
+            val workCard = card()
+            workCard.addView(text("📚  $workName", 17f, gold, true))
+            workCard.addView(text("${workChapters.size} فصل محفوظ", 11f, Color.LTGRAY), matchWrap(dp(6)))
+            workChapters.sortedWith(compareBy<MangaFoxChapterArchive.ChapterInfo> { it.createdAt }.thenBy { it.chapterName })
+                .forEach { chapter ->
+                    val chapterCard = LinearLayout(this).apply {
+                        orientation = LinearLayout.VERTICAL
+                        layoutDirection = View.LAYOUT_DIRECTION_RTL
+                        setPadding(dp(10), dp(9), dp(10), dp(9))
+                        background = rounded(Color.rgb(34, 32, 42), 12)
+                    }
+                    chapterCard.addView(text("${chapter.chapterName}", 14f, Color.WHITE, true))
+                    chapterCard.addView(text("${chapter.pageCount} صورة  ·  ${if (chapter.captureOnly) "صور أصلية" else "مترجم"}", 11f, Color.LTGRAY), matchWrap(dp(5)))
+                    val buttons = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        layoutDirection = View.LAYOUT_DIRECTION_RTL
+                    }
+                    buttons.addView(actionButton("فتح الفصل", true) {
+                        if (MangaFoxChapterArchive.open(this@MainActivity, chapter.id)) {
+                            preferences.edit().putBoolean(PREF_RESULTS_EDIT_MODE, false).apply()
+                            showResults()
+                        } else toast("تعذر فتح هذا الفصل؛ قد تكون بعض ملفاته مفقودة")
+                    }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(4) })
+                    buttons.addView(actionButton("حذف الفصل", false) {
+                        AlertDialog.Builder(this@MainActivity)
+                            .setTitle("حذف ${chapter.chapterName}؟")
+                            .setMessage("سيُحذف هذا الفصل فقط من تصنيف «$workName». بقية فصول العمل ستبقى محفوظة.")
+                            .setNegativeButton("إلغاء", null)
+                            .setPositiveButton("حذف الفصل") { _, _ ->
+                                val wasActive = MangaFoxRuntime.activeArchiveId == chapter.id
+                                MangaFoxChapterArchive.delete(this@MainActivity, chapter.id)
+                                if (wasActive) {
+                                    MangaFoxRuntime.activeArchiveId = ""
+                                    MangaFoxRuntime.resultPages = emptyList()
+                                    MangaFoxRuntime.sourcePages = emptyList()
+                                    MangaFoxRuntime.translationLayerFiles = emptyList()
+                                    MangaFoxRuntime.resultTitle = "لا يوجد فصل محدد"
+                                    MangaFoxRuntime.pendingEdits = false
+                                    MangaFoxRuntime.captureOnlyResult = false
+                                    MangaFoxRuntime.activeWorkName = "عمل غير مصنف"
+                                    MangaFoxRuntime.activeChapterName = "الفصل المترجم"
+                                    MangaFoxLayerHistory(this@MainActivity).reset()
+                                    MangaFoxRuntime.persist(this@MainActivity)
+                                }
+                                toast("تم حذف ${chapter.chapterName} فقط")
+                                renderHomeTab()
+                            }.show()
+                    }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginStart = dp(4) })
+                    chapterCard.addView(buttons, matchWrap(dp(2)))
+                    workCard.addView(chapterCard, matchWrap(dp(7)))
+                }
+            root.addView(workCard, matchWrap(dp(10)))
+        }
+    }
+
+    private fun restoreFontSelectionFromDisk() {
+        val savedPath = preferences.getString(PREF_FONT_FILE, null)?.takeIf { it.isNotBlank() } ?: return
+        val savedFile = File(savedPath)
+        val valid = savedFile.isFile && savedFile.length() >= 4096L &&
+            savedFile.extension.lowercase(Locale.ROOT) in setOf("ttf", "otf", "ttc") &&
+            runCatching { Typeface.createFromFile(savedFile); true }.getOrDefault(false)
+        if (valid) {
+            val canonical = runCatching { savedFile.canonicalPath }.getOrDefault(savedFile.absolutePath)
+            val label = preferences.getString(PREF_FONT_LABEL, null).takeUnless { it.isNullOrBlank() }
+                ?: savedFile.name
+            preferences.edit().putString(PREF_FONT_FILE, canonical).putString(PREF_FONT_LABEL, label).commit()
+        } else {
+            // A stale path must not shadow a valid system fallback after an interrupted import.
+            preferences.edit().remove(PREF_FONT_FILE).remove(PREF_FONT_LABEL).commit()
+        }
+    }
+
+    private fun showInstalledFontsDialog() {
+        val fontDir = File(filesDir, "fonts")
+        val installed = fontDir.listFiles()?.filter { file ->
+            file.isFile && file.length() >= 4096L && file.extension.lowercase(Locale.ROOT) in setOf("ttf", "otf", "ttc") &&
+                runCatching { Typeface.createFromFile(file); true }.getOrDefault(false)
+        }?.sortedBy { it.name.lowercase(Locale.ROOT) }.orEmpty()
+        if (installed.isEmpty()) {
+            AlertDialog.Builder(this).setTitle("الخطوط المثبتة")
+                .setMessage("لم يتم العثور على ملفات خطوط صالحة. نزّل خطاً أو استورده أولاً؛ سيُحفظ داخل مساحة التطبيق ويظل متاحاً بعد إغلاقه.")
+                .setPositiveButton("إغلاق", null).show()
+            return
+        }
+        val selectedPath = preferences.getString(PREF_FONT_FILE, null)
+        val labels = installed.map { file ->
+            val selected = file.absolutePath == selectedPath
+            "${if (selected) "✓  " else ""}${file.name}  ·  ${formatBytes(file.length())}"
+        }
+        AlertDialog.Builder(this).setTitle("الخطوط المثبتة (${installed.size})")
+            .setItems(labels.toTypedArray()) { _, which ->
+                val file = installed[which]
+                runCatching { Typeface.createFromFile(file) }.onSuccess {
+                    preferences.edit().putString(PREF_FONT_FILE, file.absolutePath)
+                        .putString(PREF_FONT_LABEL, file.name)
+                        .putString(PREF_FONT_FAMILY, "sans-serif")
+                        .commit()
+                    updateFontPreview()
+                    toast("تم تفعيل الخط المحفوظ: ${file.name}")
+                }.onFailure { toast("ملف الخط غير صالح: ${it.localizedMessage ?: "خطأ"}") }
+            }
+            .setNeutralButton("استخدام خط النظام") { _, _ ->
+                preferences.edit().remove(PREF_FONT_FILE).remove(PREF_FONT_LABEL).apply()
+                updateFontPreview()
+                toast("تمت العودة إلى خط النظام")
+            }
+            .setNegativeButton("إغلاق", null).show()
     }
 
     private fun addLibraryTab(root: LinearLayout) {
@@ -898,18 +1098,92 @@ class MainActivity : android.app.Activity() {
         }.setNegativeButton("إغلاق", null).show()
     }
 
+    private fun syncCurrentArchiveAfterLayerChange() {
+        if (MangaFoxRuntime.activeArchiveId.isNotBlank() && MangaFoxRuntime.resultPages.isNotEmpty()) {
+            MangaFoxChapterArchive.save(
+                this, MangaFoxRuntime.activeWorkName, MangaFoxRuntime.activeChapterName,
+                MangaFoxRuntime.resultTitle, MangaFoxRuntime.sourcePages, MangaFoxRuntime.resultPages,
+                MangaFoxRuntime.translationLayerFiles, MangaFoxRuntime.captureOnlyResult,
+                MangaFoxRuntime.qualitySummary, preserveExistingImages = true
+            )
+        }
+        MangaFoxRuntime.persist(this)
+        MangaFoxAccessibilityService.instance?.updateLensPendingEdits()
+    }
+
     private fun showLayerHistoryDialog(pageIndex: Int) {
-        val pair = readLayerArray(pageIndex)
-        if (pair == null) { toast("لا توجد طبقات قابلة للتراجع"); return }
-        val (file, _) = pair
-        AlertDialog.Builder(this).setTitle("سجل تعديلات الصفحة ${pageIndex + 1}")
-            .setItems(arrayOf("تراجع عن آخر تعديل", "إعادة آخر تعديل متراجع عنه")) { _, which ->
-                val history = MangaFoxLayerHistory(this)
-                val changed = if (which == 0) history.undo(pageIndex, file) else history.redo(pageIndex, file)
+        AlertDialog.Builder(this).setTitle("سجل التعديلات · الصفحة ${pageIndex + 1}")
+            .setMessage("يعمل التراجع بترتيب زمني على مستوى الفصل كله؛ كل ضغطة تعيد آخر تعديل واحد فقط، حتى لو كان في صورة أخرى.")
+            .setPositiveButton("تراجع عن آخر تعديل") { _, _ ->
+                val changed = MangaFoxLayerHistory(this).undoLatest(MangaFoxRuntime.translationLayerFiles)
                 if (changed) {
-                    MangaFoxRuntime.persist(this)
-                                  toast("تم التراجع/الإعادة. اضغط «تطبيق الخط والملاءمة الجديدة» عند الانتهاء")
-                } else toast(if (which == 0) "لا توجد خطوة سابقة للتراجع" else "لا توجد خطوة لإعادتها")
+                    MangaFoxRuntime.pendingEdits = true
+                    syncCurrentArchiveAfterLayerChange()
+                    showResults()
+                } else toast("لا توجد خطوة سابقة للتراجع")
+            }
+            .setNeutralButton("إعادة آخر تعديل") { _, _ ->
+                val changed = MangaFoxLayerHistory(this).redoLatest(MangaFoxRuntime.translationLayerFiles)
+                if (changed) {
+                    MangaFoxRuntime.pendingEdits = true
+                    syncCurrentArchiveAfterLayerChange()
+                    showResults()
+                } else toast("لا توجد خطوة لإعادتها")
+            }.setNegativeButton("إغلاق", null).show()
+    }
+
+    private fun showSaveNamedEditsDialog() {
+        val input = EditText(this).apply {
+            hint = "مثال: ترجمة معدلة - نسخة 1"
+            setSingleLine(true)
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+        }
+        AlertDialog.Builder(this).setTitle("حفظ مجموعة التعديلات")
+            .setMessage("سيُحفظ ترتيب طبقات جميع الصور لهذا الفصل باسم تختاره، ويمكن استعادته لاحقاً دون المساس ببقية الفصول.")
+            .setView(input)
+            .setNegativeButton("إلغاء", null)
+            .setPositiveButton("حفظ المجموعة") { _, _ ->
+                val name = input.text.toString().trim()
+                if (name.isBlank()) {
+                    toast("اكتب اسماً لمجموعة التعديلات")
+                } else {
+                    val allLayerPaths = MangaFoxRuntime.resultPages.indices.mapNotNull { index -> layerFileForPage(index)?.absolutePath }
+                    val scopeKey = MangaFoxRuntime.activeArchiveId.ifBlank { "${MangaFoxRuntime.activeWorkName}::${MangaFoxRuntime.activeChapterName}" }
+                    val saved = allLayerPaths.size == MangaFoxRuntime.resultPages.size &&
+                        MangaFoxEditSetStore.save(this, name, MangaFoxRuntime.resultTitle, scopeKey, allLayerPaths)
+                    toast(if (saved) "تم حفظ مجموعة «$name»" else "تعذر حفظ مجموعة التعديلات")
+                }
+            }.show()
+    }
+
+    private fun showRestoreNamedEditsDialog() {
+        val scopeKey = MangaFoxRuntime.activeArchiveId.ifBlank { "${MangaFoxRuntime.activeWorkName}::${MangaFoxRuntime.activeChapterName}" }
+        val names = MangaFoxEditSetStore.list(this, MangaFoxRuntime.resultTitle, scopeKey)
+        if (names.isEmpty()) {
+            toast("لا توجد مجموعات محفوظة لهذا الفصل")
+            return
+        }
+        AlertDialog.Builder(this).setTitle("استعادة مجموعة التعديلات")
+            .setItems(names.map { it.name }.toTypedArray()) { _, which ->
+                val selected = names[which]
+                AlertDialog.Builder(this).setTitle("استعادة «${selected.name}»؟")
+                    .setMessage("سيُسجل الوضع الحالي أولاً في سجل التراجع، ثم تُستعاد طبقات المجموعة المحددة. لن تتغير الصورة حتى تضغط تطبيق جميع التعديلات.")
+                    .setNegativeButton("إلغاء", null)
+                    .setPositiveButton("استعادة") { _, _ ->
+                        val allLayerPaths = MangaFoxRuntime.resultPages.indices.mapNotNull { index -> layerFileForPage(index)?.absolutePath }
+                        val restored = allLayerPaths.size == MangaFoxRuntime.resultPages.size &&
+                            MangaFoxEditSetStore.restore(
+                                this, selected.fileName, MangaFoxRuntime.resultTitle, scopeKey,
+                                allLayerPaths, MangaFoxLayerHistory(this)
+                            )
+                        if (restored) {
+                            MangaFoxRuntime.pendingEdits = true
+                            syncCurrentArchiveAfterLayerChange()
+                            showResults()
+                            toast("تمت استعادة المجموعة؛ طبّقها على الصور عند الانتهاء")
+                        } else toast("لم يمكن استعادة المجموعة؛ تحقق من تطابق الفصل والصفحات")
+                    }.show()
             }.setNegativeButton("إغلاق", null).show()
     }
 
@@ -1137,6 +1411,9 @@ class MainActivity : android.app.Activity() {
         )
         fontStatusText = fontStatus
         settingsCard.addView(fontStatus, matchWrap())
+        settingsCard.addView(actionButton("إدارة الخطوط المثبتة واختيار خط محفوظ", true) {
+            showInstalledFontsDialog()
+        }, matchWrap(dp(6)))
 
         settingsCard.addView(text("لغة النص الأصلي", 14f, gold, true).apply {
             setPadding(0, dp(12), 0, dp(3))
@@ -1603,7 +1880,7 @@ class MainActivity : android.app.Activity() {
             Typeface.createFromFile(target)
             preferences.edit().putString(PREF_FONT_FILE, target.absolutePath)
                 .putString(PREF_FONT_LABEL, if (friendlyFontLabel.isNullOrBlank()) displayName else "$friendlyFontLabel ($displayName)")
-                .apply()
+                .commit()
             updateFontPreview()
             toast("تم استيراد الخط وتفعيله: ${friendlyFontLabel ?: displayName}")
         }.onFailure { toast("تعذر استيراد الخط: ${it.localizedMessage ?: "ملف غير صالح"}") }
@@ -1781,7 +2058,7 @@ class MainActivity : android.app.Activity() {
                 if (!temp.renameTo(target)) throw IllegalStateException("تعذر حفظ الخط")
                 runOnUiThread {
                     preferences.edit().putString(PREF_FONT_FILE, target.absolutePath)
-                        .putString(PREF_FONT_LABEL, label).apply()
+                        .putString(PREF_FONT_LABEL, label).commit()
                     updateFontPreview()
                     toast("تم تنزيل $label وتفعيله")
                 }
@@ -1836,7 +2113,7 @@ class MainActivity : android.app.Activity() {
                 runOnUiThread {
                     preferences.edit().putString(PREF_FONT_FILE, target.absolutePath)
                         .putString(PREF_FONT_LABEL, "Droid Arabic Kufi Bold · Apache-2.0")
-                        .putBoolean(PREF_FONT_BOLD, true).apply()
+                        .putBoolean(PREF_FONT_BOLD, true).commit()
                     updateFontPreview()
                     toast("تم تنزيل Droid Arabic Kufi Bold وتفعيله")
                 }
@@ -2063,6 +2340,9 @@ class MainActivity : android.app.Activity() {
             showResults()
         })
         root.addView(topBar, matchWrap(dp(4)))
+        root.addView(actionButton("☰  القائمة الجانبية", false) {
+            showQuickSidePanel()
+        }, matchWrap(dp(6)))
 
         root.addView(text(
             if (editMode) "MANGA FOX · وضع التحرير" else "MANGA FOX · المعاينة المتصلة",
@@ -2073,11 +2353,44 @@ class MainActivity : android.app.Activity() {
             root.addView(text("${pages.size} صورة · ${MangaFoxRuntime.resultTitle}", 12f, Color.LTGRAY).apply {
                 gravity = Gravity.CENTER
             }, matchWrap(dp(5)))
-            root.addView(actionButton("تطبيق الخط والملاءمة الجديدة دون إعادة OCR", true) {
+            root.addView(text(
+                if (MangaFoxRuntime.pendingEdits) "✎ توجد تعديلات غير مطبقة؛ العدسة العائمة تعرض علامة التحرير." else "لا توجد تعديلات معلّقة.",
+                12f, if (MangaFoxRuntime.pendingEdits) gold else Color.LTGRAY, true
+            ).apply { gravity = Gravity.CENTER }, matchWrap(dp(5)))
+            root.addView(actionButton("تطبيق جميع تعديلات الصور دفعة واحدة", true) {
                 val service = MangaFoxAccessibilityService.instance
                 if (MangaFoxRuntime.sourcePages.isEmpty()) toast("الصور الأصلية غير متوفرة لهذه النتيجة")
                 else if (service == null) toast("فعّل خدمة Manga Fox لإعادة تنسيق الطبقات")
                 else service.rerenderLastResultsFromLayers { showResults() }
+            }, matchWrap(dp(5)))
+            val historyActions = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+            }
+            historyActions.addView(actionButton("↶ تراجع عن آخر تعديل", false) {
+                val changed = MangaFoxLayerHistory(this).undoLatest(MangaFoxRuntime.translationLayerFiles)
+                if (changed) {
+                    MangaFoxRuntime.pendingEdits = true
+                    syncCurrentArchiveAfterLayerChange()
+                    showResults()
+                    toast("تم التراجع عن آخر تعديل فقط")
+                } else toast("لا توجد تعديلات سابقة للتراجع عنها")
+            }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(3) })
+            historyActions.addView(actionButton("↷ إعادة التعديل", false) {
+                val changed = MangaFoxLayerHistory(this).redoLatest(MangaFoxRuntime.translationLayerFiles)
+                if (changed) {
+                    MangaFoxRuntime.pendingEdits = true
+                    syncCurrentArchiveAfterLayerChange()
+                    showResults()
+                    toast("تمت إعادة آخر تعديل متراجع عنه")
+                } else toast("لا توجد خطوة متراجَع عنها لإعادتها")
+            }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginStart = dp(3) })
+            root.addView(historyActions, matchWrap(dp(6)))
+            root.addView(actionButton("حفظ مجموعة التعديلات باسم...", false) {
+                showSaveNamedEditsDialog()
+            }, matchWrap(dp(5)))
+            root.addView(actionButton("استعادة مجموعة تعديلات محفوظة", false) {
+                showRestoreNamedEditsDialog()
             }, matchWrap(dp(5)))
             root.addView(actionButton("إعادة OCR وترجمة الصور الأصلية من جديد", false) {
                 MangaFoxAccessibilityService.instance?.retranslateLastResults()
@@ -2209,13 +2522,20 @@ class MainActivity : android.app.Activity() {
                 temp.copyTo(file, overwrite = true)
                 temp.delete()
             }
+            MangaFoxRuntime.pendingEdits = true
+            if (MangaFoxRuntime.activeArchiveId.isNotBlank()) {
+                MangaFoxChapterArchive.save(
+                    this, MangaFoxRuntime.activeWorkName, MangaFoxRuntime.activeChapterName,
+                    MangaFoxRuntime.resultTitle, MangaFoxRuntime.sourcePages,
+                    MangaFoxRuntime.resultPages, MangaFoxRuntime.translationLayerFiles,
+                    MangaFoxRuntime.captureOnlyResult, MangaFoxRuntime.qualitySummary,
+                    preserveExistingImages = true
+                )
+            }
             MangaFoxRuntime.persist(this)
         }.onSuccess {
-            if (refresh) {
-                val service = MangaFoxAccessibilityService.instance
-                if (service == null) toast("تم حفظ الطبقة. افتح الخدمة لإعادة رسم الصورة")
-                else service.rerenderLastResultsFromLayers { showResults() }
-            }
+            MangaFoxAccessibilityService.instance?.updateLensPendingEdits()
+            toast("تم تسجيل التعديل. أكمل تعديل بقية الصور ثم اضغط «تطبيق جميع تعديلات الصور دفعة واحدة»")
         }.onFailure { toast("تعذر حفظ الطبقة: ${it.localizedMessage ?: "خطأ في الملف"}") }
     }
 
@@ -2820,6 +3140,19 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         translatorCache.clear()
     }
 
+    private fun beginCaptureMetadata() {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val work = prefs.getString(PREF_CURRENT_WORK_NAME, "").orEmpty().trim().ifBlank { "عمل غير مصنف" }
+        val chapter = prefs.getString(PREF_CURRENT_CHAPTER_NAME, "").orEmpty().trim()
+            .ifBlank { "فصل ${System.currentTimeMillis()}" }
+        MangaFoxRuntime.activeWorkName = work
+        MangaFoxRuntime.activeChapterName = chapter
+        // A new capture must never reuse the chapter currently open in the archive.
+        MangaFoxRuntime.activeArchiveId = ""
+        MangaFoxRuntime.pendingEdits = false
+        MangaFoxRuntime.persist(this)
+    }
+
     fun startSingleCapture(startDelayMs: Long = 250L) {
         if (captureRunning || translationRunning) {
             toast("هناك عملية ترجمة أو التقاط قيد التنفيذ")
@@ -2829,6 +3162,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             toast("الالتقاط التلقائي يحتاج Android 11 أو أحدث")
             return
         }
+        beginCaptureMetadata()
         captureRunning = true
         fullChapterMode = false
         capturedSegments.forEach { runCatching { it.delete() } }
@@ -2866,6 +3200,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             toast("ترجمة الفصل الكامل تحتاج Android 11 أو أحدث")
             return
         }
+        beginCaptureMetadata()
         captureRunning = true
         fullChapterMode = true
         captureOnlyMode = false
@@ -2897,6 +3232,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             toast("التقاط الفصل الكامل يحتاج Android 11 أو أحدث")
             return
         }
+        beginCaptureMetadata()
         captureRunning = true
         fullChapterMode = true
         captureOnlyMode = true
@@ -3244,9 +3580,15 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                         MangaFoxRuntime.sourcePages = saved
                         MangaFoxRuntime.resultPages = saved
                         MangaFoxRuntime.translationLayerFiles = saved.map { "" }
-                        MangaFoxRuntime.resultTitle = "فصل ملتقط دون ترجمة"
+                        MangaFoxLayerHistory(this).reset()
+                        MangaFoxRuntime.resultTitle = MangaFoxRuntime.activeChapterName
                         MangaFoxRuntime.captureOnlyResult = true
                         MangaFoxRuntime.qualitySummary = "صور أصلية دون OCR أو ترجمة"
+                        MangaFoxChapterArchive.save(
+                            this, MangaFoxRuntime.activeWorkName, MangaFoxRuntime.activeChapterName,
+                            MangaFoxRuntime.resultTitle, saved, saved, saved.map { "" }, true,
+                            MangaFoxRuntime.qualitySummary
+                        )
                         MangaFoxRuntime.progressPercent = 100
                         MangaFoxRuntime.progressDetail = "اكتمل الالتقاط: ${saved.size} صورة"
                         MangaFoxRuntime.status = "تم التقاط الفصل دون ترجمة؛ يمكنك تصديره PDF"
@@ -3267,7 +3609,9 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 }
             }
         } else {
-            translateSavedSegments(workPages, note, if (workPages.size > 1) "الفصل العمودي" else "الصفحة الحالية")
+            translateSavedSegments(workPages, note, MangaFoxRuntime.activeChapterName.ifBlank {
+                if (workPages.size > 1) "الفصل العمودي" else "الصفحة الحالية"
+            })
         }
     }
 
@@ -3505,6 +3849,16 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     MangaFoxRuntime.progressPercent = 100
                     MangaFoxRuntime.progressDetail = "تم تطبيق إعدادات الخط دون تشغيل OCR"
                     MangaFoxRuntime.status = MangaFoxRuntime.progressDetail
+                    MangaFoxRuntime.pendingEdits = false
+                    if (MangaFoxRuntime.activeArchiveId.isNotBlank()) {
+                        MangaFoxChapterArchive.save(
+                            this@MangaFoxAccessibilityService, MangaFoxRuntime.activeWorkName,
+                            MangaFoxRuntime.activeChapterName, MangaFoxRuntime.resultTitle,
+                            MangaFoxRuntime.sourcePages, MangaFoxRuntime.resultPages,
+                            MangaFoxRuntime.translationLayerFiles, MangaFoxRuntime.captureOnlyResult,
+                            MangaFoxRuntime.qualitySummary
+                        )
+                    }
                     MangaFoxRuntime.persist(this@MangaFoxAccessibilityService)
                     updateTranslationLens(100, MangaFoxRuntime.progressDetail)
                     mainHandler.postDelayed({ if (!translationRunning) resetLensProgress() }, 3500L)
@@ -3664,20 +4018,44 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                         }
                     }
                     val oldFiles = MangaFoxRuntime.resultPages
+                    val oldSources = MangaFoxRuntime.sourcePages
                     val oldLayers = MangaFoxRuntime.translationLayerFiles
-                    MangaFoxRuntime.resultPages = translatedFiles
+                    val retainedSources = if (preserveInputs) oldSources else newSourceFiles.toList()
+                    MangaFoxRuntime.resultPages = translatedFiles.toList()
                     MangaFoxRuntime.translationLayerFiles = newLayerFiles.toList()
-                    oldFiles.forEach { runCatching { File(it).delete() } }
-                    oldLayers.forEach { runCatching { File(it).delete() } }
-                    if (!preserveInputs) {
-                        val oldSources = MangaFoxRuntime.sourcePages
-                        MangaFoxRuntime.sourcePages = newSourceFiles.toList()
-                        oldSources.forEach { runCatching { File(it).delete() } }
-                    }
+                    MangaFoxLayerHistory(this@MangaFoxAccessibilityService).reset()
+                    if (!preserveInputs) MangaFoxRuntime.sourcePages = newSourceFiles.toList()
                     MangaFoxRuntime.resultTitle = title
+                    MangaFoxRuntime.pendingEdits = false
                     MangaFoxRuntime.qualitySummary = "اكتُشف ${MangaFoxRuntime.detectedBlocks} · تُرجم ${MangaFoxRuntime.translatedBlocks} · فشل ${MangaFoxRuntime.failedBlocks} · تُرك ${MangaFoxRuntime.skippedBlocks}"
                     MangaFoxRuntime.status = "اكتملت الترجمة: ${translatedFiles.size} صورة مدمجة · ${MangaFoxRuntime.qualitySummary}"
                     MangaFoxRuntime.lastError = note
+                    val archivedId = MangaFoxChapterArchive.save(
+                        this@MangaFoxAccessibilityService,
+                        MangaFoxRuntime.activeWorkName,
+                        MangaFoxRuntime.activeChapterName.ifBlank { title },
+                        title,
+                        retainedSources,
+                        translatedFiles,
+                        newLayerFiles,
+                        false,
+                        MangaFoxRuntime.qualitySummary
+                    )
+                    // Archive files are independent copies. Avoid deleting an original
+                    // that is also the current input during a preserve-input retranslation.
+                    val permanentArchiveRoot = File(filesDir, "mfox_library").canonicalPath + File.separator
+                    fun deleteOnlyWorkingFile(path: String) {
+                        if (path.isBlank()) return
+                        runCatching {
+                            val file = File(path)
+                            val canonical = file.canonicalPath
+                            if (!canonical.startsWith(permanentArchiveRoot)) file.delete()
+                        }
+                    }
+                    oldFiles.filterNot { it in retainedSources }.forEach(::deleteOnlyWorkingFile)
+                    oldLayers.forEach(::deleteOnlyWorkingFile)
+                    if (!preserveInputs) oldSources.forEach(::deleteOnlyWorkingFile)
+                    if (archivedId == null) MangaFoxRuntime.lastError = "${MangaFoxRuntime.lastError} · تعذر إنشاء نسخة الأرشيف".trim(' ', '·')
                     MangaFoxRuntime.persist(this@MangaFoxAccessibilityService)
                     MangaFoxRuntime.progressPercent = 100
                     MangaFoxRuntime.progressDetail = "اكتملت الترجمة"
@@ -5241,6 +5619,7 @@ val outlineWidth = 0f
             view.text = when {
                 percent < 0 -> "!"
                 translationRunning -> "${current.coerceIn(0, 99)}%"
+                MangaFoxRuntime.pendingEdits -> "✎"
                 current >= 100 -> "✓"
                 else -> "狐"
             }
@@ -5261,11 +5640,54 @@ val outlineWidth = 0f
         mainHandler.post {
             bubble?.apply {
                 val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                text = prefs.getString(PREF_LENS_GLYPH, "狐") ?: "狐"
+                text = if (MangaFoxRuntime.pendingEdits) "✎" else (prefs.getString(PREF_LENS_GLYPH, "狐") ?: "狐")
                 textSize = (prefs.getInt(PREF_LENS_SIZE, 58) * 0.40f).coerceIn(18f, 38f)
-                contentDescription = "Manga Fox Translator. اضغط لفتح خيارات الترجمة واسحب لتحريك العدسة"
+                contentDescription = if (MangaFoxRuntime.pendingEdits) "توجد تعديلات طبقات غير مطبقة. افتح Manga FOX ثم طبّق جميع التعديلات" else "Manga Fox Translator. اضغط لفتح خيارات الترجمة واسحب لتحريك العدسة"
             }
         }
+    }
+
+    fun updateLensPendingEdits() {
+        mainHandler.post {
+            val view = bubble ?: return@post
+            if (!translationRunning) {
+                val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                view.text = if (MangaFoxRuntime.pendingEdits) "✎" else (prefs.getString(PREF_LENS_GLYPH, "狐") ?: "狐")
+                view.textSize = if (MangaFoxRuntime.pendingEdits) 24f else (prefs.getInt(PREF_LENS_SIZE, 58) * 0.40f).coerceIn(18f, 38f)
+                view.contentDescription = if (MangaFoxRuntime.pendingEdits) "توجد تعديلات غير مطبقة" else "Manga Fox Translator. اضغط لفتح خيارات الترجمة واسحب لتحريك العدسة"
+            }
+        }
+    }
+
+    fun centerFloatingBubble() {
+        if (!this::windowManager.isInitialized) return
+        if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+            toast("فعّل إذن الظهور فوق التطبيقات أولاً")
+            return
+        }
+        if (!bubbleWasAdded || bubble == null || bubbleParams == null) {
+            refreshLensAppFilter()
+            mainHandler.postDelayed({
+                if (bubbleWasAdded && bubble != null && bubbleParams != null) {
+                    centerFloatingBubble()
+                } else {
+                    toast("تعذر إظهار العدسة؛ تحقق من خدمة Manga FOX")
+                }
+            }, 220L)
+            return
+        }
+        val view = bubble ?: return
+        val params = bubbleParams ?: return
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val screenWidth = resources.displayMetrics.widthPixels
+        val screenHeight = resources.displayMetrics.heightPixels
+        params.x = ((screenWidth - params.width) / 2).coerceAtLeast(0)
+        params.y = ((screenHeight - params.height) / 2).coerceAtLeast(0)
+        runCatching {
+            windowManager.updateViewLayout(view, params)
+            prefs.edit().putInt("lens_x", params.x).putInt("lens_y", params.y).apply()
+            toast("انجذبت العدسة إلى منتصف الشاشة")
+        }.onFailure { toast("تعذر تحريك العدسة: ${it.localizedMessage ?: "خطأ"}") }
     }
 
     fun applyLensSettings() {
@@ -5277,7 +5699,7 @@ val outlineWidth = 0f
         params.height = dp(size)
         view.textSize = (size * 0.40f).coerceIn(18f, 38f)
         view.alpha = prefs.getInt(PREF_LENS_ALPHA, 100).coerceIn(35, 100) / 100f
-        view.text = prefs.getString(PREF_LENS_GLYPH, "狐") ?: "狐"
+        view.text = if (MangaFoxRuntime.pendingEdits) "✎" else (prefs.getString(PREF_LENS_GLYPH, "狐") ?: "狐")
         view.background = lensBackgroundForPrefs(prefs)
         if (bubbleWasAdded) runCatching { windowManager.updateViewLayout(view, params) }
     }
@@ -5416,6 +5838,10 @@ val outlineWidth = 0f
             }.onFailure { toast("تعذر فتح آخر نتيجة: ${it.localizedMessage ?: "خطأ"}") }
         }
 
+        addAction("انجذاب العدسة إلى وسط الشاشة", "إعادة وضع العدسة في مركز الشاشة وحفظ موضعها") {
+            centerFloatingBubble()
+        }
+
         val close = TextView(this).apply {
             text = "إغلاق"
             textSize = 13f
@@ -5533,6 +5959,9 @@ val outlineWidth = 0f
             view.text = "${MangaFoxRuntime.progressPercent.coerceIn(0, 99)}%"
             view.textSize = 13f
             view.contentDescription = "Manga Fox: ترجمة الصور ${MangaFoxRuntime.progressPercent}%"
+        } else if (MangaFoxRuntime.pendingEdits) {
+            view.text = "✎"
+            view.contentDescription = "توجد تعديلات غير مطبقة في Manga FOX"
         }
         bubble = view
         bubbleParams = params
@@ -5841,31 +6270,363 @@ object MangaFoxQualityGuard {
     }
 }
 
-/** Per-page JSON snapshots for undo/redo. Snapshots are capped to avoid unlimited storage growth. */
+/** Chronological, per-operation layer history shared by every page in the active chapter. */
 class MangaFoxLayerHistory(private val context: Context) {
-    private fun folder(page: Int, kind: String) = File(context.filesDir, "mfox_phantom_history/page_${page + 1}/$kind").apply { mkdirs() }
+    private fun root() = File(context.filesDir, "mfox_phantom_history/global").apply { mkdirs() }
+    private fun stack(name: String) = File(root(), name).apply { mkdirs() }
+
     @Synchronized fun push(page: Int, current: File) {
-        if (page < 0 || !current.isFile || current.length() > 4L * 1024L * 1024L) return
+        if (page < 0 || !current.isFile || current.length() > 8L * 1024L * 1024L) return
         runCatching {
-            val target = File(folder(page, "undo"), "${System.currentTimeMillis()}.json")
-            current.copyTo(target, overwrite = true)
-            folder(page, "redo").listFiles()?.forEach { it.delete() }
-            folder(page, "undo").listFiles()?.sortedByDescending { it.name }?.drop(10)?.forEach { it.delete() }
+            val payload = JSONObject().put("page", page).put("snapshot", current.readText(Charsets.UTF_8))
+            val target = File(stack("undo"), "${System.currentTimeMillis().toString().padStart(13, '0')}_${System.nanoTime()}.json")
+            writeAtomically(target, payload.toString())
+            stack("redo").listFiles()?.forEach { it.delete() }
+            trim(stack("undo"), 40)
         }
     }
-    @Synchronized fun undo(page: Int, current: File): Boolean = move(page, current, "undo", "redo")
-    @Synchronized fun redo(page: Int, current: File): Boolean = move(page, current, "redo", "undo")
-    private fun move(page: Int, current: File, from: String, to: String): Boolean = runCatching {
-        val candidates = folder(page, from).listFiles()?.filter { it.isFile }?.sortedByDescending { it.name }.orEmpty()
-        val snapshot = candidates.firstOrNull() ?: return false
-        if (current.isFile) current.copyTo(File(folder(page, to), "${System.currentTimeMillis()}.json"), overwrite = true)
-        val text = snapshot.readText(Charsets.UTF_8)
-        val temp = File(current.parentFile, current.name + ".history.tmp")
-        temp.writeText(text, Charsets.UTF_8)
-        if (!temp.renameTo(current)) { temp.copyTo(current, overwrite = true); temp.delete() }
-        snapshot.delete()
+
+    @Synchronized fun undoLatest(layerPaths: List<String>): Boolean = moveLatest(layerPaths, "undo", "redo")
+    @Synchronized fun redoLatest(layerPaths: List<String>): Boolean = moveLatest(layerPaths, "redo", "undo")
+
+    @Synchronized fun reset() {
+        runCatching { root().deleteRecursively() }
+        root().mkdirs()
+    }
+
+    private fun moveLatest(layerPaths: List<String>, from: String, to: String): Boolean = runCatching {
+        val source = stack(from).listFiles()?.filter { it.isFile && it.extension == "json" }
+            ?.maxByOrNull { it.name } ?: return false
+        val payload = JSONObject(source.readText(Charsets.UTF_8))
+        val page = payload.optInt("page", -1)
+        val current = layerPaths.getOrNull(page)?.takeIf { it.isNotBlank() }?.let(::File)
+            ?: return false
+        if (!current.isFile) return false
+        val currentSnapshot = JSONObject().put("page", page).put("snapshot", current.readText(Charsets.UTF_8))
+        val destination = File(stack(to), "${System.currentTimeMillis().toString().padStart(13, '0')}_${System.nanoTime()}.json")
+        writeAtomically(destination, currentSnapshot.toString())
+        val desired = payload.optString("snapshot", "[]")
+        writeTextAtomically(current, desired)
+        source.delete()
+        trim(stack(to), 40)
         true
     }.getOrDefault(false)
+
+    private fun trim(directory: File, keep: Int) {
+        directory.listFiles()?.filter { it.isFile }?.sortedByDescending { it.name }?.drop(keep)?.forEach { it.delete() }
+    }
+
+    private fun writeAtomically(target: File, value: String) {
+        val temp = File(target.parentFile, target.name + ".tmp")
+        temp.writeText(value, Charsets.UTF_8)
+        if (!temp.renameTo(target)) { temp.copyTo(target, overwrite = true); temp.delete() }
+    }
+
+    private fun writeTextAtomically(target: File, value: String) {
+        val temp = File(target.parentFile, target.name + ".history.tmp")
+        temp.writeText(value, Charsets.UTF_8)
+        if (!temp.renameTo(target)) { temp.copyTo(target, overwrite = true); temp.delete() }
+    }
+}
+
+/** Named snapshots of every page's editable translation layers for the current chapter. */
+object MangaFoxEditSetStore {
+    data class Entry(val name: String, val fileName: String)
+    private fun folder(context: Context) = File(context.filesDir, "mfox_named_edit_sets").apply { mkdirs() }
+    private fun catalog(context: Context) = File(folder(context), "catalog.json")
+
+    @Synchronized fun save(context: Context, name: String, chapterTitle: String, scopeKey: String, layerPaths: List<String>): Boolean = runCatching {
+        require(name.isNotBlank() && layerPaths.isNotEmpty())
+        val pages = JSONArray()
+        layerPaths.forEach { path ->
+            val file = path.takeIf { it.isNotBlank() }?.let(::File)
+            pages.put(if (file?.isFile == true) file.readText(Charsets.UTF_8) else "[]")
+        }
+        val fileName = "set_${System.currentTimeMillis()}_${System.nanoTime()}_${kotlin.math.abs(name.hashCode())}.json"
+        val target = File(folder(context), fileName)
+        val snapshot = JSONObject()
+            .put("name", name.trim())
+            .put("chapterTitle", chapterTitle)
+            .put("scopeKey", scopeKey)
+            .put("createdAt", System.currentTimeMillis())
+            .put("pages", pages)
+        writeAtomically(target, snapshot.toString())
+        val old = readCatalog(context)
+        old.put(JSONObject().put("name", name.trim()).put("file", fileName)
+            .put("chapterTitle", chapterTitle).put("scopeKey", scopeKey).put("createdAt", System.currentTimeMillis()))
+        writeAtomically(catalog(context), old.toString())
+        true
+    }.getOrDefault(false)
+
+    @Synchronized fun list(context: Context, chapterTitle: String, scopeKey: String): List<Entry> {
+        val root = readCatalog(context)
+        val output = ArrayList<Entry>()
+        for (index in 0 until root.length()) {
+            val item = root.optJSONObject(index) ?: continue
+            if (item.optString("chapterTitle") != chapterTitle || item.optString("scopeKey") != scopeKey) continue
+            val fileName = item.optString("file")
+            if (fileName.isNotBlank() && File(folder(context), fileName).isFile) {
+                output.add(Entry(item.optString("name"), fileName))
+            }
+        }
+        return output.sortedByDescending { entry ->
+            runCatching { JSONObject(File(folder(context), entry.fileName).readText()).optLong("createdAt") }.getOrDefault(0L)
+        }
+    }
+
+    @Synchronized fun restore(
+        context: Context,
+        fileName: String,
+        chapterTitle: String,
+        scopeKey: String,
+        layerPaths: List<String>,
+        history: MangaFoxLayerHistory
+    ): Boolean = runCatching {
+        val safeName = File(fileName).name
+        val file = File(folder(context), safeName)
+        require(file.isFile)
+        val snapshot = JSONObject(file.readText(Charsets.UTF_8))
+        require(snapshot.optString("chapterTitle") == chapterTitle && snapshot.optString("scopeKey") == scopeKey)
+        val pages = snapshot.optJSONArray("pages") ?: error("ملف المجموعة لا يحتوي صفحات")
+        require(pages.length() == layerPaths.size && layerPaths.isNotEmpty())
+        val writes = layerPaths.mapIndexed { index, path ->
+            require(path.isNotBlank())
+            val target = File(path)
+            val content = pages.optString(index, "[]")
+            JSONArray(content)
+            target to content
+        }
+        writes.forEachIndexed { index, pair ->
+            val target = pair.first
+            target.parentFile?.mkdirs()
+            val temp = File(target.parentFile, target.name + ".named.tmp")
+            temp.writeText(pair.second, Charsets.UTF_8)
+            JSONArray(pair.second)
+            history.push(index, target)
+            if (!temp.renameTo(target)) { temp.copyTo(target, overwrite = true); temp.delete() }
+        }
+        true
+    }.getOrDefault(false)
+
+    private fun readCatalog(context: Context): JSONArray = runCatching {
+        val file = catalog(context)
+        if (file.isFile) JSONArray(file.readText(Charsets.UTF_8)) else JSONArray()
+    }.getOrDefault(JSONArray())
+
+    private fun writeAtomically(target: File, value: String) {
+        val temp = File(target.parentFile, target.name + ".tmp")
+        temp.writeText(value, Charsets.UTF_8)
+        if (!temp.renameTo(target)) { temp.copyTo(target, overwrite = true); temp.delete() }
+    }
+}
+
+/** Persistent archive: independent chapter folders grouped by manga/manhwa title. */
+object MangaFoxChapterArchive {
+    data class ChapterInfo(
+        val id: String,
+        val workName: String,
+        val chapterName: String,
+        val title: String,
+        val pageCount: Int,
+        val captureOnly: Boolean,
+        val quality: String,
+        val createdAt: Long
+    )
+
+    private fun base(context: Context) = File(context.filesDir, "mfox_library").apply { mkdirs() }
+    private fun catalogFile(context: Context) = File(base(context), "catalog.json")
+    private fun readCatalog(context: Context): JSONObject = runCatching {
+        val file = catalogFile(context)
+        if (file.isFile) JSONObject(file.readText(Charsets.UTF_8)) else JSONObject()
+    }.getOrDefault(JSONObject())
+
+    @Synchronized fun list(context: Context): List<ChapterInfo> {
+        val array = readCatalog(context).optJSONArray("chapters") ?: JSONArray()
+        val result = ArrayList<ChapterInfo>()
+        for (index in 0 until array.length()) {
+            val item = array.optJSONObject(index) ?: continue
+            val id = item.optString("id")
+            val dir = File(base(context), File(item.optString("folder")).name)
+            val manifest = File(dir, "chapter.json")
+            if (id.isBlank() || !manifest.isFile) continue
+            val pages = runCatching { JSONObject(manifest.readText(Charsets.UTF_8)).optJSONArray("results")?.length() ?: 0 }.getOrDefault(0)
+            result.add(ChapterInfo(
+                id, item.optString("workName", "عمل غير مصنف"),
+                item.optString("chapterName", "فصل"), item.optString("title", "فصل"),
+                pages, item.optBoolean("captureOnly", false), item.optString("quality", ""),
+                item.optLong("createdAt", 0L)
+            ))
+        }
+        return result.sortedByDescending { it.createdAt }
+    }
+
+    @Synchronized fun save(
+        context: Context,
+        workName: String,
+        chapterName: String,
+        title: String,
+        sources: List<String>,
+        results: List<String>,
+        layers: List<String>,
+        captureOnly: Boolean,
+        quality: String,
+        preserveExistingImages: Boolean = false
+    ): String? {
+        if (results.isEmpty()) return null
+        return runCatching {
+            val safeWork = workName.trim().ifBlank { "عمل غير مصنف" }
+            val safeChapter = chapterName.trim().ifBlank { title.ifBlank { "فصل ${System.currentTimeMillis()}" } }
+            val catalog = readCatalog(context)
+            val existing = catalog.optJSONArray("chapters") ?: JSONArray()
+            var existingId = MangaFoxRuntime.activeArchiveId.takeIf { active ->
+                (0 until existing.length()).any { existing.optJSONObject(it)?.optString("id") == active }
+            }
+            if (existingId.isNullOrBlank()) {
+                for (index in 0 until existing.length()) {
+                    val item = existing.optJSONObject(index) ?: continue
+                    if (item.optString("workName") == safeWork && item.optString("chapterName") == safeChapter) {
+                        existingId = item.optString("id")
+                        break
+                    }
+                }
+            }
+            val chapterId = existingId?.takeIf { it.isNotBlank() }
+                ?: "chapter_${System.currentTimeMillis()}_${System.nanoTime()}"
+            val previousEntry = (0 until existing.length()).mapNotNull { existing.optJSONObject(it) }
+                .firstOrNull { it.optString("id") == chapterId }
+            val folderName = previousEntry?.optString("folder")?.takeIf { it.isNotBlank() }
+                ?: "chapter_$chapterId"
+            val folder = File(base(context), File(folderName).name).apply { mkdirs() }
+            fun copyList(paths: List<String>, prefix: String): JSONArray {
+                val array = JSONArray()
+                paths.forEachIndexed { index, path ->
+                    val source = path.takeIf { it.isNotBlank() }?.let(::File)
+                    if (source == null || !source.isFile) {
+                        array.put("")
+                    } else {
+                        val isInsideFolder = runCatching { source.canonicalFile.parentFile == folder.canonicalFile }.getOrDefault(false)
+                        val ext = source.extension.takeIf { it.isNotBlank() } ?: if (prefix == "layer") "json" else "bin"
+                        val destination = if (isInsideFolder) source else
+                            File(folder, "${prefix}_${(index + 1).toString().padStart(4, '0')}.$ext")
+                        val keepExistingImage = preserveExistingImages && prefix != "layer" &&
+                            destination.isFile && destination.length() == source.length() && !isInsideFolder
+                        if (source.absolutePath != destination.absolutePath && !keepExistingImage) {
+                            source.copyTo(destination, overwrite = true)
+                        }
+                        array.put(destination.name)
+                    }
+                }
+                return array
+            }
+            val sourceArray = copyList(sources, "source")
+            val resultArray = copyList(results, "result")
+            val layerArray = copyList(layers, "layer")
+            val updatedAt = System.currentTimeMillis()
+            val createdAt = previousEntry?.optLong("createdAt", updatedAt) ?: updatedAt
+            val manifest = JSONObject()
+                .put("id", chapterId)
+                .put("workName", safeWork)
+                .put("chapterName", safeChapter)
+                .put("title", title.ifBlank { safeChapter })
+                .put("sources", sourceArray)
+                .put("results", resultArray)
+                .put("layers", layerArray)
+                .put("captureOnly", captureOnly)
+                .put("quality", quality)
+                .put("pendingEdits", MangaFoxRuntime.pendingEdits)
+                .put("createdAt", createdAt)
+                .put("updatedAt", updatedAt)
+            writeAtomically(File(folder, "chapter.json"), manifest.toString())
+            val retainedNames = HashSet<String>().apply {
+                add("chapter.json")
+                listOf(sourceArray, resultArray, layerArray).forEach { array ->
+                    for (index in 0 until array.length()) {
+                        val name = array.optString(index)
+                        if (name.isNotBlank()) add(File(name).name)
+                    }
+                }
+            }
+            folder.listFiles()?.filter { it.isFile && it.name !in retainedNames }?.forEach { it.delete() }
+            val newEntry = JSONObject()
+                .put("id", chapterId)
+                .put("workName", safeWork)
+                .put("chapterName", safeChapter)
+                .put("title", title.ifBlank { safeChapter })
+                .put("folder", folderName)
+                .put("captureOnly", captureOnly)
+                .put("quality", quality)
+                .put("createdAt", createdAt)
+                .put("updatedAt", updatedAt)
+            val merged = JSONArray()
+            for (index in 0 until existing.length()) {
+                val item = existing.optJSONObject(index) ?: continue
+                if (item.optString("id") != chapterId) merged.put(item)
+            }
+            merged.put(newEntry)
+            writeAtomically(catalogFile(context), JSONObject().put("version", 1).put("chapters", merged).toString())
+            MangaFoxRuntime.activeArchiveId = chapterId
+            MangaFoxRuntime.activeWorkName = safeWork
+            MangaFoxRuntime.activeChapterName = safeChapter
+            chapterId
+        }.getOrNull()
+    }
+
+    @Synchronized fun open(context: Context, id: String): Boolean = runCatching {
+        val array = readCatalog(context).optJSONArray("chapters") ?: return false
+        val item = (0 until array.length()).mapNotNull { array.optJSONObject(it) }
+            .firstOrNull { it.optString("id") == id } ?: return false
+        val folder = File(base(context), File(item.optString("folder")).name)
+        val manifestFile = File(folder, "chapter.json")
+        val manifest = JSONObject(manifestFile.readText(Charsets.UTF_8))
+        fun files(key: String): List<String> {
+            val values = manifest.optJSONArray(key) ?: JSONArray()
+            return (0 until values.length()).map { index ->
+                val relative = values.optString(index, "")
+                if (relative.isBlank()) "" else File(folder, File(relative).name).absolutePath
+            }
+        }
+        val results = files("results")
+        require(results.isNotEmpty() && results.all { it.isNotBlank() && File(it).isFile })
+        val sources = files("sources")
+        val layers = files("layers")
+        MangaFoxRuntime.resultPages = results
+        MangaFoxRuntime.sourcePages = results.indices.map { sources.getOrNull(it).orEmpty() }
+        MangaFoxRuntime.translationLayerFiles = results.indices.map { layers.getOrNull(it).orEmpty() }
+        MangaFoxRuntime.resultTitle = manifest.optString("title", item.optString("chapterName"))
+        MangaFoxRuntime.qualitySummary = manifest.optString("quality", "")
+        MangaFoxRuntime.captureOnlyResult = manifest.optBoolean("captureOnly", false)
+        MangaFoxRuntime.activeArchiveId = id
+        MangaFoxRuntime.activeWorkName = item.optString("workName", "عمل غير مصنف")
+        MangaFoxRuntime.activeChapterName = item.optString("chapterName", "فصل")
+        MangaFoxRuntime.pendingEdits = manifest.optBoolean("pendingEdits", false)
+        MangaFoxLayerHistory(context).reset()
+        MangaFoxRuntime.persist(context)
+        true
+    }.getOrDefault(false)
+
+    @Synchronized fun delete(context: Context, id: String) {
+        val catalog = readCatalog(context)
+        val existing = catalog.optJSONArray("chapters") ?: JSONArray()
+        val updated = JSONArray()
+        for (index in 0 until existing.length()) {
+            val item = existing.optJSONObject(index) ?: continue
+            if (item.optString("id") == id) {
+                val folder = File(base(context), File(item.optString("folder")).name)
+                val safeRoot = base(context).canonicalFile
+                if (runCatching { folder.canonicalFile.parentFile == safeRoot }.getOrDefault(false)) {
+                    folder.deleteRecursively()
+                }
+            } else updated.put(item)
+        }
+        writeAtomically(catalogFile(context), JSONObject().put("version", 1).put("chapters", updated).toString())
+    }
+
+    private fun writeAtomically(target: File, value: String) {
+        target.parentFile?.mkdirs()
+        val temp = File(target.parentFile, target.name + ".tmp")
+        temp.writeText(value, Charsets.UTF_8)
+        if (!temp.renameTo(target)) { temp.copyTo(target, overwrite = true); temp.delete() }
+    }
 }
 
 /** Safe ZIP backup of source/result/layer files plus local terminology and character notes. */
@@ -5979,10 +6740,23 @@ object MangaFoxProjectArchive {
             MangaFoxRuntime.resultPages = newResults
             MangaFoxRuntime.translationLayerFiles = newLayers
             MangaFoxRuntime.resultTitle = root.optString("title", "مشروع Manga FOX مستورد")
+            MangaFoxRuntime.activeWorkName = "مشاريع مستوردة"
+            MangaFoxRuntime.activeChapterName = MangaFoxRuntime.resultTitle
+            MangaFoxRuntime.activeArchiveId = ""
+            MangaFoxRuntime.pendingEdits = false
+            MangaFoxRuntime.captureOnlyResult = false
             MangaFoxRuntime.qualitySummary = root.optString("quality", "تم استيراد المشروع")
             File(temporary, "knowledge.json").takeIf { it.isFile }?.let { knowledge ->
                 runCatching { MangaFoxKnowledgeStore(context).importJson(knowledge.readText(Charsets.UTF_8)) }
             }
+            // Imported projects enter the same permanent work/chapter archive immediately;
+            // their edit-set scope therefore remains stable across the next app launch.
+            MangaFoxChapterArchive.save(
+                context, MangaFoxRuntime.activeWorkName, MangaFoxRuntime.activeChapterName,
+                MangaFoxRuntime.resultTitle, MangaFoxRuntime.sourcePages, MangaFoxRuntime.resultPages,
+                MangaFoxRuntime.translationLayerFiles, MangaFoxRuntime.captureOnlyResult,
+                MangaFoxRuntime.qualitySummary
+            )
             MangaFoxRuntime.persist(context)
             importCommitted = true
         } finally {
@@ -6498,6 +7272,10 @@ object MangaFoxRuntime {
                 .put("results", org.json.JSONArray(resultPages))
                 .put("layers", org.json.JSONArray(translationLayerFiles))
                 .put("captureOnly", captureOnlyResult)
+                .put("workName", activeWorkName)
+                .put("chapterName", activeChapterName)
+                .put("activeArchiveId", activeArchiveId)
+                .put("pendingEdits", pendingEdits)
             val target = File(context.filesDir, SESSION_MANIFEST)
             val temp = File(context.filesDir, "$SESSION_MANIFEST.tmp")
             temp.writeText(root.toString(), Charsets.UTF_8)
@@ -6548,10 +7326,29 @@ object MangaFoxRuntime {
             resultTitle = root.optString("title", "الفصل المترجم")
             qualitySummary = root.optString("quality", qualitySummary)
             captureOnlyResult = root.optBoolean("captureOnly", false)
-            if (resultPages.none { File(it).isFile }) {
+            activeWorkName = root.optString("workName", "عمل غير مصنف")
+            activeChapterName = root.optString("chapterName", resultTitle)
+            activeArchiveId = root.optString("activeArchiveId", "")
+            pendingEdits = root.optBoolean("pendingEdits", false)
+            val sessionResultsValid = resultPages.isNotEmpty() &&
+                resultPages.all { it.isNotBlank() && File(it).isFile }
+            val sessionSourcesValid = sourcePages.size == resultPages.size &&
+                sourcePages.all { it.isBlank() || File(it).isFile }
+            val sessionLayersValid = translationLayerFiles.size == resultPages.size &&
+                translationLayerFiles.all { it.isBlank() || File(it).isFile }
+            if (!sessionResultsValid || !sessionSourcesValid || !sessionLayersValid) {
+                val recoverArchiveId = activeArchiveId
                 sourcePages = emptyList()
                 resultPages = emptyList()
                 translationLayerFiles = emptyList()
+                activeArchiveId = ""
+                pendingEdits = false
+                // The working copies may have been cleaned after a later translation.
+                // Reopen the permanent chapter copy before declaring the session empty.
+                if (recoverArchiveId.isNotBlank() && MangaFoxChapterArchive.open(context, recoverArchiveId)) {
+                    return
+                }
+                persist(context)
             }
         }
     }
@@ -6564,7 +7361,21 @@ object MangaFoxRuntime {
         resultPages = resultPages.toMutableList().also { it.removeAt(index) }
         if (index in sourcePages.indices) sourcePages = sourcePages.toMutableList().also { it.removeAt(index) }
         if (index in translationLayerFiles.indices) translationLayerFiles = translationLayerFiles.toMutableList().also { it.removeAt(index) }
-        removed.forEach { path -> runCatching { File(path).delete() } }
+        removed.forEach { path -> runCatching { if (path.isNotBlank()) File(path).delete() } }
+        MangaFoxLayerHistory(context).reset()
+        if (activeArchiveId.isNotBlank()) {
+            if (resultPages.isNotEmpty()) {
+                MangaFoxChapterArchive.save(
+                    context, activeWorkName, activeChapterName, resultTitle,
+                    sourcePages, resultPages, translationLayerFiles, captureOnlyResult, qualitySummary
+                )
+            } else {
+                MangaFoxChapterArchive.delete(context, activeArchiveId)
+                activeArchiveId = ""
+                pendingEdits = false
+                captureOnlyResult = false
+            }
+        }
         persist(context)
     }
 
@@ -6584,4 +7395,8 @@ object MangaFoxRuntime {
     // Per-page OCR/translation layers are stored separately from the rendered JPG.
     @Volatile var translationLayerFiles: List<String> = emptyList()
     @Volatile var captureOnlyResult: Boolean = false
+    @Volatile var activeWorkName: String = "عمل غير مصنف"
+    @Volatile var activeChapterName: String = "الفصل المترجم"
+    @Volatile var activeArchiveId: String = ""
+    @Volatile var pendingEdits: Boolean = false
 }
