@@ -17,7 +17,25 @@ object MangaFoxLocalLlm {
     private const val MODEL_URL = "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf?download=true"
     private val busy = AtomicBoolean(false)
     @Volatile private var loadedPath: String? = null
-    init { System.loadLibrary("mangallm") }
+    @Volatile private var nativeLibraryReady = false
+    @Volatile private var nativeLibraryError: String? = null
+
+    // Load the optional native engine only when the user explicitly loads Qwen.
+    // Opening Settings must never crash just because the .so is absent or incompatible.
+    @Synchronized private fun ensureNativeLibrary(): Boolean {
+        if (nativeLibraryReady) return true
+        return try {
+            System.loadLibrary("mangallm")
+            nativeLibraryReady = true
+            nativeLibraryError = null
+            true
+        } catch (error: Throwable) {
+            nativeLibraryError = error.javaClass.simpleName + ": " + (error.message ?: "native library unavailable")
+            false
+        }
+    }
+
+    fun nativeStatus(): String = nativeLibraryError ?: if (nativeLibraryReady) "جاهز" else "لم يتم تحميل المحرك بعد"
 
     private external fun nativeLoadModel(path: String, threads: Int, contextSize: Int): Boolean
     private external fun nativeGenerate(prompt: String, maxTokens: Int): String
@@ -76,7 +94,8 @@ object MangaFoxLocalLlm {
         val file = modelFile(context)
         if (!file.isFile || file.length() < 900_000_000L) return false
         if (loadedPath == file.absolutePath) return true
-        nativeRelease()
+        if (!ensureNativeLibrary()) return false
+        if (nativeLibraryReady) nativeRelease()
         val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
         val ok = nativeLoadModel(file.absolutePath, threads, 4096)
         loadedPath = if (ok) file.absolutePath else null
@@ -137,5 +156,8 @@ ${characterText.ifBlank { "لا توجد بيانات" }}
         } finally { busy.set(false) }
     }
 
-    @Synchronized fun release() { nativeRelease(); loadedPath = null }
+    @Synchronized fun release() {
+        if (nativeLibraryReady) runCatching { nativeRelease() }
+        loadedPath = null
+    }
 }
