@@ -1,8 +1,11 @@
 package com.manga.fox
 
 import android.content.Context
-import android.app.ActivityManager
 import android.os.StatFs
+import dev.ffmpegkit.llama.Llama
+import dev.ffmpegkit.llama.LlamaConfig
+import dev.ffmpegkit.llama.LlamaModel
+import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -12,186 +15,275 @@ import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 
-/** @N5CR4 — Qwen GGUF local inference bridge. */
+/** @N5CR4 — Qwen GGUF local inference bridge using the prebuilt llama-android AAR. */
 object MangaFoxLocalLlm {
     private const val MODEL_FILE = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
     private const val MODEL_URL = "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf?download=true"
+    private const val MIN_MODEL_BYTES = 900_000_000L
     private val busy = AtomicBoolean(false)
+
     @Volatile private var loadedPath: String? = null
-    @Volatile private var nativeLibraryReady = false
-    @Volatile private var nativeLibraryError: String? = null
+    @Volatile private var loadedModel: LlamaModel? = null
     @Volatile private var lastLoadFailure: String = "لم تبدأ محاولة تحميل النموذج بعد"
 
-    // Load the optional native engine only when the user explicitly loads Qwen.
-    // Opening Settings must never crash just because the .so is absent or incompatible.
-    @Synchronized private fun ensureNativeLibrary(): Boolean {
-        if (nativeLibraryReady) return true
-        return try {
-            System.loadLibrary("mangallm")
-            nativeLibraryReady = true
-            nativeLibraryError = null
-            true
-        } catch (error: Throwable) {
-            nativeLibraryError = error.javaClass.simpleName + ": " + (error.message ?: "native library unavailable")
-            false
-        }
+    fun lastLoadError(): String = lastLoadFailure
+    fun nativeStatus(): String = when {
+        loadedModel != null -> "محرك llama.cpp جاهز · النموذج محمّل"
+        else -> "مكتبة llama-android مضافة؛ النموذج غير محمّل"
     }
 
-    fun nativeStatus(): String = nativeLibraryError ?: if (nativeLibraryReady) "جاهز" else "لم يتم تحميل المحرك بعد"
+    fun modelFile(context: Context): File = File(context.filesDir, "ai_models/$MODEL_FILE")
 
-    private external fun nativeLoadModel(path: String, threads: Int, contextSize: Int): Boolean
-    private external fun nativeGenerate(prompt: String, maxTokens: Int): String
-    private external fun nativeRelease()
-    private external fun nativeLastError(): String
+    fun isModelDownloaded(context: Context): Boolean {
+        val file = modelFile(context)
+        if (!file.isFile || file.length() < MIN_MODEL_BYTES) return false
+        return runCatching {
+            RandomAccessFile(file, "r").use { input ->
+                val magic = ByteArray(4)
+                input.readFully(magic)
+                magic.contentEquals(byteArrayOf(0x47, 0x47, 0x55, 0x46))
+            }
+        }.getOrDefault(false)
+    }
 
-    fun lastLoadError(): String = lastLoadFailure
+    fun isLoaded(): Boolean = loadedModel != null && loadedPath != null
 
-    fun modelFile(context: Context) = File(context.filesDir, "ai_models/$MODEL_FILE")
-    fun isModelDownloaded(context: Context) = modelFile(context).let { it.isFile && it.length() > 900_000_000L }
-    fun isLoaded() = loadedPath != null
-
+    /** Resumable download with GGUF header and final-size validation. */
     fun downloadModel(context: Context, onProgress: (Long, Long) -> Unit): File {
         val target = modelFile(context)
-        target.parentFile?.mkdirs()
-        val partial = File(target.parentFile, target.name + ".part")
-        if (StatFs(target.parentFile!!.absolutePath).availableBytes < 1_200_000_000L)
+        val parent = target.parentFile ?: throw IllegalStateException("تعذر تحديد مجلد النموذج")
+        if (!parent.exists() && !parent.mkdirs()) throw IllegalStateException("تعذر إنشاء مجلد النموذج")
+        val partial = File(parent, target.name + ".part")
+        if (StatFs(parent.absolutePath).availableBytes < 1_200_000_000L) {
             throw IllegalStateException("المساحة الحرة غير كافية؛ وفر 1.2GB على الأقل")
-        var offset = if (partial.exists()) partial.length() else 0L
-        val connection = (URL(MODEL_URL).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 25000; readTimeout = 60000; instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "MangaFox-Android/3.1")
-            if (offset > 0) setRequestProperty("Range", "bytes=$offset-")
         }
-        var expectedTotal = -1L
+
+        var offset = if (partial.isFile) partial.length() else 0L
+        val connection = (URL(MODEL_URL).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 25_000
+            readTimeout = 60_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "MangaFox-Android/3.1")
+            if (offset > 0L) setRequestProperty("Range", "bytes=$offset-")
+        }
+
         try {
-            val status = connection.responseCode
-            if (offset > 0 && status != HttpURLConnection.HTTP_PARTIAL) { partial.delete(); offset = 0L }
+            var status = connection.responseCode
+            if (offset > 0L && status != HttpURLConnection.HTTP_PARTIAL) {
+                partial.delete()
+                offset = 0L
+                connection.disconnect()
+                return downloadModel(context, onProgress)
+            }
             if (status !in 200..299) throw IllegalStateException("فشل تنزيل النموذج: HTTP $status")
-            val length = connection.getHeaderFieldLong("Content-Length", -1L)
-            val total = if (length > 0) length + offset else -1L
-            expectedTotal = total
+
+            val contentLength = connection.getHeaderFieldLong("Content-Length", -1L)
+            val contentRange = connection.getHeaderField("Content-Range")
+            val rangeTotal = contentRange?.substringAfterLast('/')?.toLongOrNull() ?: -1L
+            val expectedTotal = if (rangeTotal > 0L) rangeTotal else if (contentLength > 0L) contentLength + offset else -1L
+
             connection.inputStream.use { input ->
                 RandomAccessFile(partial, "rw").use { output ->
-                    output.seek(offset); val buffer = ByteArray(1024 * 1024); var downloaded = offset; var lastReport = 0L
+                    if (offset == 0L) output.setLength(0L)
+                    output.seek(offset)
+                    val buffer = ByteArray(1024 * 1024)
+                    var downloaded = offset
+                    var lastReport = offset
                     while (true) {
-                        val n = input.read(buffer); if (n < 0) break
-                        output.write(buffer, 0, n); downloaded += n
-                        if (downloaded - lastReport >= 5L * 1024L * 1024L) { lastReport = downloaded; onProgress(downloaded, total) }
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        output.write(buffer, 0, count)
+                        downloaded += count
+                        if (downloaded - lastReport >= 5L * 1024L * 1024L) {
+                            lastReport = downloaded
+                            onProgress(downloaded, expectedTotal)
+                        }
                     }
-                    onProgress(downloaded, total)
+                    onProgress(downloaded, expectedTotal)
                     output.fd.sync()
                 }
             }
-            if (partial.length() < 900_000_000L) throw IllegalStateException("ملف النموذج غير مكتمل (${partial.length()} bytes)")
-            if (expectedTotal > 0 && partial.length() != expectedTotal)
-                throw IllegalStateException("حجم النموذج لا يطابق الحجم المتوقع؛ أعد التنزيل")
-            val header = ByteArray(4)
-            RandomAccessFile(partial, "r").use { it.readFully(header) }
-            if (!header.contentEquals(byteArrayOf(0x47, 0x47, 0x55, 0x46)))
-                throw IllegalStateException("الملف المستلم ليس GGUF صالحاً")
-            if (target.exists()) target.delete()
+
+            if (partial.length() < MIN_MODEL_BYTES) {
+                throw IllegalStateException("ملف النموذج غير مكتمل (${partial.length()} bytes)")
+            }
+            if (expectedTotal > 0L && partial.length() != expectedTotal) {
+                throw IllegalStateException("حجم النموذج لا يطابق الحجم المتوقع؛ أعد استكمال التنزيل")
+            }
+            RandomAccessFile(partial, "r").use { input ->
+                val header = ByteArray(4)
+                input.readFully(header)
+                if (!header.contentEquals(byteArrayOf(0x47, 0x47, 0x55, 0x46))) {
+                    throw IllegalStateException("الملف المستلم ليس GGUF صالحاً")
+                }
+            }
+            if (target.exists() && !target.delete()) throw IllegalStateException("تعذر استبدال ملف النموذج القديم")
             if (!partial.renameTo(target)) throw IllegalStateException("تعذر تثبيت ملف النموذج")
             return target
-        } finally { connection.disconnect() }
+        } finally {
+            connection.disconnect()
+        }
     }
 
-    @Synchronized fun load(context: Context): Boolean {
+    /** Loads the local GGUF model through the AAR; caller should use a worker thread. */
+    @Synchronized
+    fun load(context: Context): Boolean {
         val file = modelFile(context)
         if (!file.isFile) {
-            lastLoadFailure = "ملف النموذج غير موجود في: ${file.absolutePath}"
+            lastLoadFailure = "ملف النموذج غير موجود: ${file.absolutePath}"
             return false
         }
-        if (file.length() < 900_000_000L) {
-            lastLoadFailure = "حجم ملف النموذج غير مكتمل: ${file.length()} bytes"
+        if (file.length() < MIN_MODEL_BYTES || !isModelDownloaded(context)) {
+            lastLoadFailure = "ملف GGUF غير مكتمل أو تالف؛ الحجم الحالي ${file.length()} bytes"
             return false
         }
-        if (loadedPath == file.absolutePath) {
+        if (loadedPath == file.absolutePath && loadedModel != null) {
             lastLoadFailure = "النموذج محمّل مسبقاً"
             return true
         }
-        if (!ensureNativeLibrary()) {
-            lastLoadFailure = "تعذر تحميل مكتبة mangallm: ${nativeLibraryError ?: "سبب غير معروف"}"
-            return false
-        }
+
         return try {
-            if (nativeLibraryReady) nativeRelease()
-            val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
-            // A 2K context substantially lowers KV-cache allocation on mid-range phones.
-            val ok = nativeLoadModel(file.absolutePath, threads, 2048)
-            if (ok) {
-                loadedPath = file.absolutePath
-                lastLoadFailure = "تم تحميل Qwen بنجاح"
-                true
-            } else {
-                loadedPath = null
-                lastLoadFailure = runCatching { nativeLastError() }.getOrNull()
-                    ?.takeIf { it.isNotBlank() }
-                    ?: "رفض محرك llama.cpp تحميل النموذج؛ افحص سجل MangaFoxLLM في Logcat"
-                false
-            }
-        } catch (error: Throwable) {
+            loadedModel?.let { runCatching { Llama.releaseModel(it) } }
+            loadedModel = null
             loadedPath = null
-            lastLoadFailure = "${error.javaClass.simpleName}: ${error.message ?: "فشل غير معروف أثناء تحميل النموذج"}"
+
+            val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+            val model = runBlocking {
+                Llama.loadModel(
+                    modelPath = file.absolutePath,
+                    config = LlamaConfig(
+                        contextSize = 2048,
+                        threads = threads,
+                        gpuLayers = 0,
+                        temperature = 0.25f,
+                        topP = 0.90f,
+                        topK = 40,
+                        seed = -1
+                    )
+                )
+            }
+            loadedModel = model
+            loadedPath = file.absolutePath
+            lastLoadFailure = "تم تحميل Qwen بنجاح عبر llama-android"
+            true
+        } catch (error: Throwable) {
+            loadedModel = null
+            loadedPath = null
+            val detail = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
+            lastLoadFailure = "فشل تحميل محرك Qwen: $detail"
             false
         }
     }
 
     data class Bubble(val id: Int, val language: String, val text: String)
 
-    fun translatePageContext(context: Context, blocks: List<Bubble>,
+    /** Synchronous facade retained so existing MainActivity call sites remain unchanged. */
+    @Synchronized
+    fun translatePageContext(
+        context: Context,
+        blocks: List<Bubble>,
         glossary: List<MangaFoxKnowledgeStore.GlossaryEntry>,
-        characters: List<MangaFoxKnowledgeStore.CharacterEntry>): Map<Int, String> {
+        characters: List<MangaFoxKnowledgeStore.CharacterEntry>
+    ): Map<Int, String> {
         require(blocks.isNotEmpty()) { "لا توجد فقاعات للترجمة" }
         check(busy.compareAndSet(false, true)) { "محرك الترجمة المحلي مشغول" }
         try {
-            check(load(context)) { "حمّل نموذج Qwen المحلي أولاً" }
-            val glossaryText = glossary.take(48).joinToString("\n") { "${it.source} = ${it.arabic} ${it.note}" }
-            val characterText = characters.take(24).joinToString("\n") { "${it.name} | ${it.voice} | ${it.notes}" }
-            val windows = ArrayList<List<Bubble>>(); var current = ArrayList<Bubble>(); var chars = 0
+            check(load(context)) { lastLoadFailure }
+            val model = loadedModel ?: throw IllegalStateException("لم يتم إنشاء جلسة Qwen")
+
+            val glossaryText = glossary.take(24).joinToString("\n") {
+                "${it.source.take(100)} = ${it.arabic.take(140)} ${it.note.take(100)}"
+            }
+            val characterText = characters.take(12).joinToString("\n") {
+                "${it.name.take(80)} | ${it.voice.take(100)} | ${it.notes.take(120)}"
+            }
+
+            // Keep each prompt safely below the 2K context window, including the system instructions.
+            val windows = ArrayList<List<Bubble>>()
+            var current = ArrayList<Bubble>()
+            var chars = 0
             for (bubble in blocks) {
                 val cost = bubble.text.length + 48
-                if (current.isNotEmpty() && (chars + cost > 3000 || current.size >= 24)) { windows.add(current); current = ArrayList(); chars = 0 }
-                current.add(bubble); chars += cost
+                if (current.isNotEmpty() && (chars + cost > 2100 || current.size >= 18)) {
+                    windows.add(current)
+                    current = ArrayList()
+                    chars = 0
+                }
+                current.add(bubble)
+                chars += cost
             }
             if (current.isNotEmpty()) windows.add(current)
+
             val result = LinkedHashMap<Int, String>()
-            windows.forEachIndexed { wi, window ->
-                val payload = JSONArray()
-                window.forEach { payload.put(JSONObject().put("id", it.id).put("language", it.language).put("text", it.text)) }
-                val system = """
-أنت مترجم مانجا ومانهوا محترف إلى العربية الفصحى. اقرأ جميع الفقاعات في المجموعة كسياق حواري واحد.
-- افهم المتحدث والمخاطَب والضمائر والنبرة واستمرار الجملة بين الفقاعات.
+            runBlocking {
+                windows.forEachIndexed { windowIndex, window ->
+                    val payload = JSONArray()
+                    window.forEach { bubble ->
+                        payload.put(
+                            JSONObject()
+                                .put("id", bubble.id)
+                                .put("language", bubble.language)
+                                .put("text", bubble.text)
+                        )
+                    }
+
+                    val systemPrompt = """
+أنت مترجم مانجا ومانهوا محترف إلى العربية الفصحى. افهم المشهد والحوار قبل ترجمة كل فقاعة.
+قواعد إلزامية:
+- اقرأ الفقاعات في المجموعة كسياق حواري واحد، واربط الضمائر والمتحدث والمخاطَب وتسلسل الأحداث.
 - أعد ترجمة مستقلة لكل id، ولا تدمج فقاعتين ولا تغيّر الترتيب.
-- ثبّت الأسماء والألقاب والمصطلحات وفق المعجم.
-- لا تخترع معلومات أو جنس شخصية لا يدل عليه النص، ولا تحذف نفياً أو شرطاً.
-- استخدم عربية طبيعية موجزة تناسب فقاعة المانجا، لا ترجمة حرفية متخشبة.
-- أخرج JSON فقط: {"translations":[{"id":0,"text":"..."}]} مع كل id مرة واحدة.
+- لا تترجم كلمة بكلمة؛ انقل المعنى المقصود بصياغة عربية طبيعية موجزة تناسب فقاعة المانجا.
+- حافظ على النفي والشرط والسخرية والغضب والتردد والتلميحات بحسب السياق.
+- ثبّت الأسماء والألقاب والمصطلحات وفق القاموس، ولا تخترع جنس الشخصية أو معلومات غير موجودة.
+- لا تضف شرحاً أو ملاحظات أو نصاً خارج JSON.
+- أخرج JSON فقط بالشكل: {"translations":[{"id":0,"text":"الترجمة"}]}، وكل id مرة واحدة.
+
 قاموس المصطلحات:
 ${glossaryText.ifBlank { "لا يوجد" }}
+
 الشخصيات:
 ${characterText.ifBlank { "لا توجد بيانات" }}
-                """.trimIndent()
-                val prompt = "<|im_start|>system\n$system<|im_end|>\n<|im_start|>user\n$payload<|im_end|>\n<|im_start|>assistant\n"
-                val generated = nativeGenerate(prompt, max(320, window.sumOf { it.text.length } / 2 + 220)).trim()
-                val jsonStart = generated.indexOf('{')
-                val jsonEnd = generated.lastIndexOf('}')
-                if (jsonStart < 0 || jsonEnd <= jsonStart)
-                    throw IllegalStateException("المجموعة ${wi + 1}: لم يُرجع النموذج JSON صالحاً")
-                val cleaned = generated.substring(jsonStart, jsonEnd + 1)
-                val rows = JSONObject(cleaned).optJSONArray("translations") ?: throw IllegalStateException("المجموعة ${wi + 1}: استجابة بلا translations")
-                for (i in 0 until rows.length()) {
-                    val row = rows.optJSONObject(i) ?: continue
-                    val id = row.optInt("id", -1); val value = row.optString("text").trim()
-                    if (id >= 0 && value.isNotBlank()) result[id] = value
+                    """.trimIndent()
+
+                    val maxTokens = max(320, (window.sumOf { it.text.length } / 2 + 220)).coerceAtMost(900)
+                    val generated = Llama.complete(
+                        model = model,
+                        prompt = payload.toString(),
+                        systemPrompt = systemPrompt,
+                        maxTokens = maxTokens
+                    ).text.trim()
+
+                    val jsonStart = generated.indexOf('{')
+                    val jsonEnd = generated.lastIndexOf('}')
+                    if (jsonStart < 0 || jsonEnd <= jsonStart) {
+                        throw IllegalStateException("المجموعة ${windowIndex + 1}: لم يُرجع النموذج JSON صالحاً")
+                    }
+                    val parsed = JSONObject(generated.substring(jsonStart, jsonEnd + 1))
+                    val rows = parsed.optJSONArray("translations")
+                        ?: throw IllegalStateException("المجموعة ${windowIndex + 1}: استجابة بلا translations")
+                    for (index in 0 until rows.length()) {
+                        val row = rows.optJSONObject(index) ?: continue
+                        val id = row.optInt("id", -1)
+                        val value = row.optString("text").trim()
+                        if (id >= 0 && value.isNotBlank()) result[id] = value
+                    }
+                    if (window.any { result[it.id].isNullOrBlank() }) {
+                        throw IllegalStateException("المجموعة ${windowIndex + 1}: ترجمة غير مكتملة")
+                    }
                 }
-                if (window.any { result[it.id].isNullOrBlank() }) throw IllegalStateException("المجموعة ${wi + 1}: ترجمة غير مكتملة")
             }
             return result
-        } finally { busy.set(false) }
+        } catch (error: Throwable) {
+            throw IllegalStateException(error.message ?: "فشلت الترجمة المحلية", error)
+        } finally {
+            busy.set(false)
+        }
     }
 
-    @Synchronized fun release() {
-        if (nativeLibraryReady) runCatching { nativeRelease() }
+    @Synchronized
+    fun release() {
+        loadedModel?.let { runCatching { Llama.releaseModel(it) } }
+        loadedModel = null
         loadedPath = null
     }
 }

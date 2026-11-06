@@ -1,36 +1,38 @@
-<?xml version="1.0" encoding="utf-8"?>  <manifest xmlns:android="http://schemas.android.com/apk/res/android">  <uses-permission android:name="android.permission.INTERNET" />  
-<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />  
-<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />  
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-<application  
-    android:allowBackup="false"  
-    android:icon="@android:drawable/ic_menu_search"  
-    android:label="Manga Fox"  
-    android:supportsRtl="true"  
-    android:theme="@android:style/Theme.Material.NoActionBar">  
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <activity  
-        android:name=".MainActivity"  
-        android:configChanges="orientation|screenSize|keyboardHidden"  
-        android:exported="true">  
-        <intent-filter>  
-            <action android:name="android.intent.action.MAIN" />  
-            <category android:name="android.intent.category.LAUNCHER" />  
-        </intent-filter>  
-    </activity>  
+    <application
+        android:allowBackup="false"
+        android:icon="@android:drawable/ic_menu_search"
+        android:label="Manga Fox"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.NoActionBar">
 
-    <service  
-        android:name=".MangaFoxAccessibilityService"  
-        android:exported="true"  
-        android:label="Manga Fox Translator"  
-        android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">  
-        <intent-filter>  
-            <action android:name="android.accessibilityservice.AccessibilityService" />  
-        </intent-filter>  
-        <meta-data  
-            android:name="android.accessibilityservice"  
-            android:resource="@xml/mangafox_accessibility_config" />  
-    </service>  
-</application>
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
 
+        <service
+            android:name=".MangaFoxAccessibilityService"
+            android:exported="true"
+            android:label="Manga Fox Translator"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/mangafox_accessibility_config" />
+        </service>
+    </application>
 </manifest>

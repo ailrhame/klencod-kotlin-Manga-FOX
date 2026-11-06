@@ -13,6 +13,9 @@ android {
         targetSdk 34
         versionCode 1
         versionName '1.0.0'
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
     }
 
     compileOptions {
@@ -33,8 +36,7 @@ android {
     }
 }
 
-// The accessibility-service XML is generated here so the project only needs
-// the three hand-authored files supplied with this starter.
+// Generate the accessibility-service XML; no hand-authored XML resource is needed.
 def accessibilityXml = layout.buildDirectory.file('generated/mangaFoxResources/res/xml/mangafox_accessibility_config.xml')
 
 tasks.register('generateMangaFoxAccessibilityConfig') {
@@ -61,6 +63,10 @@ tasks.named('preBuild').configure {
 
 dependencies {
     implementation 'androidx.core:core-ktx:1.13.1'
+
+    // Prebuilt Android llama.cpp engine. No CMake/NDK build in the app project.
+    implementation 'dev.ffmpegkit-maintained:llama-android:0.1.1'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0'
 
     // ML Kit OCR: Latin, Japanese, Korean and Chinese scripts.
     implementation 'com.google.mlkit:text-recognition:16.0.1'
