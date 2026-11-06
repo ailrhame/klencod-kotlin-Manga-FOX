@@ -153,7 +153,6 @@ internal const val PREF_AI_ZH_ENABLED = "ai_chinese_translation_enabled"
 internal const val PREF_ZH_SCRIPT = "chinese_script_variant"
 internal const val PREF_AI_SECRET_CIPHER = "ai_translation_secret_cipher"
 internal const val PREF_AI_SECRET_IV = "ai_translation_secret_iv"
-internal const val MAX_CAPTURE_FRAMES = 120
 
 class MainActivity : android.app.Activity() {
     private val dark = Color.rgb(10, 10, 13)
@@ -558,7 +557,7 @@ class MainActivity : android.app.Activity() {
             setPadding(0, dp(14), 0, dp(4))
         }, matchWrap())
         root.addView(TextView(this).apply {
-            text = "My rights · N5CR4  ↗"
+            text = "By  · N5CR4  ↗"
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(gold)
@@ -3527,7 +3526,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private var captureRunning = false
     private var fullChapterMode = false
     private var captureOnlyMode = false
-    private var captureCount = 0
+    private var captureCount = 0L
     private var unchangedFrameCount = 0
     private var screenshotRetryCount = 0
     private var gestureFailureCount = 0
@@ -3768,7 +3767,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         captureRunning = true
         fullChapterMode = true
         captureOnlyMode = false
-        captureCount = 0
+        captureCount = 0L
         unchangedFrameCount = 0
         screenshotRetryCount = 0
         gestureFailureCount = 0
@@ -3800,7 +3799,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         captureRunning = true
         fullChapterMode = true
         captureOnlyMode = true
-        captureCount = 0
+        captureCount = 0L
         unchangedFrameCount = 0
         screenshotRetryCount = 0
         gestureFailureCount = 0
@@ -3816,10 +3815,6 @@ class MangaFoxAccessibilityService : AccessibilityService() {
 
     private fun captureNextFrame() {
         if (!captureRunning || !fullChapterMode) return
-        if (captureCount >= MAX_CAPTURE_FRAMES) {
-            finishCaptureAndTranslate("وصل الالتقاط إلى حد الأمان (${MAX_CAPTURE_FRAMES} لقطة). يمكنك بدء التقاط آخر لاستكمال بقية الفصل.")
-            return
-        }
         requestScreenshot { bitmap, error ->
             if (!captureRunning) {
                 bitmap?.recycle()
@@ -3879,7 +3874,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             previousFrame?.recycle()
             previousFrame = comparisonFrame
             captureCount++
-            MangaFoxRuntime.status = "التقاط الفصل: $captureCount لقطة · الحد الوقائي $MAX_CAPTURE_FRAMES"
+            MangaFoxRuntime.status = "التقاط الفصل: $captureCount لقطة · لا يوجد حد ثابت للعدد"
             notifyCaptureProgress()
             dispatchNextSwipe(displayWidth, displayHeight)
             // The compressed JPEG segment is now on disk; release the full-size
