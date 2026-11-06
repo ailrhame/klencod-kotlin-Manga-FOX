@@ -142,6 +142,7 @@ internal const val PREF_SOURCE_LANGUAGE = "translation_source_language"
 internal const val PREF_ONBOARDING_SEEN = "onboarding_seen_v1"
 internal const val PREF_CONTEXT_PAGE_TRANSLATION = "context_page_translation_v1"
 internal const val PREF_CONTEXT_ONLINE_ENGINE = "context_online_engine_v1"
+internal const val PREF_CONTEXT_LOCAL_ENGINE = "context_local_engine_v1"
 internal const val PREF_CONTEXT_MODEL = "context_translation_model_v1"
 internal const val PREF_SHOW_BUBBLE_BOUNDS = "show_bubble_bounds_v1"
 internal const val PREF_READER_BRIGHTNESS = "reader_brightness_v1"
@@ -557,7 +558,7 @@ class MainActivity : android.app.Activity() {
             setPadding(0, dp(14), 0, dp(4))
         }, matchWrap())
         root.addView(TextView(this).apply {
-            text = "By  · N5CR4  ↗"
+            text = "حقوقي · N5CR4  ↗"
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(gold)
@@ -1729,136 +1730,89 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun addChineseAiSettings(root: LinearLayout) {
-        root.addView(text("محرك الترجمة الذكي للصينية · MAX", 16f, gold, true).apply {
+        root.addView(text("محرك الترجمة السياقية المحلي · QWEN", 16f, gold, true).apply {
             setPadding(0, dp(14), 0, dp(3))
         }, matchWrap())
-        root.addView(text("أدخل مفتاح OpenAI API فقط. يستخدم التطبيق عنوان الخدمة والنموذج الافتراضيين داخلياً، ويبقى ML Kit بديلاً محلياً عند تعذر AI.", 11f, Color.LTGRAY), matchWrap(dp(5)))
-
-        val apiKey = EditText(this).apply {
-            setSingleLine(true)
-            hint = if (MangaFoxSecureSecretStore.get(this@MainActivity).isNullOrBlank()) "مفتاح API" else "مفتاح API محفوظ ومشفّر — أدخل بديلاً للتغيير"
-            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
-            setPadding(dp(10), dp(11), dp(10), dp(11))
-            background = rounded(Color.rgb(38, 38, 46), 10)
-        }
-        root.addView(apiKey, matchWrap(dp(6)))
-
-        val enabled = CheckBox(this).apply {
-            text = "تفعيل الذكاء الاصطناعي للصينية مع الرجوع للمحرك المحلي عند الفشل"
-            textSize = 12f
-            setTextColor(Color.WHITE)
-            buttonTintList = android.content.res.ColorStateList.valueOf(gold)
-            isChecked = preferences.getBoolean(PREF_AI_ZH_ENABLED, true)
-            setOnCheckedChangeListener { _, checked ->
-                preferences.edit().putBoolean(PREF_AI_ZH_ENABLED, checked).apply()
-                toast(if (checked) "تم تفعيل مسار AI للصينية" else "تم إيقاف AI؛ سيعمل المحرك المحلي")
-            }
-        }
-        root.addView(enabled, matchWrap(dp(5)))
+        root.addView(text("ترجمة حوار الصفحة على الجهاز دون API أو اشتراك. يحتاج النموذج إلى تنزيل أول مرة (قرابة 1GB) ومساحة حرة كافية. لا تُرسل صورك أو نصوصك إلى خادم ترجمة.", 11f, Color.LTGRAY), matchWrap(dp(6)))
 
         val pageContext = CheckBox(this).apply {
             text = "ترجمة الصفحة بسياق كامل (كل الفقاعات مرتبة معاً)"
-            textSize = 12f
-            setTextColor(Color.WHITE)
+            textSize = 12f; setTextColor(Color.WHITE)
             buttonTintList = android.content.res.ColorStateList.valueOf(gold)
-            isChecked = preferences.getBoolean(PREF_CONTEXT_PAGE_TRANSLATION, false)
+            isChecked = preferences.getBoolean(PREF_CONTEXT_PAGE_TRANSLATION, true)
             setOnCheckedChangeListener { _, checked ->
                 preferences.edit().putBoolean(PREF_CONTEXT_PAGE_TRANSLATION, checked).apply()
-                toast(if (checked) "سيُرسل حوار الصفحة كوحدة سياقية عند توفر المحرك الأونلاين" else "عادت الترجمة المستقلة لكل فقاعة")
+                toast(if (checked) "سيتم فهم حوار الصفحة قبل الترجمة عند توفر Qwen" else "تم إيقاف الترجمة السياقية")
             }
         }
-        root.addView(pageContext, matchWrap(dp(4)))
-        val onlineContext = CheckBox(this).apply {
-            text = "استخدام المحرك الأونلاين الأقوى للسياق؛ ML Kit احتياطي تلقائي"
-            textSize = 11f
-            setTextColor(Color.LTGRAY)
+        root.addView(pageContext, matchWrap(dp(5)))
+
+        val localEnabled = CheckBox(this).apply {
+            text = "استخدام Qwen المحلي لترجمة السياق"
+            textSize = 12f; setTextColor(Color.WHITE)
             buttonTintList = android.content.res.ColorStateList.valueOf(gold)
-            isChecked = preferences.getBoolean(PREF_CONTEXT_ONLINE_ENGINE, true)
+            isChecked = preferences.getBoolean(PREF_CONTEXT_LOCAL_ENGINE, true)
             setOnCheckedChangeListener { _, checked ->
-                preferences.edit().putBoolean(PREF_CONTEXT_ONLINE_ENGINE, checked).apply()
-                toast(if (checked) "المحرك الأونلاين متاح عند تفعيل سياق الصفحة" else "سيُستخدم ML Kit المحلي فقط")
+                preferences.edit().putBoolean(PREF_CONTEXT_LOCAL_ENGINE, checked).apply()
+                toast(if (checked) "تم اختيار المحرك المحلي" else "سيعود التطبيق إلى مسار الترجمة الاحتياطي")
             }
         }
-        root.addView(onlineContext, matchWrap(dp(4)))
-        val contextModels = listOf(
-            "gpt-6.1-sol" to "GPT-6.1 Sol · جودة عالية وتكلفة متوازنة",
-            "gpt-6-astra" to "GPT-6 Astra · أقوى جودة وتكلفة أعلى",
-            "gpt-6-luna" to "GPT-6 Luna · خيار اقتصادي"
-        )
-        val contextModelLabel = text(
-            "محرك السياق الحالي: ${contextModels.firstOrNull { it.first == preferences.getString(PREF_CONTEXT_MODEL, "gpt-6.1-sol") }?.second ?: contextModels.first().second}",
+        root.addView(localEnabled, matchWrap(dp(4)))
+
+        val modelStatus = text(
+            if (MangaFoxLocalLlm.isModelDownloaded(this)) "حالة النموذج: تم التنزيل · ${if (MangaFoxLocalLlm.isLoaded()) "محمّل في الذاكرة" else "جاهز للتحميل في الذاكرة"}"
+            else "حالة النموذج: لم يتم تنزيله بعد · Qwen2.5 1.5B Q4_K_M",
             11f, Color.rgb(232, 218, 184), true
         )
-        root.addView(contextModelLabel, matchWrap(dp(4)))
-        root.addView(actionButton("اختيار محرك ترجمة سياق الصفحة", false) {
-            val selectedModel = preferences.getString(PREF_CONTEXT_MODEL, "gpt-6.1-sol") ?: "gpt-6.1-sol"
-            val selectedIndex = contextModels.indexOfFirst { it.first == selectedModel }.coerceAtLeast(0)
-            AlertDialog.Builder(this@MainActivity)
-                .setTitle("محرك ترجمة الحوار")
-                .setSingleChoiceItems(contextModels.map { it.second }.toTypedArray(), selectedIndex) { dialog, which ->
-                    val model = contextModels.getOrNull(which)?.first ?: "gpt-6.1-sol"
-                    preferences.edit().putString(PREF_CONTEXT_MODEL, model).apply()
-                    contextModelLabel.text = "محرك السياق الحالي: ${contextModels[which].second}"
-                    dialog.dismiss()
-                    toast("تم تغيير محرك سياق الصفحة")
-                }
-                .setNegativeButton("إغلاق", null)
-                .show()
-        }, matchWrap(dp(4)))
-        root.addView(text("ترسل هذه الميزة نصوص الفقاعات المستخرجة من الصفحة إلى مزود OpenAI فقط عند تفعيل الخيارين ووجود مفتاح محفوظ. لا تُرسل الصور نفسها. فشل الشبكة أو الاستجابة الناقصة يعيد الصفحة إلى ML Kit المحلي. Astra أعلى تكلفة؛ Sol هو الاختيار الافتراضي المتوازن.", 10f, Color.rgb(190, 185, 175)), matchWrap(dp(6)))
-
-        fun saveKey(showMessage: Boolean): Boolean {
-            val newKey = apiKey.text.toString().trim()
-            if (newKey.isNotBlank()) {
-                val stored = runCatching { MangaFoxSecureSecretStore.put(this@MainActivity, newKey) }.isSuccess
-                if (!stored) {
-                    if (showMessage) toast("تعذر تشفير المفتاح على هذا الجهاز؛ لم يُحفظ")
-                    return false
-                }
-                apiKey.setText("")
-                apiKey.hint = "مفتاح API محفوظ ومشفّر — أدخل بديلاً للتغيير"
-            }
-            val existing = MangaFoxSecureSecretStore.get(this@MainActivity)
-            if (existing.isNullOrBlank()) {
-                if (showMessage) toast("أدخل مفتاح API أولاً")
-                return false
-            }
-            if (showMessage) toast("حُفظ مفتاح API مشفّراً داخل التطبيق")
-            return true
-        }
-
-        root.addView(actionButton("حفظ مفتاح API", true) { saveKey(true) }, matchWrap(dp(3)))
-        root.addView(actionButton("حذف مفتاح API المحفوظ", false) {
-            MangaFoxSecureSecretStore.clear(this)
-            apiKey.setText("")
-            apiKey.hint = "مفتاح API"
-            toast("تم حذف مفتاح API المشفّر من بيانات التطبيق")
-        }, matchWrap(dp(3)))
-        root.addView(actionButton("اختبار اتصال API", false) {
-            if (!saveKey(false)) {
-                toast("أدخل مفتاح API واحفظه أولاً")
+        root.addView(modelStatus, matchWrap(dp(5)))
+        root.addView(actionButton("تنزيل نموذج Qwen المجاني (استئناف عند الانقطاع)", true) {
+            if (MangaFoxLocalLlm.isModelDownloaded(this)) {
+                toast("النموذج موجود بالفعل على الجهاز")
                 return@actionButton
             }
-            toast("جارٍ اختبار الاتصال…")
-            fontDownloadExecutor.execute {
+            val progress = android.app.ProgressDialog(this).apply {
+                setTitle("تنزيل نموذج Qwen")
+                setMessage("جارٍ الاتصال بمصدر النموذج…")
+                setProgressStyle(android.app.ProgressDialog.STYLE_HORIZONTAL)
+                isIndeterminate = true; setCancelable(false); show()
+            }
+            Thread {
                 val result = runCatching {
-                    MangaFoxAiTranslator.translate(
-                        this, "你是谁？", emptyList(), emptyList(), testRequest = true,
-                        scriptMode = preferences.getString(PREF_ZH_SCRIPT, "auto") ?: "auto"
-                    )
+                    MangaFoxLocalLlm.downloadModel(this) { done, total ->
+                        runOnUiThread {
+                            if (total > 0) {
+                                progress.isIndeterminate = false
+                                progress.max = 1000
+                                progress.progress = ((done * 1000L) / total).toInt().coerceIn(0, 1000)
+                                progress.setMessage("${done / 1_000_000} / ${total / 1_000_000} MB")
+                            } else progress.setMessage("تم تنزيل ${done / 1_000_000} MB")
+                        }
+                    }
                 }
                 runOnUiThread {
-                    if (result.isSuccess && result.getOrNull().orEmpty().isNotBlank()) {
-                        toast("نجح اتصال API. استجابة الاختبار: ${result.getOrNull()?.take(90)}")
-                    } else {
-                        toast("فشل اختبار API: ${result.exceptionOrNull()?.message?.take(180) ?: "استجابة فارغة"}")
-                    }
+                    progress.dismiss()
+                    if (result.isSuccess) {
+                        modelStatus.text = "حالة النموذج: تم التنزيل · جاهز للتحميل"
+                        toast("اكتمل تنزيل Qwen. اضغط تحميل النموذج في الذاكرة")
+                    } else toast("فشل التنزيل: ${result.exceptionOrNull()?.message?.take(140)}")
+                }
+            }.start()
+        }, matchWrap(dp(4)))
+        root.addView(actionButton("تحميل Qwen في الذاكرة", false) {
+            if (!MangaFoxLocalLlm.isModelDownloaded(this)) {
+                toast("نزّل النموذج أولاً")
+                return@actionButton
+            }
+            toast("جارٍ تحميل النموذج محلياً…")
+            fontDownloadExecutor.execute {
+                val loaded = runCatching { MangaFoxLocalLlm.load(this) }.getOrDefault(false)
+                runOnUiThread {
+                    modelStatus.text = if (loaded) "حالة النموذج: يعمل محلياً وجاهز" else "حالة النموذج: تعذر التحميل؛ تحقق من ذاكرة الجهاز"
+                    toast(if (loaded) "Qwen جاهز. الترجمة السياقية تعمل دون إنترنت" else "تعذر تحميل Qwen؛ سيبقى ML Kit احتياطياً")
                 }
             }
         }, matchWrap(dp(4)))
-        root.addView(text("يتطلب الاتصال بالإنترنت. تُرسل النصوص الصينية إلى مزود الخدمة عند تفعيل AI. المفتاح مشفّر باستخدام Android Keystore.", 10f, Color.LTGRAY), matchWrap(dp(4)))
+        root.addView(text("النموذج: Qwen2.5-1.5B-Instruct Q4_K_M · المصدر: Hugging Face · Runtime: llama.cpp · يعمل على CPU ARM64. إذا لم يتوفر النموذج أو فشل التحميل، يستمر مسار ML Kit الحالي دون تعطيل بقية التطبيق.", 10f, Color.rgb(190, 185, 175)), matchWrap(dp(6)))
     }
 
     private fun showLearnedTranslationDialog(sourceText: String) {
@@ -5477,22 +5431,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     private fun translateWithLanguage(sourceText: String, languageCode: String): String {
-        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        if (languageCode == "zh" && prefs.getBoolean(PREF_AI_ZH_ENABLED, true)) {
-            val apiKey = MangaFoxSecureSecretStore.get(this)
-            if (!apiKey.isNullOrBlank()) {
-                val knowledge = MangaFoxKnowledgeStore(this)
-                val aiResult = runCatching {
-                    MangaFoxAiTranslator.translate(
-                        this, sourceText, knowledge.glossary(), knowledge.characters(),
-                        scriptMode = prefs.getString(PREF_ZH_SCRIPT, "auto") ?: "auto"
-                    )
-                }.getOrNull()
-                if (!aiResult.isNullOrBlank() && isUsefulArabicTranslation(sourceText, aiResult) &&
-                    !hasUntranslatedLatinRuns(aiResult, 5)) return cleanArabicTranslation(aiResult)
-                // A rejected/failed AI result never replaces the original; local ML Kit remains the fallback.
-            }
-        }
+        // The paid/remote AI path is intentionally not invoked. Qwen handles page context
+        // locally; this method remains the on-device ML Kit fallback for individual bubbles.
         val translator = translatorFor(languageCode)
         Tasks.await(translator.downloadModelIfNeeded(DownloadConditions.Builder().build()))
         return Tasks.await(translator.translate(sourceText))
@@ -5869,22 +5809,22 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         // request is allowed to finish, then the per-bubble loop checks pause again.
         awaitTranslationResume()
         val contextTranslations: Map<Int, String> = if (
-            prefs.getBoolean(PREF_CONTEXT_PAGE_TRANSLATION, false) &&
-            prefs.getBoolean(PREF_CONTEXT_ONLINE_ENGINE, true) &&
-            !MangaFoxSecureSecretStore.get(this).isNullOrBlank()
+            prefs.getBoolean(PREF_CONTEXT_PAGE_TRANSLATION, true) &&
+            prefs.getBoolean(PREF_CONTEXT_LOCAL_ENGINE, true) &&
+            MangaFoxLocalLlm.isModelDownloaded(this)
         ) {
-            onProgress(0.425f, "ترجمة حوار الصفحة كسياق واحد · ${blocks.size} فقاعة")
+            onProgress(0.425f, "فهم حوار الصفحة محلياً · ${blocks.size} فقاعة")
             runCatching {
-                MangaFoxAiTranslator.translatePageContext(
+                MangaFoxLocalLlm.translatePageContext(
                     this,
                     blocks.mapIndexed { blockIndex, block ->
-                        MangaFoxAiTranslator.ContextBlock(blockIndex, block.language, block.text)
+                        MangaFoxLocalLlm.Bubble(blockIndex, block.language, block.text)
                     },
                     MangaFoxKnowledgeStore(this).glossary(),
                     MangaFoxKnowledgeStore(this).characters()
                 )
             }.getOrElse { error ->
-                onProgress(0.43f, "تعذر محرك السياق؛ رجوع تلقائي إلى ML Kit: ${error.message?.take(80).orEmpty()}")
+                onProgress(0.43f, "تعذر Qwen المحلي؛ رجوع تلقائي إلى ML Kit: ${error.message?.take(80).orEmpty()}")
                 emptyMap()
             }
         } else emptyMap()
