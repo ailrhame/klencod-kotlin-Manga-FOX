@@ -2,6 +2,7 @@ package com.manga.fox
 
 import android.content.Context
 import android.os.StatFs
+import android.os.Debug
 import dev.ffmpegkit.llama.Llama
 import dev.ffmpegkit.llama.LlamaConfig
 import dev.ffmpegkit.llama.LlamaModel
@@ -25,8 +26,24 @@ object MangaFoxLocalLlm {
     @Volatile private var loadedPath: String? = null
     @Volatile private var loadedModel: LlamaModel? = null
     @Volatile private var lastLoadFailure: String = "لم تبدأ محاولة تحميل النموذج بعد"
+    @Volatile private var lastInferenceMillis: Long = -1L
+    @Volatile private var lastInferenceBubbleCount: Int = 0
+    @Volatile private var lastInferenceWindowCount: Int = 0
+    @Volatile private var lastInferenceError: String = "لا توجد عملية ترجمة مسجلة بعد"
 
     fun lastLoadError(): String = lastLoadFailure
+
+    /** Reports process PSS (native + managed memory) and most recent local inference metrics. */
+    fun diagnosticsSummary(context: Context): String {
+        val pssMb = runCatching { Debug.getPss().toDouble() / 1024.0 }.getOrDefault(0.0)
+        val runtime = Runtime.getRuntime()
+        val heapUsedMb = (runtime.totalMemory() - runtime.freeMemory()).toDouble() / (1024.0 * 1024.0)
+        val modelMb = modelFile(context).takeIf { it.isFile }?.length()?.toDouble()?.div(1024.0 * 1024.0) ?: 0.0
+        val lastTime = if (lastInferenceMillis >= 0L) "${lastInferenceMillis}ms" else "غير متاح"
+        return "ذاكرة العملية PSS: ${String.format(java.util.Locale.US, "%.0f", pssMb)}MB · Heap: ${String.format(java.util.Locale.US, "%.0f", heapUsedMb)}MB · حجم النموذج: ${String.format(java.util.Locale.US, "%.0f", modelMb)}MB\n" +
+            "آخر ترجمة: $lastTime · الفقاعات: $lastInferenceBubbleCount · الدفعات: $lastInferenceWindowCount\n" +
+            "حالة المحرك: ${if (isLoaded()) "محمّل" else "غير محمّل"} · ${lastInferenceError.take(120)}"
+    }
     fun nativeStatus(): String = when {
         loadedModel != null -> "محرك llama.cpp جاهز · النموذج محمّل"
         else -> "مكتبة llama-android مضافة؛ النموذج غير محمّل"
@@ -187,24 +204,32 @@ object MangaFoxLocalLlm {
     ): Map<Int, String> {
         require(blocks.isNotEmpty()) { "لا توجد فقاعات للترجمة" }
         check(busy.compareAndSet(false, true)) { "محرك الترجمة المحلي مشغول" }
+        val inferenceStartedNanos = System.nanoTime()
         try {
             check(load(context)) { lastLoadFailure }
             val model = loadedModel ?: throw IllegalStateException("لم يتم إنشاء جلسة Qwen")
 
-            val glossaryText = glossary.take(24).joinToString("\n") {
+            val mode = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(PREF_QWEN_TRANSLATION_MODE, "balanced") ?: "balanced"
+            val (windowCharLimit, bubbleLimit, glossaryLimit, characterLimit, tokenLimit) = when (mode) {
+                "quick" -> listOf(1500, 12, 12, 8, 620)
+                "precise" -> listOf(2250, 20, 32, 16, 950)
+                else -> listOf(1950, 16, 24, 12, 820)
+            }
+            val glossaryText = glossary.take(glossaryLimit).joinToString("\n") {
                 "${it.source.take(100)} = ${it.arabic.take(140)} ${it.note.take(100)}"
             }
-            val characterText = characters.take(12).joinToString("\n") {
+            val characterText = characters.take(characterLimit).joinToString("\n") {
                 "${it.name.take(80)} | ${it.voice.take(100)} | ${it.notes.take(120)}"
             }
 
-            // Keep each prompt safely below the 2K context window, including the system instructions.
+            // The chosen profile changes only batching/context density; it never truncates source bubbles.
             val windows = ArrayList<List<Bubble>>()
             var current = ArrayList<Bubble>()
             var chars = 0
             for (bubble in blocks) {
                 val cost = bubble.text.length + 48
-                if (current.isNotEmpty() && (chars + cost > 2100 || current.size >= 18)) {
+                if (current.isNotEmpty() && (chars + cost > windowCharLimit || current.size >= bubbleLimit)) {
                     windows.add(current)
                     current = ArrayList()
                     chars = 0
@@ -234,7 +259,10 @@ object MangaFoxLocalLlm {
 - أعد ترجمة مستقلة لكل id، ولا تدمج فقاعتين ولا تغيّر الترتيب.
 - لا تترجم كلمة بكلمة؛ انقل المعنى المقصود بصياغة عربية طبيعية موجزة تناسب فقاعة المانجا.
 - حافظ على النفي والشرط والسخرية والغضب والتردد والتلميحات بحسب السياق.
+- فسّر التعابير الاصطلاحية والأمثال والشتائم والمزاح بحسب المقصود في المشهد، ولا تنقل بنيتها حرفياً إذا أفسدت المعنى.
+- اجعل الحوار عربياً طبيعياً ومختصراً، مع الحفاظ على شخصية المتحدث ودرجة الرسمية والانفعال.
 - ثبّت الأسماء والألقاب والمصطلحات وفق القاموس، ولا تخترع جنس الشخصية أو معلومات غير موجودة.
+- عند غموض الضمير أو المتحدث، اختر الصياغة العربية الأقل افتراضاً ولا تضف معلومة من عندك.
 - لا تضف شرحاً أو ملاحظات أو نصاً خارج JSON.
 - أخرج JSON فقط بالشكل: {"translations":[{"id":0,"text":"الترجمة"}]}، وكل id مرة واحدة.
 
@@ -245,7 +273,7 @@ ${glossaryText.ifBlank { "لا يوجد" }}
 ${characterText.ifBlank { "لا توجد بيانات" }}
                     """.trimIndent()
 
-                    val maxTokens = max(320, (window.sumOf { it.text.length } / 2 + 220)).coerceAtMost(900)
+                    val maxTokens = max(320, (window.sumOf { it.text.length } / 2 + 220)).coerceAtMost(tokenLimit)
                     val generated = Llama.complete(
                         model = model,
                         prompt = payload.toString(),
@@ -272,8 +300,16 @@ ${characterText.ifBlank { "لا توجد بيانات" }}
                     }
                 }
             }
+            lastInferenceMillis = ((System.nanoTime() - inferenceStartedNanos) / 1_000_000L).coerceAtLeast(0L)
+            lastInferenceBubbleCount = blocks.size
+            lastInferenceWindowCount = windows.size
+            lastInferenceError = "آخر ترجمة اكتملت بنجاح"
             return result
         } catch (error: Throwable) {
+            lastInferenceMillis = ((System.nanoTime() - inferenceStartedNanos) / 1_000_000L).coerceAtLeast(0L)
+            lastInferenceBubbleCount = blocks.size
+            lastInferenceWindowCount = 0
+            lastInferenceError = "تعذرت الترجمة: ${error.message ?: error.javaClass.simpleName}"
             throw IllegalStateException(error.message ?: "فشلت الترجمة المحلية", error)
         } finally {
             busy.set(false)

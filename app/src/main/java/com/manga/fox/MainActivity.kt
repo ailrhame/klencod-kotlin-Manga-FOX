@@ -42,6 +42,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
+import android.provider.DocumentsContract
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.provider.OpenableColumns
@@ -154,11 +155,19 @@ internal const val PREF_AI_ZH_ENABLED = "ai_chinese_translation_enabled"
 internal const val PREF_ZH_SCRIPT = "chinese_script_variant"
 internal const val PREF_AI_SECRET_CIPHER = "ai_translation_secret_cipher"
 internal const val PREF_AI_SECRET_IV = "ai_translation_secret_iv"
+internal const val PREF_QWEN_TRANSLATION_MODE = "qwen_translation_quality_mode_v1"
+internal const val PREF_ACTIVE_THEME_ID = "mfox_active_theme_v1"
+internal const val REQUEST_IMPORT_THEME = 718
+internal const val REQUEST_EXPORT_THEME = 719
+internal const val REQUEST_IMPORT_IMAGE_ARCHIVE = 720
+internal const val REQUEST_IMPORT_IMAGE_FOLDER = 721
 
 class MainActivity : android.app.Activity() {
-    private val dark = Color.rgb(10, 10, 13)
-    private val panel = Color.rgb(25, 25, 31)
-    private val gold = Color.rgb(255, 190, 65)
+    private var activeTheme: MangaFoxTheme = MangaFoxThemeStore.defaultTheme
+    private val dark: Int get() = activeTheme.background
+    private val panel: Int get() = activeTheme.panel
+    private val gold: Int get() = activeTheme.accent
+    private var pendingThemeArchive: File? = null
     private lateinit var preferences: SharedPreferences
     private var fontPreview: TextView? = null
     private var fontStatusText: TextView? = null
@@ -191,6 +200,7 @@ class MainActivity : android.app.Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        activeTheme = MangaFoxThemeStore.resolve(this, preferences.getString(PREF_ACTIVE_THEME_ID, "fox_noir"))
         restoreFontSelectionFromDisk()
         MangaFoxRuntime.restore(this)
         // Preserve a restored session if it is not already represented in the permanent archive.
@@ -443,6 +453,13 @@ class MainActivity : android.app.Activity() {
             window.isNavigationBarContrastEnforced = false
             window.isStatusBarContrastEnforced = false
         }
+        if (!readingFullscreen) {
+            val lightBackground = (Color.red(dark) * 299 + Color.green(dark) * 587 + Color.blue(dark) * 114) / 1000 >= 150
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = if (lightBackground) {
+                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+            } else View.SYSTEM_UI_FLAG_VISIBLE
+        }
     }
 
     private fun setReadingFullscreen(enabled: Boolean) {
@@ -520,14 +537,14 @@ class MainActivity : android.app.Activity() {
         }
         listOf(
             "translation" to "ترجمة", "studio" to "استوديو", "quality" to "الجودة",
-            "knowledge" to "المعجم", "settings" to "الإعدادات", "library" to "المكتبة", "archive" to "الأعمال"
+            "knowledge" to "المعجم", "settings" to "الإعدادات", "themes" to "الثيمات", "library" to "المكتبة", "archive" to "الأعمال"
         ).forEach { (key, label) ->
             val tab = Button(this).apply {
                 text = label
                 textSize = 12f
                 isAllCaps = false
                 minWidth = 0
-                setTextColor(if (selectedHomeTab == key) Color.BLACK else Color.LTGRAY)
+                setTextColor(if (selectedHomeTab == key) activeTheme.onAccent else activeTheme.muted)
                 background = rounded(if (selectedHomeTab == key) gold else panel, 12)
                 setOnClickListener {
                     selectedHomeTab = key
@@ -620,7 +637,7 @@ class MainActivity : android.app.Activity() {
     private fun updateHomeTabs(tabs: LinearLayout) {
         val items = listOf(
             "translation" to "ترجمة", "studio" to "استوديو", "quality" to "الجودة",
-            "knowledge" to "المعجم", "settings" to "الإعدادات", "library" to "المكتبة", "archive" to "الأعمال"
+            "knowledge" to "المعجم", "settings" to "الإعدادات", "themes" to "الثيمات", "library" to "المكتبة", "archive" to "الأعمال"
         )
         tabs.removeAllViews()
         items.forEach { (key, label) ->
@@ -629,7 +646,7 @@ class MainActivity : android.app.Activity() {
                 textSize = 12f
                 isAllCaps = false
                 minWidth = 0
-                setTextColor(if (selectedHomeTab == key) Color.BLACK else Color.LTGRAY)
+                setTextColor(if (selectedHomeTab == key) activeTheme.onAccent else activeTheme.muted)
                 background = rounded(if (selectedHomeTab == key) gold else panel, 12)
                 setOnClickListener {
                     selectedHomeTab = key
@@ -648,6 +665,7 @@ class MainActivity : android.app.Activity() {
         content.removeAllViews()
         when (selectedHomeTab) {
             "settings" -> addSettingsCard(content)
+            "themes" -> addThemesTab(content)
             "library" -> addLibraryTab(content)
             "studio" -> addPhantomStudioTab(content)
             "quality" -> addQualityTab(content)
@@ -821,6 +839,7 @@ class MainActivity : android.app.Activity() {
         item("فتح النتائج") { showResults() }
         item("تصدير PDF") { exportResultsAsPdf() }
         item("إعدادات العدسة") { selectedHomeTab = "settings"; showHome() }
+        item("الثيمات وتخصيص المظهر") { selectedHomeTab = "themes"; showHome() }
         item("إغلاق") {}
         dialog.setContentView(panelView)
         dialog.window?.apply {
@@ -895,6 +914,8 @@ class MainActivity : android.app.Activity() {
         header.addView(text("أرشيف الأعمال والفصول", 19f, gold, true))
         header.addView(text("كل فصل محفوظ بصورة مستقلة داخل تصنيف العمل. يمكنك فتح أي فصل أو حذفه دون التأثير على الفصول الأخرى.", 12f, Color.LTGRAY))
         header.addView(text("إجمالي الفصول المحفوظة: ${chapters.size}", 13f, Color.WHITE, true).apply { setPadding(0, dp(8), 0, 0) })
+        header.addView(actionButton("استيراد فصل من ZIP / CBZ", true) { pickImageArchive() }, matchWrap(dp(4)))
+        header.addView(actionButton("استيراد مجلد صور من الهاتف", false) { pickImageFolder() }, matchWrap(dp(4)))
         root.addView(header, matchWrap(dp(10)))
         if (chapters.isEmpty()) {
             root.addView(text("لا توجد فصول محفوظة بعد. افتح قسم الترجمة، واكتب اسم العمل ورقم الفصل قبل بدء الالتقاط.", 14f, Color.LTGRAY)
@@ -956,6 +977,255 @@ class MainActivity : android.app.Activity() {
             root.addView(workCard, matchWrap(dp(10)))
         }
     }
+
+    private fun pickImageArchive() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/zip", "application/x-cbz", "application/octet-stream"))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runCatching { startActivityForResult(intent, REQUEST_IMPORT_IMAGE_ARCHIVE) }
+            .onFailure { toast("تعذر فتح مدير الملفات") }
+    }
+
+    private fun pickImageFolder() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        }
+        runCatching { startActivityForResult(intent, REQUEST_IMPORT_IMAGE_FOLDER) }
+            .onFailure { toast("مدير الملفات لا يدعم اختيار المجلدات") }
+    }
+
+    private data class ImportedImage(val relativeName: String, val file: File)
+
+    private fun startImageCollectionImport(uri: android.net.Uri, isFolder: Boolean) {
+        val progress = android.app.ProgressDialog(this).apply {
+            setTitle(if (isFolder) "استيراد مجلد الصور" else "استيراد ZIP / CBZ")
+            setMessage("فحص الملفات والصور…")
+            setProgressStyle(android.app.ProgressDialog.STYLE_SPINNER)
+            setCancelable(false)
+            show()
+        }
+        fontDownloadExecutor.execute {
+            val staging = File(filesDir, "mfox_import_staging_${System.currentTimeMillis()}")
+            val outcome = runCatching {
+                require(staging.mkdirs()) { "تعذر إنشاء مجلد الاستيراد" }
+                val available = filesDir.usableSpace
+                // Import temporarily holds staging plus permanent source and result copies (about 3x).
+                val maxTotalBytes = ((available - 256L * 1024L * 1024L).coerceAtLeast(0L) / 3L)
+                require(maxTotalBytes >= 32L * 1024L * 1024L) { "المساحة الحرة غير كافية للاستيراد؛ اترك 256MB احتياطاً مع حساب النسخ المؤقتة والأرشيف" }
+                val imported = if (isFolder) importImagesFromFolder(uri, staging, maxTotalBytes)
+                    else importImagesFromZip(uri, staging, maxTotalBytes)
+                require(imported.isNotEmpty()) { "لم يتم العثور على صور مانجا صالحة" }
+                val sorted = imported.sortedBy { naturalSortKey(it.relativeName) }
+                val pageFiles = sorted.mapIndexed { index, item ->
+                    val extension = item.file.extension.lowercase(Locale.ROOT).let { if (it in setOf("jpg", "jpeg", "png", "webp")) it else "jpg" }
+                    val destination = File(staging, "page_${(index + 1).toString().padStart(6, '0')}.$extension")
+                    if (item.file.absolutePath != destination.absolutePath) {
+                        if (!item.file.renameTo(destination)) item.file.copyTo(destination, overwrite = true).also { item.file.delete() }
+                    }
+                    destination
+                }
+                val sourceName = readDisplayName(uri).substringAfterLast('/').substringAfterLast('\\')
+                    .substringBeforeLast('.').trim().ifBlank { if (isFolder) "مجلد مستورد" else "فصل مستورد" }.take(80)
+                val workName = sourceName
+                val chapterName = "مستورد ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.ROOT).format(java.util.Date())}"
+                val paths = pageFiles.map { it.absolutePath }
+                val previousArchiveId = MangaFoxRuntime.activeArchiveId
+                val previousPendingEdits = MangaFoxRuntime.pendingEdits
+                val previousWorkName = MangaFoxRuntime.activeWorkName
+                val previousChapterName = MangaFoxRuntime.activeChapterName
+                MangaFoxRuntime.activeArchiveId = ""
+                MangaFoxRuntime.pendingEdits = false
+                val archiveId = MangaFoxChapterArchive.save(
+                    this, workName, chapterName, sourceName, paths, paths,
+                    List(paths.size) { "" }, true,
+                    "صور مستوردة · ${paths.size} صفحة · جاهزة للترجمة"
+                ) ?: run {
+                    MangaFoxRuntime.activeArchiveId = previousArchiveId
+                    MangaFoxRuntime.pendingEdits = previousPendingEdits
+                    MangaFoxRuntime.activeWorkName = previousWorkName
+                    MangaFoxRuntime.activeChapterName = previousChapterName
+                    error("تعذر حفظ الفصل داخل المكتبة")
+                }
+                if (!MangaFoxChapterArchive.open(this, archiveId)) {
+                    MangaFoxChapterArchive.delete(this, archiveId)
+                    MangaFoxRuntime.activeArchiveId = previousArchiveId
+                    MangaFoxRuntime.pendingEdits = previousPendingEdits
+                    MangaFoxRuntime.activeWorkName = previousWorkName
+                    MangaFoxRuntime.activeChapterName = previousChapterName
+                    error("تم التراجع عن الاستيراد لأن الفصل المحفوظ تعذر فتحه")
+                }
+                MangaFoxRuntime.persist(this)
+                paths.size to sourceName
+            }
+            staging.deleteRecursively()
+            if (isFolder) runCatching {
+                contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            runOnUiThread {
+                progress.dismiss()
+                outcome.onSuccess { (count, title) ->
+                    selectedHomeTab = "archive"
+                    showResults()
+                    toast("تم استيراد $count صورة من «$title» وحفظها في المكتبة")
+                }.onFailure { error ->
+                    toast("فشل استيراد الصور: ${error.localizedMessage ?: "ملف غير صالح"}")
+                }
+            }
+        }
+    }
+
+    private fun readDisplayName(uri: android.net.Uri): String {
+        return runCatching {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
+            }
+        }.getOrNull().orEmpty().ifBlank { "Manga FOX Import" }
+    }
+
+    private fun importImagesFromZip(uri: android.net.Uri, staging: File, maxTotalBytes: Long): List<ImportedImage> {
+        val output = ArrayList<ImportedImage>()
+        var totalBytes = 0L
+        var expandedBytes = 0L
+        var scannedEntries = 0
+        val maxExpandedBytes = maxTotalBytes + 128L * 1024L * 1024L
+        val stream = contentResolver.openInputStream(uri) ?: error("تعذر فتح ملف ZIP / CBZ")
+        ZipInputStream(stream.buffered()).use { zip ->
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                scannedEntries++
+                require(scannedEntries <= 30000) { "الأرشيف يحتوي عدداً غير طبيعي من العناصر" }
+                val name = entry.name.replace('\\', '/')
+                require(!name.startsWith("/") && !name.split('/').any { it == ".." }) { "الأرشيف يحتوي مساراً غير آمن" }
+                val extension = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+                if (!entry.isDirectory && extension in setOf("jpg", "jpeg", "png", "webp")) {
+                    val target = File(staging, "raw_${output.size.toString().padStart(6, '0')}.$extension")
+                    val remaining = minOf(maxTotalBytes - totalBytes, maxExpandedBytes - expandedBytes)
+                    val size = copyBoundedImage(zip, target, remaining)
+                    totalBytes += size
+                    expandedBytes += size
+                    if (size > 0L && isReadableImage(target)) output.add(ImportedImage(name, target)) else target.delete()
+                } else {
+                    expandedBytes += drainZipEntryBounded(zip, maxExpandedBytes - expandedBytes)
+                }
+                require(expandedBytes <= maxExpandedBytes) { "محتوى الأرشيف بعد فك الضغط يتجاوز الحد الآمن" }
+                zip.closeEntry()
+            }
+        }
+        return output
+    }
+
+    private fun drainZipEntryBounded(input: InputStream, remainingBytes: Long): Long {
+        require(remainingBytes >= 0L) { "الأرشيف تجاوز حد البيانات المفكوكة" }
+        var countTotal = 0L
+        val buffer = ByteArray(32 * 1024)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            countTotal += count
+            require(countTotal <= remainingBytes) { "الأرشيف يحتوي ملفاً مضغوطاً بحجم غير آمن" }
+        }
+        return countTotal
+    }
+
+    private fun importImagesFromFolder(treeUri: android.net.Uri, staging: File, maxTotalBytes: Long): List<ImportedImage> {
+        runCatching {
+            contentResolver.takePersistableUriPermission(treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        data class FolderNode(val documentId: String, val relativePath: String, val depth: Int)
+        val pending = java.util.ArrayDeque<FolderNode>()
+        pending.add(FolderNode(DocumentsContract.getTreeDocumentId(treeUri), "", 0))
+        val files = ArrayList<Pair<String, android.net.Uri>>()
+        var visited = 0
+        while (pending.isNotEmpty()) {
+            val node = pending.removeFirst()
+            require(node.depth <= 20) { "المجلد متداخل بعمق غير مدعوم" }
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, node.documentId)
+            contentResolver.query(
+                childrenUri,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE
+                ), null, null, null
+            )?.use { cursor ->
+                val idIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val typeIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                require(idIndex >= 0 && nameIndex >= 0 && typeIndex >= 0) { "مدير الملفات لا يوفر بيانات المجلد المطلوبة" }
+                while (cursor.moveToNext()) {
+                    visited++
+                    require(visited <= 30000) { "المجلد يحتوي عدداً كبيراً جداً من العناصر" }
+                    val id = cursor.getString(idIndex)
+                    val name = cursor.getString(nameIndex).orEmpty()
+                    val mime = cursor.getString(typeIndex).orEmpty()
+                    val relative = if (node.relativePath.isBlank()) name else "${node.relativePath}/$name"
+                    if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                        pending.add(FolderNode(id, relative, node.depth + 1))
+                    } else {
+                        val extension = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+                        if (extension in setOf("jpg", "jpeg", "png", "webp")) {
+                            files.add(relative to DocumentsContract.buildDocumentUriUsingTree(treeUri, id))
+                        }
+                    }
+                }
+            } ?: error("تعذر قراءة محتويات المجلد")
+        }
+        val output = ArrayList<ImportedImage>()
+        var totalBytes = 0L
+        files.sortedBy { naturalSortKey(it.first) }.forEachIndexed { index, pair ->
+            val extension = pair.first.substringAfterLast('.', "jpg").lowercase(Locale.ROOT)
+            val target = File(staging, "folder_${index.toString().padStart(6, '0')}.$extension")
+            val input = contentResolver.openInputStream(pair.second) ?: return@forEachIndexed
+            val size = input.use { copyBoundedImage(it, target, maxTotalBytes - totalBytes) }
+            totalBytes += size
+            if (size > 0L && isReadableImage(target)) output.add(ImportedImage(pair.first, target)) else target.delete()
+        }
+        return output
+    }
+
+    private fun copyBoundedImage(input: InputStream, target: File, remainingTotalBytes: Long): Long {
+        require(remainingTotalBytes > 0L) { "المساحة المتاحة للاستيراد انتهت" }
+        var size = 0L
+        try {
+            FileOutputStream(target).use { out ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    size += count
+                    require(size <= 128L * 1024L * 1024L) { "إحدى الصور أكبر من 128MB" }
+                    require(size <= remainingTotalBytes) { "لا توجد مساحة كافية لحفظ جميع الصور" }
+                    out.write(buffer, 0, count)
+                }
+                out.fd.sync()
+            }
+            if (size < 128L) { target.delete(); return 0L }
+            return size
+        } catch (error: Throwable) {
+            target.delete()
+            throw error
+        }
+    }
+
+    private fun isReadableImage(file: File): Boolean = runCatching {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return false
+        val sample = maxOf(1, bounds.outWidth / 160, bounds.outHeight / 160)
+        val bitmap = BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply {
+            inSampleSize = sample
+            inPreferredConfig = Bitmap.Config.RGB_565
+        }) ?: return false
+        bitmap.recycle()
+        true
+    }.getOrDefault(false)
+
+    private fun naturalSortKey(value: String): String =
+        value.lowercase(Locale.ROOT).replace(Regex("\\d+")) { it.value.padStart(18, '0') }
 
     private fun restoreFontSelectionFromDisk() {
         val savedPath = preferences.getString(PREF_FONT_FILE, null)?.takeIf { it.isNotBlank() } ?: return
@@ -1492,6 +1762,113 @@ class MainActivity : android.app.Activity() {
         progressText?.text = "${MangaFoxRuntime.progressPercent.coerceIn(0, 100)}% · ${MangaFoxRuntime.progressDetail.ifBlank { MangaFoxRuntime.status }}"
     }
 
+    /** @N5CR4 — Theme gallery, safe theme-pack import and export. */
+    private fun addThemesTab(root: LinearLayout) {
+        val intro = card()
+        intro.addView(text("مركز الثيمات · MANGA FOX", 19f, gold, true))
+        intro.addView(text("اختر من 9 ثيمات مدمجة، أو استورد ملف ثيم جاهز بصيغة .mftheme أو .zip أو .json. تغيير الثيم لا يلمس الصور أو الطبقات أو إعدادات الترجمة.", 12f, Color.LTGRAY))
+        intro.addView(text("الثيم يغيّر ألوان واجهة التطبيق فقط؛ ألوان النص المترجم داخل الفقاعات تبقى كما حفظتها لكل طبقة.", 11f, gold))
+        root.addView(intro, matchWrap(dp(10)))
+
+        val current = card()
+        current.addView(text("الثيم النشط: ${activeTheme.name}", 16f, gold, true))
+        val preview = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(dp(4), dp(8), dp(4), dp(8))
+        }
+        listOf(activeTheme.background, activeTheme.panel, activeTheme.accent, activeTheme.surfaceAlt).forEach { swatch ->
+            preview.addView(View(this).apply {
+                background = rounded(swatch, 12)
+                layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply {
+                    marginStart = dp(4); marginEnd = dp(4)
+                }
+            })
+        }
+        current.addView(preview, matchWrap())
+        current.addView(actionButton("تصدير الثيم الحالي كملف جاهز", false) {
+            exportActiveThemePack()
+        }, matchWrap(dp(4)))
+        current.addView(actionButton("استيراد ثيم من الملفات · MFTHEME / ZIP / JSON", true) {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+                putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/zip", "application/octet-stream", "application/json", "text/json"))
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            runCatching { startActivityForResult(intent, REQUEST_IMPORT_THEME) }
+                .onFailure { toast("تعذر فتح مدير الملفات") }
+        }, matchWrap())
+        root.addView(current, matchWrap(dp(12)))
+
+        val allThemes = MangaFoxThemeStore.all(this)
+        allThemes.forEach { item ->
+            val itemCard = card()
+            val selected = item.id == activeTheme.id
+            itemCard.addView(text(item.name + if (selected) "  ✓ مُفعّل" else "", 15f, if (selected) gold else Color.WHITE, true))
+            itemCard.addView(text(if (item.isCustom) "ثيم مستورد من ملف" else "ثيم مدمج في Manga FOX", 10f, Color.LTGRAY))
+            val strip = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+                setPadding(0, dp(3), 0, dp(5))
+            }
+            listOf(item.background, item.panel, item.accent, item.surfaceAlt).forEach { color ->
+                strip.addView(View(this).apply {
+                    background = rounded(color, 10)
+                    layoutParams = LinearLayout.LayoutParams(0, dp(28), 1f).apply {
+                        marginStart = dp(3); marginEnd = dp(3)
+                    }
+                })
+            }
+            itemCard.addView(strip, matchWrap())
+            itemCard.addView(actionButton(if (selected) "الثيم مستخدم حالياً" else "تفعيل هذا الثيم", !selected) {
+                preferences.edit().putString(PREF_ACTIVE_THEME_ID, item.id).commit()
+                activeTheme = item
+                applySystemBars()
+                selectedHomeTab = "themes"
+                showHome()
+                toast("تم تفعيل ثيم ${item.name}")
+            }, matchWrap(dp(2)))
+            if (item.isCustom) {
+                itemCard.addView(actionButton("حذف الثيم المستورد", false) {
+                    AlertDialog.Builder(this)
+                        .setTitle("حذف ${item.name}؟")
+                        .setMessage("سيُحذف ملف الثيم من Manga FOX فقط. لن تتأثر الصور أو الفصول أو الترجمات.")
+                        .setNegativeButton("إلغاء", null)
+                        .setPositiveButton("حذف") { _, _ ->
+                            MangaFoxThemeStore.deleteCustom(this, item.id)
+                            if (activeTheme.id == item.id) {
+                                activeTheme = MangaFoxThemeStore.defaultTheme
+                                preferences.edit().putString(PREF_ACTIVE_THEME_ID, activeTheme.id).apply()
+                                applySystemBars()
+                            }
+                            showHome()
+                            toast("تم حذف الثيم المستورد")
+                        }.show()
+                }, matchWrap())
+            }
+            root.addView(itemCard, matchWrap(dp(9)))
+        }
+    }
+
+    private fun exportActiveThemePack() {
+        val prepared = File(cacheDir, "mfox_theme_${System.currentTimeMillis()}.mftheme")
+        runCatching {
+            FileOutputStream(prepared).use { MangaFoxThemeStore.exportPack(activeTheme, it) }
+            pendingThemeArchive = prepared
+            val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "application/zip"
+                putExtra(Intent.EXTRA_TITLE, "${activeTheme.id}.mftheme")
+            }
+            startActivityForResult(intent, REQUEST_EXPORT_THEME)
+        }.onFailure {
+            pendingThemeArchive = null
+            prepared.delete()
+            toast("تعذر تجهيز ملف الثيم: ${it.localizedMessage ?: "خطأ"}")
+        }
+    }
+
     private fun addSettingsCard(root: LinearLayout) {
         val settingsCard = card()
         settingsCard.addView(text("إعدادات القراءة والترجمة", 18f, Color.WHITE, true))
@@ -1759,12 +2136,43 @@ class MainActivity : android.app.Activity() {
         }
         root.addView(localEnabled, matchWrap(dp(4)))
 
+        val qwenModes = listOf(
+            "quick" to "سريع · تقسيم أصغر وزمن أقل",
+            "balanced" to "متوازن · الإعداد الموصى به",
+            "precise" to "دقيق · سياق وتعليمات أغنى"
+        )
+        val currentMode = preferences.getString(PREF_QWEN_TRANSLATION_MODE, "balanced") ?: "balanced"
+        val modeButton = actionButton(
+            "أسلوب Qwen: ${qwenModes.firstOrNull { it.first == currentMode }?.second ?: qwenModes[1].second}",
+            false
+        ) { }
+        modeButton.setOnClickListener {
+            AlertDialog.Builder(this)
+                .setTitle("موازنة سرعة الترجمة وجودتها")
+                .setItems(qwenModes.map { it.second }.toTypedArray()) { _, which ->
+                    val chosen = qwenModes[which]
+                    preferences.edit().putString(PREF_QWEN_TRANSLATION_MODE, chosen.first).apply()
+                    modeButton.text = "أسلوب Qwen: ${chosen.second}"
+                    toast("تم ضبط أسلوب Qwen. سيُطبّق على الترجمة التالية")
+                }.show()
+        }
+        root.addView(modeButton, matchWrap(dp(4)))
+        root.addView(text("السريع يقلل حجم دفعة الحوار، والمتوازن يوازن الأداء والسياق، والدقيق يخصص مساحة أكبر للسياق والقاموس. لا يغيّر هذا الاختيار ملفات النموذج أو الترجمات المحفوظة.", 10f, Color.LTGRAY), matchWrap(dp(5)))
+
         val modelStatus = text(
             if (MangaFoxLocalLlm.isModelDownloaded(this)) "حالة النموذج: تم التنزيل · ${if (MangaFoxLocalLlm.isLoaded()) "محمّل في الذاكرة" else "جاهز للتحميل في الذاكرة"}"
             else "حالة النموذج: لم يتم تنزيله بعد · Qwen2.5 1.5B Q4_K_M",
             11f, Color.rgb(232, 218, 184), true
         )
         root.addView(modelStatus, matchWrap(dp(5)))
+        val qwenDiagnostics = text(MangaFoxLocalLlm.diagnosticsSummary(this), 10f, Color.LTGRAY)
+        root.addView(qwenDiagnostics, matchWrap(dp(3)))
+        root.addView(actionButton("تحديث قياس أداء Qwen والذاكرة", false) {
+            qwenDiagnostics.text = MangaFoxLocalLlm.diagnosticsSummary(this)
+            AlertDialog.Builder(this).setTitle("تشخيص محرك Qwen")
+                .setMessage(qwenDiagnostics.text)
+                .setPositiveButton("إغلاق", null).show()
+        }, matchWrap(dp(4)))
         root.addView(actionButton("تنزيل نموذج Qwen المجاني (استئناف عند الانقطاع)", true) {
             if (MangaFoxLocalLlm.isModelDownloaded(this)) {
                 toast("النموذج موجود بالفعل على الجهاز")
@@ -2013,6 +2421,63 @@ class MainActivity : android.app.Activity() {
     @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_IMPORT_IMAGE_ARCHIVE || requestCode == REQUEST_IMPORT_IMAGE_FOLDER) {
+            val uri = data?.data
+            if (resultCode == RESULT_OK && uri != null) {
+                startImageCollectionImport(uri, requestCode == REQUEST_IMPORT_IMAGE_FOLDER)
+            } else if (resultCode != RESULT_CANCELED) {
+                toast("لم يتم اختيار ملف أو مجلد")
+            }
+            return
+        }
+        if (requestCode == REQUEST_IMPORT_THEME) {
+            val uri = data?.data
+            if (resultCode != RESULT_OK || uri == null) {
+                if (resultCode != RESULT_CANCELED) toast("لم يتم اختيار ملف ثيم")
+                return
+            }
+            fontDownloadExecutor.execute {
+                val imported = runCatching {
+                    val input = contentResolver.openInputStream(uri) ?: error("تعذر قراءة ملف الثيم")
+                    input.use { MangaFoxThemeStore.importTheme(this, it) }
+                }
+                runOnUiThread {
+                    imported.onSuccess { theme ->
+                        preferences.edit().putString(PREF_ACTIVE_THEME_ID, theme.id).commit()
+                        activeTheme = theme
+                        applySystemBars()
+                        selectedHomeTab = "themes"
+                        showHome()
+                        toast("تم استيراد وتفعيل الثيم: ${theme.name}")
+                    }.onFailure { error ->
+                        toast("رفض ملف الثيم: ${error.localizedMessage ?: "صيغة غير صالحة"}")
+                    }
+                }
+            }
+            return
+        }
+        if (requestCode == REQUEST_EXPORT_THEME) {
+            val prepared = pendingThemeArchive
+            pendingThemeArchive = null
+            val destination = data?.data
+            if (resultCode != RESULT_OK || destination == null || prepared == null || !prepared.isFile) {
+                prepared?.delete()
+                if (resultCode != RESULT_CANCELED) toast("تعذر حفظ ملف الثيم")
+                return
+            }
+            fontDownloadExecutor.execute {
+                val result = runCatching {
+                    val output = contentResolver.openOutputStream(destination, "w") ?: error("تعذر فتح ملف الوجهة")
+                    output.use { out -> prepared.inputStream().use { it.copyTo(out) } }
+                }
+                prepared.delete()
+                runOnUiThread {
+                    if (result.isSuccess) toast("تم تصدير ملف الثيم الجاهز")
+                    else toast("فشل تصدير الثيم: ${result.exceptionOrNull()?.localizedMessage ?: "خطأ"}")
+                }
+            }
+            return
+        }
         if (requestCode == REQUEST_SAVE_PDF) {
             val prepared = pendingPdfFile
             pendingPdfFile = null
@@ -2551,7 +3016,7 @@ class MainActivity : android.app.Activity() {
             orientation = LinearLayout.VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_RTL
             setPadding(if (editMode) 0 else dp(5), dp(3), if (editMode) 0 else dp(5), dp(5))
-            setBackgroundColor(Color.rgb(9, 9, 13))
+            setBackgroundColor(activeTheme.panel)
         }
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -2576,6 +3041,12 @@ class MainActivity : android.app.Activity() {
         })
         readerChrome.addView(topBar, matchWrap(dp(3)))
         readerChrome.addView(actionButton("☰  القائمة الجانبية", false) { showQuickSidePanel() }, matchWrap(dp(5)))
+        if (MangaFoxRuntime.captureOnlyResult && MangaFoxRuntime.sourcePages.any { it.isNotBlank() && File(it).isFile }) {
+            readerChrome.addView(actionButton("ترجمة الصور المستوردة الآن", true) {
+                MangaFoxAccessibilityService.instance?.retranslateLastResults()
+                    ?: toast("فعّل خدمة Manga FOX أولاً")
+            }, matchWrap(dp(4)))
+        }
         readerChrome.addView(text(
             if (editMode) "MANGA FOX · وضع التحرير المباشر" else "MANGA FOX · قارئ متصل",
             15f, gold, true
@@ -3327,7 +3798,11 @@ class MainActivity : android.app.Activity() {
     private fun text(value: String, size: Float, color: Int, bold: Boolean = false): TextView = TextView(this).apply {
         text = value
         textSize = size
-        setTextColor(color)
+        setTextColor(when (color) {
+            Color.WHITE -> activeTheme.text
+            Color.LTGRAY -> activeTheme.muted
+            else -> color
+        })
         gravity = Gravity.RIGHT
         setPadding(0, dp(5), 0, dp(6))
         if (bold) typeface = Typeface.create("sans-serif", Typeface.BOLD)
@@ -3337,8 +3812,8 @@ class MainActivity : android.app.Activity() {
         text = label
         textSize = 14f
         isAllCaps = false
-        setTextColor(if (primary) Color.BLACK else Color.WHITE)
-        background = rounded(if (primary) gold else Color.rgb(50, 49, 57), 13)
+        setTextColor(if (primary) activeTheme.onAccent else activeTheme.text)
+        background = rounded(if (primary) gold else activeTheme.surfaceAlt, 13)
         setPadding(dp(8), dp(8), dp(8), dp(8))
         setOnClickListener { action() }
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(50)).apply {
@@ -8280,4 +8755,199 @@ object MangaFoxRuntime {
     @Volatile var activeChapterName: String = "الفصل المترجم"
     @Volatile var activeArchiveId: String = ""
     @Volatile var pendingEdits: Boolean = false
+}
+
+/**
+ * @N5CR4 — Manga FOX theme model and bounded theme-pack reader.
+ * Theme packs are ZIP files containing one theme.json, or a plain theme JSON file.
+ * No paths/assets/scripts are extracted or executed.
+ */
+data class MangaFoxTheme(
+    val id: String,
+    val name: String,
+    val background: Int,
+    val panel: Int,
+    val accent: Int,
+    val surfaceAlt: Int,
+    val text: Int,
+    val muted: Int,
+    val onAccent: Int,
+    val isCustom: Boolean = false
+) {
+    fun toJson(): JSONObject = JSONObject()
+        .put("format", "MANGAFOX_THEME")
+        .put("version", 1)
+        .put("id", id)
+        .put("name", name)
+        .put("background", String.format(Locale.US, "#%06X", 0xFFFFFF and background))
+        .put("panel", String.format(Locale.US, "#%06X", 0xFFFFFF and panel))
+        .put("accent", String.format(Locale.US, "#%06X", 0xFFFFFF and accent))
+        .put("surfaceAlt", String.format(Locale.US, "#%06X", 0xFFFFFF and surfaceAlt))
+        .put("text", String.format(Locale.US, "#%06X", 0xFFFFFF and text))
+        .put("muted", String.format(Locale.US, "#%06X", 0xFFFFFF and muted))
+        .put("onAccent", String.format(Locale.US, "#%06X", 0xFFFFFF and onAccent))
+}
+
+object MangaFoxThemeStore {
+    val defaultTheme = MangaFoxTheme(
+        "fox_noir", "FOX Noir · الأسود والذهبي",
+        Color.rgb(10, 10, 13), Color.rgb(25, 25, 31), Color.rgb(255, 190, 65),
+        Color.rgb(50, 49, 57), Color.WHITE, Color.LTGRAY, Color.BLACK
+    )
+
+    private val builtIns = listOf(
+        defaultTheme,
+        MangaFoxTheme("purple_nebula", "Purple Nebula · سديم بنفسجي", Color.rgb(9, 7, 20), Color.rgb(27, 20, 45), Color.rgb(180, 112, 255), Color.rgb(54, 39, 78), Color.rgb(247, 241, 255), Color.rgb(190, 177, 211), Color.WHITE),
+        MangaFoxTheme("ocean_blue", "Ocean Blue · محيط أزرق", Color.rgb(5, 16, 27), Color.rgb(14, 34, 51), Color.rgb(65, 190, 235), Color.rgb(26, 57, 78), Color.rgb(235, 248, 255), Color.rgb(165, 195, 211), Color.rgb(3, 20, 31)),
+        MangaFoxTheme("sakura", "Sakura · ساكورا", Color.rgb(25, 10, 20), Color.rgb(48, 22, 38), Color.rgb(255, 126, 178), Color.rgb(78, 38, 61), Color.rgb(255, 241, 247), Color.rgb(218, 181, 198), Color.rgb(48, 10, 30)),
+        MangaFoxTheme("emerald", "Emerald · زمردي", Color.rgb(6, 17, 15), Color.rgb(17, 37, 31), Color.rgb(76, 214, 151), Color.rgb(31, 65, 52), Color.rgb(237, 255, 246), Color.rgb(171, 207, 188), Color.rgb(5, 31, 21)),
+        MangaFoxTheme("crimson", "Crimson · قرمزي", Color.rgb(20, 7, 10), Color.rgb(43, 17, 23), Color.rgb(242, 83, 105), Color.rgb(73, 28, 38), Color.rgb(255, 241, 243), Color.rgb(216, 174, 182), Color.WHITE),
+        MangaFoxTheme("blood_moon", "Blood Moon · قمر دموي", Color.rgb(18, 7, 13), Color.rgb(40, 16, 27), Color.rgb(235, 74, 112), Color.rgb(65, 26, 42), Color.rgb(255, 241, 245), Color.rgb(220, 174, 189), Color.WHITE),
+        MangaFoxTheme("midnight_cyan", "Midnight Cyan · ليلي سماوي", Color.rgb(5, 11, 17), Color.rgb(13, 27, 38), Color.rgb(55, 220, 220), Color.rgb(24, 48, 61), Color.rgb(233, 253, 255), Color.rgb(164, 197, 204), Color.rgb(3, 25, 29)),
+        MangaFoxTheme("copper", "Copper Forge · نحاسي", Color.rgb(19, 12, 9), Color.rgb(39, 25, 18), Color.rgb(218, 139, 83), Color.rgb(66, 42, 29), Color.rgb(255, 244, 232), Color.rgb(205, 176, 151), Color.rgb(32, 17, 9))
+    )
+
+    fun resolve(context: Context, id: String?): MangaFoxTheme {
+        val key = id?.trim().orEmpty()
+        return builtIns.firstOrNull { it.id == key } ?: customFiles(context)
+            .firstNotNullOfOrNull { file -> runCatching { parseTheme(JSONObject(file.readText(Charsets.UTF_8)), true) }.getOrNull()?.takeIf { it.id == key } }
+            ?: defaultTheme
+    }
+
+    fun all(context: Context): List<MangaFoxTheme> {
+        val custom = customFiles(context).mapNotNull { file ->
+            runCatching { parseTheme(JSONObject(file.readText(Charsets.UTF_8)), true) }.getOrNull()
+        }
+        return builtIns + custom
+    }
+
+    fun deleteCustom(context: Context, id: String): Boolean {
+        if (builtIns.any { it.id == id }) return false
+        val file = File(themeDirectory(context), safeId(id) + ".json")
+        return !file.exists() || file.delete()
+    }
+
+    fun importTheme(context: Context, input: InputStream): MangaFoxTheme {
+        val bytes = readBounded(input, 2 * 1024 * 1024)
+        val jsonBytes = if (bytes.size >= 4 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4b.toByte()) {
+            var found: ByteArray? = null
+            var total = 0
+            ZipInputStream(bytes.inputStream()).use { zip ->
+                while (true) {
+                    val entry = zip.nextEntry ?: break
+                    val name = entry.name.replace('\\', '/')
+                    require(!name.startsWith("/") && !name.split('/').any { it == ".." }) { "مسار غير آمن داخل حزمة الثيم" }
+                    if (entry.isDirectory) {
+                        val scratch = ByteArray(4096)
+                        while (true) {
+                            val count = zip.read(scratch)
+                            if (count < 0) break
+                            total += count
+                            require(total <= 512 * 1024) { "الحزمة تحتوي بيانات زائدة" }
+                        }
+                        zip.closeEntry()
+                        continue
+                    }
+                    if (name.equals("theme.json", true) || name.endsWith("/theme.json", true) || name.endsWith(".json", true)) {
+                        val candidate = readBounded(zip, 256 * 1024)
+                        total += candidate.size
+                        require(total <= 256 * 1024) { "بيانات الثيم أكبر من الحد المسموح" }
+                        if (found == null) found = candidate
+                    } else {
+                        // Drain the entry safely without extracting it.
+                        val scratch = ByteArray(4096)
+                        while (true) {
+                            val count = zip.read(scratch)
+                            if (count < 0) break
+                            total += count
+                            require(total <= 512 * 1024) { "الحزمة تحتوي بيانات زائدة" }
+                        }
+                    }
+                    zip.closeEntry()
+                }
+            }
+            requireNotNull(found) { "لم يتم العثور على theme.json داخل الحزمة" }
+        } else bytes
+
+        val json = JSONObject(String(jsonBytes, Charsets.UTF_8))
+        require(json.optString("format") == "MANGAFOX_THEME") { "صيغة الثيم غير معروفة" }
+        require(json.optInt("version", 0) == 1) { "إصدار الثيم غير مدعوم" }
+        val parsed = parseTheme(json, true)
+        val uniqueId = uniqueCustomId(context, parsed.id)
+        val theme = parsed.copy(id = uniqueId, isCustom = true)
+        val target = File(themeDirectory(context), "$uniqueId.json")
+        val temp = File(target.parentFile, target.name + ".tmp")
+        temp.writeText(theme.toJson().put("id", uniqueId).toString(), Charsets.UTF_8)
+        if (!temp.renameTo(target)) {
+            temp.copyTo(target, overwrite = true)
+            temp.delete()
+        }
+        return theme
+    }
+
+    fun exportPack(theme: MangaFoxTheme, output: OutputStream) {
+        ZipOutputStream(output).use { zip ->
+            zip.putNextEntry(ZipEntry("theme.json"))
+            zip.write(theme.toJson().toString(2).toByteArray(Charsets.UTF_8))
+            zip.closeEntry()
+            zip.putNextEntry(ZipEntry("README.txt"))
+            zip.write("MANGA FOX THEME PACK v1\nImport this .mftheme file from Manga FOX > Themes.\n".toByteArray(Charsets.UTF_8))
+            zip.closeEntry()
+        }
+    }
+
+    private fun parseTheme(json: JSONObject, custom: Boolean): MangaFoxTheme {
+        val name = json.optString("name").trim()
+        require(name.isNotBlank() && name.length <= 48) { "اسم الثيم فارغ أو طويل" }
+        fun parseColor(key: String, fallback: Int): Int {
+            val value = json.optString(key, "").trim()
+            if (value.isBlank()) return fallback
+            require(Regex("^#[0-9A-Fa-f]{6}$").matches(value)) { "قيمة اللون $key غير صالحة" }
+            return Color.parseColor(value)
+        }
+        val rawId = json.optString("id", "custom_${System.currentTimeMillis()}")
+        val id = safeId(rawId)
+        require(id.isNotBlank()) { "معرّف الثيم غير صالح" }
+        val base = defaultTheme
+        val background = parseColor("background", base.background)
+        val panel = parseColor("panel", base.panel)
+        val accent = parseColor("accent", base.accent)
+        val surfaceAlt = parseColor("surfaceAlt", panel)
+        val text = parseColor("text", if (isLight(background)) Color.rgb(30, 27, 22) else Color.WHITE)
+        val muted = parseColor("muted", if (isLight(background)) Color.rgb(100, 91, 78) else Color.LTGRAY)
+        val onAccent = parseColor("onAccent", if (isLight(accent)) Color.BLACK else Color.WHITE)
+        return MangaFoxTheme(id, name, background, panel, accent, surfaceAlt, text, muted, onAccent, custom)
+    }
+
+    private fun isLight(color: Int): Boolean =
+        (Color.red(color) * 299 + Color.green(color) * 587 + Color.blue(color) * 114) / 1000 >= 150
+
+    private fun safeId(value: String): String = value.lowercase(Locale.ROOT)
+        .replace(Regex("[^a-z0-9_-]"), "_").trim('_').take(40)
+
+    private fun uniqueCustomId(context: Context, requested: String): String {
+        val candidate = safeId(requested).ifBlank { "custom_theme" }
+        if (builtIns.none { it.id == candidate } && !File(themeDirectory(context), "$candidate.json").exists()) return candidate
+        return "${candidate.take(28)}_${System.currentTimeMillis().toString().takeLast(8)}"
+    }
+
+    private fun customFiles(context: Context): List<File> =
+        themeDirectory(context).listFiles()?.filter { it.isFile && it.extension.equals("json", true) }
+            ?.sortedBy { it.name.lowercase(Locale.ROOT) } ?: emptyList()
+
+    private fun themeDirectory(context: Context): File = File(context.filesDir, "mfox_themes").apply { mkdirs() }
+
+    private fun readBounded(input: InputStream, maxBytes: Int): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(8192)
+        var total = 0
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            total += count
+            require(total <= maxBytes) { "حجم ملف الثيم يتجاوز الحد المسموح" }
+            out.write(buffer, 0, count)
+        }
+        return out.toByteArray()
+    }
 }

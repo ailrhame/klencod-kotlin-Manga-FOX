@@ -1,0 +1,13 @@
+{
+  "format": "MANGAFOX_THEME",
+  "version": 1,
+  "id": "my_custom_theme",
+  "name": "My Custom Theme",
+  "background": "#0B0B14",
+  "panel": "#1A1726",
+  "accent": "#FFB800",
+  "surfaceAlt": "#302943",
+  "text": "#F5F5F5",
+  "muted": "#A9A4B6",
+  "onAccent": "#111111"
+}
