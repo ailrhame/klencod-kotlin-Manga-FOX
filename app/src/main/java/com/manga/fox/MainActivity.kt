@@ -606,7 +606,7 @@ class MainActivity : android.app.Activity() {
             setPadding(0, dp(14), 0, dp(4))
         }, matchWrap())
         root.addView(TextView(this).apply {
-            text = "حقوقي · N5CR4  ↗"
+            text = "programmer  · N5CR4  ↗"
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(gold)
@@ -823,20 +823,43 @@ class MainActivity : android.app.Activity() {
         }
         progressCard.addView(homeProgress, matchWrap(dp(8)))
         progressCard.addView(actionButton("حذف العملية الحالية", false) {
-            AlertDialog.Builder(this)
+            // Use an explicit custom view instead of AlertDialog.setItems + setMessage.
+            // Some OEM dialog implementations hide the item list when both are set.
+            val cancelChoices = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+                setPadding(dp(20), dp(4), dp(20), dp(8))
+            }
+            cancelChoices.addView(
+                text("اختر طريقة الإلغاء. لن تتأثر نتائج الفصول السابقة.", 13f, activeTheme.muted),
+                matchWrap(dp(8))
+            )
+
+            lateinit var cancelDialog: AlertDialog
+            fun performCancel(keepCompleted: Boolean) {
+                cancelDialog.dismiss()
+                val service = MangaFoxAccessibilityService.instance
+                if (service == null) toast("خدمة Manga FOX غير متصلة")
+                else service.cancelCurrentOperation(keepCompleted)
+            }
+
+            cancelChoices.addView(
+                actionButton("إيقاف مع الاحتفاظ بالصفحات المكتملة", false) {
+                    performCancel(true)
+                }, matchWrap(dp(4))
+            )
+            cancelChoices.addView(
+                actionButton("إيقاف وحذف جميع صفحات هذه العملية", false) {
+                    performCancel(false)
+                }, matchWrap(dp(4))
+            )
+
+            cancelDialog = AlertDialog.Builder(this)
                 .setTitle("إلغاء العملية الحالية؟")
-                .setMessage("اختر طريقة الإلغاء. لن تتأثر نتائج الفصول السابقة.")
-                .setItems(arrayOf(
-                    "إيقاف مع الاحتفاظ بالصفحات المكتملة",
-                    "إيقاف وحذف جميع صفحات هذه العملية"
-                )) { _, which ->
-                    val keepCompleted = which == 0
-                    val service = MangaFoxAccessibilityService.instance
-                    if (service == null) toast("خدمة Manga FOX غير متصلة")
-                    else service.cancelCurrentOperation(keepCompleted)
-                }
+                .setView(cancelChoices)
                 .setNegativeButton("تراجع", null)
-                .show()
+                .create()
+            cancelDialog.show()
         }, matchWrap(dp(4)))
         progressCard.addView(actionButton("إيقاف الترجمة مؤقتاً / استئناف", false) {
             MangaFoxAccessibilityService.instance?.toggleTranslationPause()
