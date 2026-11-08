@@ -54,6 +54,7 @@ import android.view.View
 import android.view.WindowManager
 import android.view.animation.AccelerateDecelerateInterpolator
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -156,6 +157,7 @@ internal const val PREF_ZH_SCRIPT = "chinese_script_variant"
 internal const val PREF_AI_SECRET_CIPHER = "ai_translation_secret_cipher"
 internal const val PREF_AI_SECRET_IV = "ai_translation_secret_iv"
 internal const val PREF_QWEN_TRANSLATION_MODE = "qwen_translation_quality_mode_v1"
+internal const val PREF_AUTO_NEXT_CHAPTER = "auto_next_chapter_v1"
 internal const val PREF_ACTIVE_THEME_ID = "mfox_active_theme_v1"
 internal const val REQUEST_IMPORT_THEME = 718
 internal const val REQUEST_EXPORT_THEME = 719
@@ -606,7 +608,7 @@ class MainActivity : android.app.Activity() {
             setPadding(0, dp(14), 0, dp(4))
         }, matchWrap())
         root.addView(TextView(this).apply {
-            text = "programmer  · N5CR4  ↗"
+            text = "programmer · N5CR4  ↗"
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(gold)
@@ -809,6 +811,18 @@ class MainActivity : android.app.Activity() {
             MangaFoxAccessibilityService.instance?.let { it.stopCaptureByUser() } ?: toast("خدمة Manga Fox غير متصلة")
         }, matchWrap(dp(5)))
         actions.addView(actionButton("عرض آخر نتيجة مترجمة", false) { showResults() }, matchWrap())
+        val autoNext = CheckBox(this).apply {
+            text = "الانتقال تلقائياً للفصل التالي عند العثور على زر (الفصل التالي)"
+            textSize = 11f
+            setTextColor(Color.LTGRAY)
+            buttonTintList = android.content.res.ColorStateList.valueOf(gold)
+            isChecked = preferences.getBoolean(PREF_AUTO_NEXT_CHAPTER, false)
+            setOnCheckedChangeListener { _, checked ->
+                preferences.edit().putBoolean(PREF_AUTO_NEXT_CHAPTER, checked).apply()
+                toast(if (checked) "سيبحث عن زر الفصل التالي فقط بعد اكتمال ترجمة الفصل" else "تم إيقاف الانتقال التلقائي")
+            }
+        }
+        actions.addView(autoNext, matchWrap(dp(4)))
         root.addView(actions, matchWrap(dp(12)))
 
         val progressCard = card()
@@ -823,43 +837,20 @@ class MainActivity : android.app.Activity() {
         }
         progressCard.addView(homeProgress, matchWrap(dp(8)))
         progressCard.addView(actionButton("حذف العملية الحالية", false) {
-            // Use an explicit custom view instead of AlertDialog.setItems + setMessage.
-            // Some OEM dialog implementations hide the item list when both are set.
-            val cancelChoices = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                layoutDirection = View.LAYOUT_DIRECTION_RTL
-                setPadding(dp(20), dp(4), dp(20), dp(8))
-            }
-            cancelChoices.addView(
-                text("اختر طريقة الإلغاء. لن تتأثر نتائج الفصول السابقة.", 13f, activeTheme.muted),
-                matchWrap(dp(8))
-            )
-
-            lateinit var cancelDialog: AlertDialog
-            fun performCancel(keepCompleted: Boolean) {
-                cancelDialog.dismiss()
-                val service = MangaFoxAccessibilityService.instance
-                if (service == null) toast("خدمة Manga FOX غير متصلة")
-                else service.cancelCurrentOperation(keepCompleted)
-            }
-
-            cancelChoices.addView(
-                actionButton("إيقاف مع الاحتفاظ بالصفحات المكتملة", false) {
-                    performCancel(true)
-                }, matchWrap(dp(4))
-            )
-            cancelChoices.addView(
-                actionButton("إيقاف وحذف جميع صفحات هذه العملية", false) {
-                    performCancel(false)
-                }, matchWrap(dp(4))
-            )
-
-            cancelDialog = AlertDialog.Builder(this)
+            AlertDialog.Builder(this)
                 .setTitle("إلغاء العملية الحالية؟")
-                .setView(cancelChoices)
+                .setMessage("اختر طريقة الإلغاء. لن تتأثر نتائج الفصول السابقة.")
+                .setItems(arrayOf(
+                    "إيقاف مع الاحتفاظ بالصفحات المكتملة",
+                    "إيقاف وحذف جميع صفحات هذه العملية"
+                )) { _, which ->
+                    val keepCompleted = which == 0
+                    val service = MangaFoxAccessibilityService.instance
+                    if (service == null) toast("خدمة Manga FOX غير متصلة")
+                    else service.cancelCurrentOperation(keepCompleted)
+                }
                 .setNegativeButton("تراجع", null)
-                .create()
-            cancelDialog.show()
+                .show()
         }, matchWrap(dp(4)))
         progressCard.addView(actionButton("إيقاف الترجمة مؤقتاً / استئناف", false) {
             MangaFoxAccessibilityService.instance?.toggleTranslationPause()
@@ -986,6 +977,11 @@ class MainActivity : android.app.Activity() {
         header.addView(text("إجمالي الفصول المحفوظة: ${chapters.size}", 13f, Color.WHITE, true).apply { setPadding(0, dp(8), 0, 0) })
         header.addView(actionButton("استيراد فصل من ZIP / CBZ", true) { pickImageArchive() }, matchWrap(dp(4)))
         header.addView(actionButton("استيراد مجلد صور من الهاتف", false) { pickImageFolder() }, matchWrap(dp(4)))
+        if (chapters.isNotEmpty()) {
+            header.addView(actionButton("إنشاء طابور ترجمة لفصول متعددة في الخلفية", true) {
+                showChapterQueuePicker(chapters)
+            }, matchWrap(dp(5)))
+        }
         root.addView(header, matchWrap(dp(10)))
         if (chapters.isEmpty()) {
             root.addView(text("لا توجد فصول محفوظة بعد. افتح قسم الترجمة، واكتب اسم العمل ورقم الفصل قبل بدء الالتقاط.", 14f, Color.LTGRAY)
@@ -2229,14 +2225,39 @@ class MainActivity : android.app.Activity() {
         root.addView(modeButton, matchWrap(dp(4)))
         root.addView(text("السريع يقلل حجم دفعة الحوار، والمتوازن يوازن الأداء والسياق، والدقيق يخصص مساحة أكبر للسياق والقاموس. لا يغيّر هذا الاختيار ملفات النموذج أو الترجمات المحفوظة.", 10f, Color.LTGRAY), matchWrap(dp(5)))
 
+
+
         val modelStatus = text(
             if (MangaFoxLocalLlm.isModelDownloaded(this)) "حالة النموذج: تم التنزيل · ${if (MangaFoxLocalLlm.isLoaded()) "محمّل في الذاكرة" else "جاهز للتحميل في الذاكرة"}"
-            else "حالة النموذج: لم يتم تنزيله بعد · Qwen2.5 1.5B Q4_K_M",
+            else "حالة النموذج: لم يتم تنزيله بعد · ${MangaFoxLocalLlm.modelLabel(this)}",
             11f, Color.rgb(232, 218, 184), true
         )
         root.addView(modelStatus, matchWrap(dp(5)))
         val qwenDiagnostics = text(MangaFoxLocalLlm.diagnosticsSummary(this), 10f, Color.LTGRAY)
         root.addView(qwenDiagnostics, matchWrap(dp(3)))
+
+        val modelSelectionButton = actionButton(
+            "النموذج: ${MangaFoxLocalLlm.modelChoices().firstOrNull { it.first == MangaFoxLocalLlm.modelSelection(this) }?.second ?: "تلقائي"}",
+            false
+        ) { }
+        modelSelectionButton.setOnClickListener {
+            val choices = MangaFoxLocalLlm.modelChoices()
+            val selectedId = MangaFoxLocalLlm.modelSelection(this)
+            AlertDialog.Builder(this)
+                .setTitle("اختيار نموذج الترجمة المحلي")
+                .setItems(choices.map { it.second }.toTypedArray()) { _, which ->
+                    val chosen = choices[which]
+                    MangaFoxLocalLlm.setModelSelection(this, chosen.first)
+                    modelSelectionButton.text = "النموذج: ${chosen.second}"
+                    modelStatus.text = if (MangaFoxLocalLlm.isModelDownloaded(this))
+                        "حالة النموذج: ${MangaFoxLocalLlm.modelLabel(this)} · تم التنزيل"
+                    else "حالة النموذج: ${MangaFoxLocalLlm.modelLabel(this)} · يحتاج إلى تنزيل"
+                    qwenDiagnostics.text = MangaFoxLocalLlm.diagnosticsSummary(this)
+                    toast("تم اختيار ${chosen.second}. قد يحتاج النموذج الجديد إلى تنزيل منفصل")
+                }
+                .setNegativeButton("إغلاق", null).show()
+        }
+        root.addView(modelSelectionButton, matchWrap(dp(5)))
         root.addView(actionButton("تحديث قياس أداء Qwen والذاكرة", false) {
             qwenDiagnostics.text = MangaFoxLocalLlm.diagnosticsSummary(this)
             AlertDialog.Builder(this).setTitle("تشخيص محرك Qwen")
@@ -2256,7 +2277,7 @@ class MainActivity : android.app.Activity() {
             }
             Thread {
                 val result = runCatching {
-                    MangaFoxLocalLlm.downloadModel(this) { done, total ->
+                    MangaFoxLocalLlm.downloadModel(this, MangaFoxLocalLlm.selectedModelId(this)) { done, total ->
                         runOnUiThread {
                             if (total > 0) {
                                 progress.isIndeterminate = false
@@ -2283,7 +2304,7 @@ class MainActivity : android.app.Activity() {
             }
             toast("جارٍ تحميل النموذج محلياً…")
             fontDownloadExecutor.execute {
-                val attempt = runCatching { MangaFoxLocalLlm.load(this) }
+                val attempt = runCatching { MangaFoxLocalLlm.load(this, MangaFoxLocalLlm.selectedModelId(this)) }
                 val loaded = attempt.getOrDefault(false)
                 val failure = if (loaded) "" else (MangaFoxLocalLlm.lastLoadError().ifBlank {
                     attempt.exceptionOrNull()?.message ?: "سبب غير محدد"
@@ -2294,7 +2315,7 @@ class MainActivity : android.app.Activity() {
                 }
             }
         }, matchWrap(dp(4)))
-        root.addView(text("النموذج: Qwen2.5-1.5B-Instruct Q4_K_M · المصدر: Hugging Face · Runtime: llama.cpp · يعمل على CPU ARM64. إذا لم يتوفر النموذج أو فشل التحميل، يستمر مسار ML Kit الحالي دون تعطيل بقية التطبيق.", 10f, Color.rgb(190, 185, 175)), matchWrap(dp(6)))
+        root.addView(text("النموذج 1.5B أو 3B بصيغة Q4_K_M · الاختيار التلقائي يعتمد على RAM المتاحة فعلياً. نموذج 3B يقارب 1.93GB للتنزيل ويحتاج مساحة وذاكرة تشغيل إضافيتين. عند تعذر تحميله يعود التطبيق إلى ML Kit.", 10f, Color.rgb(190, 185, 175)), matchWrap(dp(6)))
     }
 
     private fun showLearnedTranslationDialog(sourceText: String) {
@@ -3095,6 +3116,256 @@ class MainActivity : android.app.Activity() {
         }
     }
 
+    private data class ReviewEditorRow(
+        val pageIndex: Int,
+        val layerIndex: Int,
+        val layerFile: File,
+        val editor: EditText,
+        val status: String
+    )
+
+    private fun countReviewLayers(): Int {
+        var total = 0
+        MangaFoxRuntime.translationLayerFiles.forEach { path ->
+            val file = File(path)
+            if (!file.isFile) return@forEach
+            val layers = runCatching { JSONArray(file.readText(Charsets.UTF_8)) }.getOrNull() ?: return@forEach
+            for (i in 0 until layers.length()) {
+                val status = layers.optJSONObject(i)?.optString("status", "translated") ?: continue
+                if (status == "review" || status == "failed") total++
+            }
+        }
+        return total
+    }
+
+    private fun showReviewQueue() {
+        val rows = ArrayList<ReviewEditorRow>()
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+        MangaFoxRuntime.translationLayerFiles.forEachIndexed { pageIndex, path ->
+            val file = File(path)
+            if (!file.isFile) return@forEachIndexed
+            val layers = runCatching { JSONArray(file.readText(Charsets.UTF_8)) }.getOrNull() ?: return@forEachIndexed
+            for (layerIndex in 0 until layers.length()) {
+                val item = layers.optJSONObject(layerIndex) ?: continue
+                val status = item.optString("status", "translated")
+                if (status != "review" && status != "failed") continue
+                val sourceText = item.optString("source").trim()
+                val translatedText = item.optString("translated")
+                val card = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(10), dp(9), dp(10), dp(9))
+                    background = rounded(Color.rgb(35, 32, 43), 12)
+                }
+                val statusLabel = if (status == "failed") "🔴 فشلت" else "🟡 تحتاج مراجعة"
+                card.addView(text("صفحة ${pageIndex + 1} · فقاعة ${layerIndex + 1} · $statusLabel", 12f, if (status == "failed") Color.rgb(255, 110, 110) else Color.rgb(255, 205, 85), true))
+                card.addView(text(sourceText.ifBlank { "لا يوجد نص أصلي محفوظ" }, 12f, Color.LTGRAY).apply { setPadding(0, dp(5), 0, dp(5)) }, matchWrap())
+                val editor = EditText(this).apply {
+                    setText(translatedText)
+                    hint = "اكتب الترجمة العربية المصححة"
+                    textSize = 15f
+                    minLines = 2
+                    setTextColor(Color.WHITE)
+                    setHintTextColor(Color.GRAY)
+                    setPadding(dp(9), dp(7), dp(9), dp(7))
+                    background = rounded(Color.rgb(22, 20, 29), 8)
+                }
+                card.addView(editor, matchWrap(dp(6)))
+                content.addView(card, matchWrap(dp(8)))
+                rows.add(ReviewEditorRow(pageIndex, layerIndex, file, editor, status))
+            }
+        }
+        if (rows.isEmpty()) {
+            content.addView(text("ممتاز! لا توجد فقاعات صفراء أو حمراء محفوظة للمراجعة.", 14f, Color.LTGRAY).apply {
+                setPadding(dp(12), dp(18), dp(12), dp(18))
+            }, matchWrap())
+        }
+        scroll.addView(content)
+        AlertDialog.Builder(this)
+            .setTitle("مراجعة سريعة · ${rows.size} فقاعة")
+            .setView(scroll)
+            .setNegativeButton("إغلاق", null)
+            .setPositiveButton("حفظ التعديلات وإعادة الرسم") { _, _ ->
+                if (rows.isEmpty()) return@setPositiveButton
+                val byFile = rows.groupBy { it.layerFile.absolutePath }
+                var saved = 0
+                byFile.forEach fileGroup@{ (_, fileRows) ->
+                    val file = fileRows.first().layerFile
+                    val layers = runCatching { JSONArray(file.readText(Charsets.UTF_8)) }.getOrNull() ?: return@fileGroup
+                    fileRows.forEach rowLoop@{ row ->
+                        val item = layers.optJSONObject(row.layerIndex) ?: return@rowLoop
+                        val value = row.editor.text.toString().trim()
+                        if (value.isBlank()) {
+                            item.put("translated", "").put("status", "failed")
+                        } else {
+                            val hasArabic = value.any { it in '\u0600'..'\u06FF' || it in '\u0750'..'\u077F' }
+                            item.put("translated", value).put("status", if (hasArabic) "translated" else "review")
+                        }
+                        saved++
+                    }
+                    val tmp = File(file.parentFile, file.name + ".review.tmp")
+                    runCatching {
+                        tmp.writeText(layers.toString(), Charsets.UTF_8)
+                        if (!tmp.renameTo(file)) {
+                            tmp.copyTo(file, overwrite = true)
+                            tmp.delete()
+                        }
+                    }.onFailure { toast("تعذر حفظ طبقة: ${it.message}") }
+                }
+                if (saved > 0) {
+                    MangaFoxRuntime.pendingEdits = true
+                    syncCurrentArchiveAfterLayerChange()
+                    val service = MangaFoxAccessibilityService.instance
+                    if (service != null) service.rerenderLastResultsFromLayers { showResults() }
+                    else {
+                        toast("حُفظت $saved تعديلات. فعّل خدمة Manga FOX لتطبيقها على الصور")
+                        showResults()
+                    }
+                }
+            }.show()
+    }
+
+    private fun recurringNameCandidates(): List<Pair<String, Int>> {
+        val counts = LinkedHashMap<String, Int>()
+        val stop = setOf("This", "That", "What", "When", "Where", "How", "You", "Your", "They", "Them", "Then", "But", "The", "And", "For", "Not", "Yes", "No", "Why", "Who", "She", "Her", "His", "Him", "Have", "Has", "Was", "Are", "Can", "Will", "Lord", "Master", "Miss", "Sir")
+        val latinName = Regex("(?<![A-Za-z])[A-Z][a-z]{2,15}(?:[-'][A-Z]?[a-z]{2,12})?(?![A-Za-z])")
+        val cjkName = Regex("[\\u4E00-\\u9FFF]{2,4}")
+        MangaFoxRuntime.translationLayerFiles.forEach { path ->
+            val file = File(path)
+            if (!file.isFile) return@forEach
+            val layers = runCatching { JSONArray(file.readText(Charsets.UTF_8)) }.getOrNull() ?: return@forEach
+            for (i in 0 until layers.length()) {
+                val sourceText = layers.optJSONObject(i)?.optString("source").orEmpty()
+                latinName.findAll(sourceText).forEach { match ->
+                    val name = match.value.trim()
+                    if (name !in stop) counts[name] = (counts[name] ?: 0) + 1
+                }
+                cjkName.findAll(sourceText).forEach { match ->
+                    val name = match.value.trim()
+                    if (name.isNotBlank()) counts[name] = (counts[name] ?: 0) + 1
+                }
+            }
+        }
+        return counts.entries.filter { it.value >= 2 }
+            .sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenBy { it.key })
+            .take(24).map { it.key to it.value }
+    }
+
+    private fun showRecurringNameSuggestions() {
+        val candidates = recurringNameCandidates()
+        if (candidates.isEmpty()) {
+            AlertDialog.Builder(this).setTitle("اقتراح الأسماء")
+                .setMessage("لم أجد أسماء متكررة بوضوح في نصوص الفقاعات المحفوظة. قد تحتوي نتائج OCR على كلمات عادية، لذلك لن أضيفها تلقائياً دون مراجعتك.")
+                .setPositiveButton("إغلاق", null).show()
+            return
+        }
+        val progress = android.app.ProgressDialog(this).apply {
+            setTitle("اقتراح الأسماء بالعربية")
+            setMessage("يفحص Qwen الأسماء المتكررة ويقترح نقلها صوتياً إلى العربية…")
+            setCancelable(false)
+        }
+        progress.show()
+        Thread {
+            val store = MangaFoxKnowledgeStore(this)
+            val suggestions = runCatching {
+                if (!MangaFoxLocalLlm.isModelDownloaded(this)) emptyMap()
+                else MangaFoxLocalLlm.suggestArabicNames(
+                    this,
+                    candidates.mapIndexed { index, pair -> index to pair.first },
+                    store.glossary(),
+                    store.characters()
+                )
+            }.getOrElse { error ->
+                runOnUiThread { toast("تعذر توليد المقابلات عبر Qwen: ${error.message?.take(100).orEmpty()}") }
+                emptyMap()
+            }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) {
+                    runCatching { progress.dismiss() }
+                    return@runOnUiThread
+                }
+                runCatching { progress.dismiss() }
+                val scroll = ScrollView(this)
+                val content = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(12), dp(6), dp(12), dp(6))
+                }
+                val inputs = ArrayList<Pair<String, EditText>>()
+                candidates.forEachIndexed { index, (name, count) ->
+                    val line = LinearLayout(this).apply {
+                        orientation = LinearLayout.VERTICAL
+                        setPadding(0, dp(4), 0, dp(6))
+                    }
+                    line.addView(text("$name · تكرر $count مرات", 12f, Color.WHITE, true))
+                    val arabic = EditText(this).apply {
+                        hint = "الاسم بالعربية"
+                        textSize = 14f
+                        setTextColor(Color.WHITE)
+                        suggestions[index]?.let { setText(it) }
+                    }
+                    line.addView(arabic, matchWrap(dp(3)))
+                    content.addView(line, matchWrap(dp(3)))
+                    inputs.add(name to arabic)
+                }
+                scroll.addView(content)
+                val aiCount = suggestions.size
+                AlertDialog.Builder(this)
+                    .setTitle("أسماء متكررة · ${if (aiCount > 0) "اقتراحات Qwen جاهزة" else "أدخل المقابل عند الحاجة"}")
+                    .setMessage(
+                        if (aiCount > 0) "اقترح Qwen نقلاً صوتياً عربياً لـ $aiCount اسم. راجع النتائج وعدّلها، ثم احفظ الأسماء المكتملة بضغطة واحدة."
+                        else "لم تتوفر اقتراحات آلية (النموذج غير منزّل أو غير متاح). يمكنك إدخال المقابل العربي يدوياً، ولن يُحفظ أي اسم فارغ."
+                    )
+                    .setView(scroll)
+                    .setNegativeButton("إلغاء", null)
+                    .setPositiveButton("حفظ الأسماء المكتملة في المعجم") { _, _ ->
+                        var added = 0
+                        inputs.forEach { (source, editor) ->
+                            val arabic = editor.text.toString().trim()
+                            if (arabic.isNotBlank()) {
+                                store.saveGlossaryEntry(
+                                    MangaFoxKnowledgeStore.GlossaryEntry(
+                                        source, arabic,
+                                        "اقتراح اسم متكرر بمساعدة Qwen · ${MangaFoxRuntime.activeChapterName}"
+                                    )
+                                )
+                                added++
+                            }
+                        }
+                        toast(if (added > 0) "أُضيف $added اسم إلى المعجم" else "لم تُضف أسماء؛ لا توجد مقابلات عربية مكتملة")
+                    }.show()
+            }
+        }.start()
+    }
+
+    private fun showChapterQueuePicker(chapters: List<MangaFoxChapterArchive.ChapterInfo>) {
+        if (MangaFoxAccessibilityService.instance == null) {
+            toast("فعّل خدمة Manga FOX أولاً لتشغيل طابور الترجمة")
+            return
+        }
+        val queueable = chapters.filter { it.pageCount > 0 && it.sourcePageCount == it.pageCount }
+        if (queueable.isEmpty()) {
+            toast("لا توجد فصول بأصول الصور محفوظة. لا يمكن إعادة ترجمة النتائج وحدها دون الصورة الأصلية.")
+            return
+        }
+        val selected = BooleanArray(queueable.size)
+        val labels = queueable.map { "${it.workName} · ${it.chapterName} · ${it.sourcePageCount} صورة أصلية" }.toTypedArray()
+        AlertDialog.Builder(this).setTitle("اختر الفصول التي تريد ترجمتها")
+            .setMultiChoiceItems(labels, selected) { _, which, checked -> selected[which] = checked }
+            .setNegativeButton("إلغاء", null)
+            .setPositiveButton("إضافة إلى الطابور") { _, _ ->
+                val ids = queueable.indices.filter { selected[it] }.map { queueable[it].id }
+                if (ids.isEmpty()) toast("لم تختر أي فصل")
+                else {
+                    runCatching { MangaFoxChapterQueueService.enqueue(this, ids) }
+                        .onSuccess { toast("أُضيف ${ids.size} فصل إلى طابور الخلفية") }
+                        .onFailure { toast("تعذر بدء طابور الترجمة: ${it.message}") }
+                }
+            }.show()
+    }
+
     private fun showResults() {
         setReadingFullscreen(true)
         val editMode = preferences.getBoolean(PREF_RESULTS_EDIT_MODE, false)
@@ -3141,6 +3412,13 @@ class MainActivity : android.app.Activity() {
         })
         readerChrome.addView(topBar, matchWrap(dp(3)))
         readerChrome.addView(actionButton("☰  القائمة الجانبية", false) { showQuickSidePanel() }, matchWrap(dp(5)))
+        val reviewCount = countReviewLayers()
+        readerChrome.addView(actionButton("مراجعة الفقاعات الصفراء والحمراء · $reviewCount", false) {
+            showReviewQueue()
+        }, matchWrap(dp(4)))
+        readerChrome.addView(actionButton("اقتراح الأسماء المتكررة وإضافتها للمعجم", false) {
+            showRecurringNameSuggestions()
+        }, matchWrap(dp(4)))
         if (MangaFoxRuntime.captureOnlyResult && MangaFoxRuntime.sourcePages.any { it.isNotBlank() && File(it).isFile }) {
             readerChrome.addView(actionButton("ترجمة الصور المستوردة الآن", true) {
                 MangaFoxAccessibilityService.instance?.retranslateLastResults()
@@ -4059,6 +4337,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private var captureRunning = false
     private var fullChapterMode = false
     private var captureOnlyMode = false
+    @Volatile private var queuedChapterId: String? = null
+    @Volatile private var autoNextAfterTranslation = false
     private var captureCount = 0L
     private var unchangedFrameCount = 0
     private var screenshotRetryCount = 0
@@ -4122,6 +4402,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         }, 1900L)
         refreshLensAppFilter()
         mainHandler.postDelayed({ recoverInterruptedCapture() }, 900L)
+        mainHandler.postDelayed({ MangaFoxChapterQueueService.kick(this) }, 1400L)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -4203,6 +4484,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     }
 
     private fun beginCaptureMetadata() {
+        autoNextAfterTranslation = false
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val work = prefs.getString(PREF_CURRENT_WORK_NAME, "").orEmpty().trim().ifBlank { "عمل غير مصنف" }
         val chapter = prefs.getString(PREF_CURRENT_CHAPTER_NAME, "").orEmpty().trim()
@@ -4282,6 +4564,55 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             translationPaused = false
             translationPauseLock.notifyAll()
         }
+    }
+
+    private fun advanceToNextChapterFromAccessibility() {
+        if (!autoNextAfterTranslation) return
+        autoNextAfterTranslation = false
+        val root = rootInActiveWindow ?: run {
+            toast("لم أجد شاشة القراءة النشطة للانتقال للفصل التالي")
+            return
+        }
+        val exactLabels = listOf("الفصل التالي", "الفصل القادم", "next chapter", "nextChapter")
+        var visited = 0
+        var target: AccessibilityNodeInfo? = null
+        fun scan(node: AccessibilityNodeInfo?, depth: Int) {
+            if (node == null || target != null || depth > 14 || visited >= 500) return
+            visited++
+            val label = (node.text?.toString().orEmpty() + " " + node.contentDescription?.toString().orEmpty()).trim()
+            val viewId = node.viewIdResourceName.orEmpty().lowercase(Locale.ROOT)
+            val namedChapterControl = label.contains("التالي") && ("chapter" in viewId || "next_chapter" in viewId)
+            if (node.isEnabled && node.isVisibleToUser && (exactLabels.any { label.contains(it, ignoreCase = true) } || namedChapterControl)) {
+                var candidate: AccessibilityNodeInfo? = node
+                repeat(4) {
+                    if (candidate == null || candidate!!.isClickable) return@repeat
+                    candidate = candidate!!.parent
+                }
+                if (candidate?.isClickable == true) target = candidate
+            }
+            for (index in 0 until node.childCount) scan(node.getChild(index), depth + 1)
+        }
+        scan(root, 0)
+        val clicked = target?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
+        if (!clicked) {
+            toast("لم يظهر زر واضح باسم (الفصل التالي). لم أضغط أزراراً عامة لتجنب فتح صفحة خاطئة")
+            return
+        }
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val current = prefs.getString(PREF_CURRENT_CHAPTER_NAME, MangaFoxRuntime.activeChapterName).orEmpty()
+        val match = Regex("\\d+(?:\\.\\d+)?").find(current)
+        val nextName = if (match == null) "الفصل التالي" else {
+            val old = match.value
+            val next = old.toDoubleOrNull()?.plus(1.0) ?: 0.0
+            val formatted = if (old.contains('.')) String.format(Locale.US, "%0${old.length}.${old.substringAfter('.').length}f", next)
+                else next.toInt().toString().padStart(old.length, '0')
+            current.replaceRange(match.range, formatted)
+        }
+        prefs.edit().putString(PREF_CURRENT_CHAPTER_NAME, nextName).apply()
+        MangaFoxRuntime.activeChapterName = nextName
+        mainHandler.postDelayed({
+            if (!captureRunning && !translationRunning) startFullChapterCapture(1700L)
+        }, 1800L)
     }
 
     fun startFullChapterCapture(startDelayMs: Long = 450L) {
@@ -4389,6 +4720,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 MangaFoxRuntime.status = "لم يتغير المحتوى؛ محاولة التمرير ${unchangedFrameCount}/3..."
                 notifyCaptureProgress()
                 if (unchangedFrameCount >= 3) {
+                    autoNextAfterTranslation = !captureOnlyMode && getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                        .getBoolean(PREF_AUTO_NEXT_CHAPTER, false)
                     finishCaptureAndTranslate("وصل الالتقاط إلى نهاية المحتوى بعد 3 محاولات تمرير دون تغير")
                 } else {
                     dispatchNextSwipe(displayWidth, displayHeight)
@@ -5137,6 +5470,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 newLayerFiles.addAll(checkpointPaths("layers"))
                 val groupSize = if (preserveInputs) 1 else 2
                 val groups = workPages.chunked(groupSize)
+                var previousPageContext = emptyList<MangaFoxLocalLlm.Bubble>()
                 val startGroup = (resumeCheckpoint?.optInt("nextGroup", 0) ?: 0).coerceIn(0, groups.size)
                 try {
                     groups.drop(startGroup).forEachIndexed { offset, groupFiles ->
@@ -5168,11 +5502,18 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                                 }
                                 newSourceFiles.add(sourceCopy.absolutePath)
                             }
-                            val outputBitmap = translateBitmap(mergedPage) { fraction, detail ->
+                            val outputBitmap = translateBitmap(mergedPage, previousPageContext) { fraction, detail ->
                                 val aggregate = (((index + fraction.coerceIn(0f, 1f)) / groups.size) * 100f).toInt().coerceIn(0, 99)
                                 updateTranslationLens(aggregate, "الصفحة ${index + 1} من ${groups.size} · $detail")
                             }
                             translated = outputBitmap
+                            previousPageContext = lastOcrTranslationLines.get()
+                                .filter { it.sourceText.isNotBlank() }
+                                .sortedWith(compareBy<TranslationLine> { it.bounds.top }.thenByDescending { it.bounds.right })
+                                .takeLast(5)
+                                .mapIndexed { contextIndex, line ->
+                                    MangaFoxLocalLlm.Bubble(-1 - contextIndex, line.language, line.sourceText.take(260))
+                                }
                             val layerFile = File(filesDir, "mfox_layers_${System.currentTimeMillis()}_$index.json")
                             val layerArray = org.json.JSONArray()
                             lastOcrTranslationLines.get().forEach { line ->
@@ -5298,6 +5639,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                         if (instance !== this@MangaFoxAccessibilityService) closeRecognitionResources()
                         val notified = notifyResultsReady()
                         toast(if (notified) "اكتملت الترجمة العربية. اضغط إشعار Manga Fox لعرض الفصل" else "اكتملت الترجمة. افتح Manga Fox ثم اختر عرض آخر نتيجة مترجمة")
+                        completeQueuedChapter(true, "اكتملت ترجمة الفصل")
+                        if (autoNextAfterTranslation) mainHandler.postDelayed({ advanceToNextChapterFromAccessibility() }, 1100L)
                     }
                 } catch (e: Exception) {
                     val cancelled = cancelOperationRequested || e.message == "MFOX_OPERATION_CANCELLED"
@@ -5341,6 +5684,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                             mainHandler.postDelayed({ resetLensProgress() }, 2500L)
                             if (instance !== this@MangaFoxAccessibilityService) closeRecognitionResources()
                             toast(if (keep && translatedFiles.isNotEmpty()) "أُلغيت العملية مع الاحتفاظ بـ ${translatedFiles.size} صفحة مكتملة" else "أُلغيت العملية وحُذفت نتائجها")
+                            completeQueuedChapter(false, "أُلغيت ترجمة الفصل من الطابور")
                         }
                     } else {
                         // Keep the last committed page boundary and remaining source files.
@@ -5375,6 +5719,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                             mainHandler.postDelayed({ resetLensProgress() }, 4000L)
                             if (instance !== this@MangaFoxAccessibilityService) closeRecognitionResources()
                             toast("${MangaFoxRuntime.lastError} · تم حفظ الصفحات المكتملة ويمكن الاستكمال لاحقاً")
+                            completeQueuedChapter(false, MangaFoxRuntime.lastError)
                         }
                     }
                 }
@@ -5384,7 +5729,26 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             clearTranslationPause()
             workPages.forEach { runCatching { it.delete() } }
             finishCaptureWithError("تعذر تشغيل عامل الترجمة: ${e.localizedMessage ?: "خطأ داخلي"}")
+            completeQueuedChapter(false, e.localizedMessage ?: "تعذر تشغيل عامل الترجمة")
         }
+    }
+
+    private fun completeQueuedChapter(success: Boolean, detail: String) {
+        val id = queuedChapterId ?: return
+        queuedChapterId = null
+        MangaFoxChapterQueueService.onChapterFinished(this, id, success, detail)
+    }
+
+    fun startQueuedArchiveChapter(chapterId: String): Int {
+        if (captureRunning || translationRunning) return 0
+        if (!MangaFoxChapterArchive.open(this, chapterId)) return -1
+        val sources = MangaFoxRuntime.sourcePages.mapNotNull { path -> path.takeIf { it.isNotBlank() }?.let(::File)?.takeIf { it.isFile && it.length() > 0L } }
+        if (sources.isEmpty() || sources.size != MangaFoxRuntime.resultPages.size ||
+            sources.size != MangaFoxRuntime.sourcePages.count { it.isNotBlank() }) return -1
+        queuedChapterId = chapterId
+        val title = MangaFoxRuntime.activeChapterName.ifBlank { MangaFoxRuntime.resultTitle }
+        translateSavedSegments(ArrayList(sources), "ترجمة من طابور الفصول الخلفي", title, preserveInputs = true)
+        return if (translationRunning) 1 else { queuedChapterId = null; -1 }
     }
 
     /** Resume the last durable page boundary after the app/service process was interrupted. */
@@ -6227,6 +6591,57 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         return strongHits > 0 || (softHits >= 2 && candidates.size <= 12)
     }
 
+    /**
+     * Reject likely failed/low-confidence machine translations before rendering.
+     * This is a conservative heuristic: it detects empty echoes, untranslated Latin,
+     * missing Arabic output and implausibly expanded text, not semantic truth.
+     */
+    private fun isSuspiciousTranslation(sourceText: String, translatedText: String): Boolean {
+        val source = sourceText.trim()
+        val translated = cleanArabicTranslation(translatedText)
+        if (source.isBlank() || translated.isBlank()) return true
+        if (translated.equals(source, ignoreCase = true) && source.length > 2) return true
+        if (hasUntranslatedLatinRuns(translated)) return true
+        if (hasForeignLetters(source) && !isUsefulArabicTranslation(source, translated)) return true
+        if (translated.length > max(24, source.length * 5)) return true
+        return needsReviewStatus(source, translated)
+    }
+
+    /**
+     * Performs exactly three additional translation attempts for a suspicious block.
+     * Different likely language codes are used where available; the strongest valid
+     * Arabic candidate is retained. A failed attempt never replaces a better result.
+     */
+    private fun retryTranslationThreeTimes(
+        sourceText: String,
+        languageCode: String,
+        mixed: Boolean
+    ): String? {
+        val source = sourceText.trim()
+        if (source.isBlank()) return null
+        val candidates = retryLanguageCandidates(source, languageCode)
+        var best: String? = null
+        var bestScore = Int.MIN_VALUE
+        repeat(3) { attempt ->
+            val retryCode = candidates.getOrNull(attempt) ?: languageCode
+            val raw = runCatching {
+                if (mixed) translateMixedTextPreservingArabic(source, retryCode)
+                else translateInChunks(source, retryCode)
+            }.getOrNull() ?: return@repeat
+            val clean = cleanArabicTranslation(raw)
+            if (isSuspiciousTranslation(source, clean)) return@repeat
+            val arabicCount = clean.count { isArabicChar(it) && it.isLetter() }
+            val foreignCount = foreignLetterCount(clean)
+            val lengthPenalty = kotlin.math.abs(clean.length - source.length) / 8
+            val score = arabicCount * 3 - foreignCount * 5 - lengthPenalty
+            if (score > bestScore) {
+                bestScore = score
+                best = raw
+            }
+        }
+        return best
+    }
+
     private fun translateWithLanguage(sourceText: String, languageCode: String): String {
         // The paid/remote AI path is intentionally not invoked. Qwen handles page context
         // locally; this method remains the on-device ML Kit fallback for individual bubbles.
@@ -6329,61 +6744,118 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             .distinct()
     }
 
-    private fun translateBitmap(source: Bitmap, onProgress: (Float, String) -> Unit = { _, _ -> }): Bitmap {
+    private fun scoreTranslationCandidate(sourceText: String, candidate: String): Double {
+        val value = candidate.trim()
+        if (value.isBlank()) return -1_000.0
+        val letters = value.count { it.isLetter() }.coerceAtLeast(1)
+        val arabic = value.count { it in '\u0600'..'\u06FF' || it in '\u0750'..'\u077F' || it in '\u08A0'..'\u08FF' }
+        val latin = value.count { it in 'A'..'Z' || it in 'a'..'z' }
+        val sourceLetters = sourceText.count { it.isLetter() }.coerceAtLeast(1)
+        val ratio = value.length.toDouble() / sourceText.length.coerceAtLeast(1)
+        var score = (arabic.toDouble() / letters) * 5.0
+        score -= (latin.toDouble() / letters) * 4.0
+        score += min(arabic, 100) * 0.008
+        if (ratio < 0.12) score -= 1.2
+        if (ratio > 4.0) score -= min(2.0, (ratio - 4.0) * 0.25)
+        if (value.equals(sourceText.trim(), ignoreCase = true)) score -= 3.0
+        if (arabic == 0 && hasForeignLetters(sourceText)) score -= 4.0
+        if (sourceLetters < 3) score += 0.0
+        return score
+    }
+
+    private fun chooseBestTranslationCandidate(sourceText: String, qwenCandidate: String?, mlKitCandidate: String?): String? {
+        return listOfNotNull(qwenCandidate, mlKitCandidate)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .maxByOrNull { scoreTranslationCandidate(sourceText, it) }
+    }
+
+    private fun translateBitmap(
+        source: Bitmap,
+        previousPageContext: List<MangaFoxLocalLlm.Bubble> = emptyList(),
+        onProgress: (Float, String) -> Unit = { _, _ -> }
+    ): Bitmap {
         lastOcrTranslationLines.set(emptyList())
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val forcedLanguage = prefs.getString(PREF_SOURCE_LANGUAGE, "auto") ?: "auto"
-        onProgress(0.03f, "تهيئة التعرف على النص")
-        val engines: List<Pair<String, TextRecognizer>> = when (forcedLanguage) {
-            "ja" -> listOf("ja" to japaneseRecognizer)
-            "en" -> listOf("en" to latinRecognizer)
-            "ko" -> listOf("ko" to koreanRecognizer)
-            "zh" -> listOf("zh" to chineseRecognizer)
-            else -> listOf("en" to latinRecognizer, "ja" to japaneseRecognizer, "ko" to koreanRecognizer, "zh" to chineseRecognizer)
+        onProgress(0.03f, "تهيئة التعرف على النص · اللغة ${if (forcedLanguage == "auto") "تلقائية" else forcedLanguage}")
+        val recognizerByCode: Map<String, TextRecognizer> = mapOf(
+            "en" to latinRecognizer,
+            "ja" to japaneseRecognizer,
+            "ko" to koreanRecognizer,
+            "zh" to chineseRecognizer
+        )
+        var activeLanguage = forcedLanguage.takeIf { it in recognizerByCode.keys } ?: "auto"
+        if (activeLanguage == "auto") {
+            // Probe only a bounded thumbnail first. Full-resolution OCR then uses one selected engine.
+            val probeScale = min(1f, 960f / max(source.width, source.height).coerceAtLeast(1))
+            val probe = if (probeScale < 0.999f) Bitmap.createScaledBitmap(
+                source, max(1, (source.width * probeScale).roundToInt()),
+                max(1, (source.height * probeScale).roundToInt()), true
+            ) else source
+            val scores = LinkedHashMap<String, Double>()
+            try {
+                // Script-specific engines first: kana and Hangul provide strong language evidence.
+                listOf("ja", "ko", "zh", "en").forEachIndexed { index, code ->
+                    val result = runCatching {
+                        Tasks.await(recognizerByCode.getValue(code).process(InputImage.fromBitmap(probe, 0)))
+                    }.getOrNull()
+                    val sample = collectCandidates(result, code, if (probeScale > 0f) 1f / probeScale else 1f)
+                    val textSample = sample.joinToString(" ") { it.text }
+                    val letters = textSample.count { it.isLetter() }.coerceAtLeast(1)
+                    val latin = textSample.count { it in 'A'..'Z' || it in 'a'..'z' }
+                    val kana = textSample.count { it in '\u3040'..'\u30FF' }
+                    val hangul = textSample.count { it in '\uAC00'..'\uD7AF' }
+                    val han = textSample.count { it in '\u4E00'..'\u9FFF' }
+                    val score = when (code) {
+                        "ja" -> (kana * 3.0 + han * 0.15) / letters
+                        "ko" -> (hangul * 3.0) / letters
+                        "zh" -> (han * 1.5) / letters
+                        else -> (latin * 1.4) / letters
+                    } + min(0.20, sample.size * 0.01)
+                    scores[code] = score
+                    onProgress(0.045f + index * 0.012f, "كشف لغة الكتابة من صورة مصغرة · ${index + 1}/4")
+                }
+            } finally {
+                if (probe !== source && !probe.isRecycled) probe.recycle()
+            }
+            activeLanguage = scores.maxByOrNull { it.value }?.key ?: "en"
+            // If all probes are nearly empty, Latin is the broadest fallback; no full-page four-engine scan.
+            if ((scores[activeLanguage] ?: 0.0) < 0.015) activeLanguage = "en"
         }
+        val engines: List<Pair<String, TextRecognizer>> = listOf(activeLanguage to recognizerByCode.getValue(activeLanguage))
         fun recognizeAll(bitmap: Bitmap, scale: Float): List<OcrCandidate> {
             val image = InputImage.fromBitmap(bitmap, 0)
-            val found = ArrayList<OcrCandidate>()
-            engines.forEachIndexed { index, engine ->
-                onProgress(0.06f + index * 0.055f, "OCR متعدد المحركات · ${index + 1}/${engines.size}")
-                val result = runCatching { Tasks.await(engine.second.process(image)) }.getOrNull()
-                found.addAll(collectCandidates(result, engine.first, scale))
-            }
-            return found
+            val engine = engines.single()
+            onProgress(0.08f, "OCR بالمحرك المختار: $activeLanguage")
+            val result = runCatching { Tasks.await(engine.second.process(image)) }.getOrNull()
+            return collectCandidates(result, engine.first, scale)
         }
 
         val allCandidates = ArrayList<OcrCandidate>()
         allCandidates.addAll(recognizeAll(source, 1f))
         // OCR robustness for non-standard Latin lettering: run an independent
         // contrast pass even when other scripts were recognized successfully.
-        if (forcedLanguage == "auto" || forcedLanguage == "en") {
-            val existingLatinChars = allCandidates.asSequence().filter { it.engineLanguage == "en" }
-                .sumOf { it.text.count { ch -> ch in 'A'..'Z' || ch in 'a'..'z' } }
-            if (forcedLanguage == "auto" || forcedLanguage == "en") {
-                onProgress(0.20f, "فحص الخطوط اللاتينية المزخرفة بعد تحسين التباين")
-                val (latinEnhanced, latinScale) = createOcrVariant(source, inverted = false)
-                try {
-                    val retry = runCatching {
-                        Tasks.await(latinRecognizer.process(InputImage.fromBitmap(latinEnhanced, 0)))
-                    }.getOrNull()
-                    allCandidates.addAll(collectCandidates(retry, "en", latinScale))
-                } finally {
-                    if (!latinEnhanced.isRecycled) latinEnhanced.recycle()
-                }
-                val recoveredLatin = allCandidates.asSequence().filter { it.engineLanguage == "en" }
-                    .sumOf { it.text.count { ch -> ch in 'A'..'Z' || ch in 'a'..'z' } }
-                if (forcedLanguage == "auto" || forcedLanguage == "en") {
-                    onProgress(0.235f, "محاولة قراءة الخطوط المزخرفة بالعتبة التكيفية العامة")
-                    val (binary, binaryScale) = createBinarizedOcrVariant(source)
-                    try {
-                        val retry = runCatching {
-                            Tasks.await(latinRecognizer.process(InputImage.fromBitmap(binary, 0)))
-                        }.getOrNull()
-                        allCandidates.addAll(collectCandidates(retry, "en", binaryScale))
-                    } finally {
-                        if (!binary.isRecycled) binary.recycle()
-                    }
-                }
+        if (activeLanguage == "en") {
+            onProgress(0.20f, "فحص الخطوط اللاتينية المزخرفة بعد تحسين التباين")
+            val (latinEnhanced, latinScale) = createOcrVariant(source, inverted = false)
+            try {
+                val retry = runCatching {
+                    Tasks.await(latinRecognizer.process(InputImage.fromBitmap(latinEnhanced, 0)))
+                }.getOrNull()
+                allCandidates.addAll(collectCandidates(retry, "en", latinScale))
+            } finally {
+                if (!latinEnhanced.isRecycled) latinEnhanced.recycle()
+            }
+            onProgress(0.235f, "محاولة قراءة الخطوط المزخرفة بالعتبة التكيفية العامة")
+            val (binary, binaryScale) = createBinarizedOcrVariant(source)
+            try {
+                val retry = runCatching {
+                    Tasks.await(latinRecognizer.process(InputImage.fromBitmap(binary, 0)))
+                }.getOrNull()
+                allCandidates.addAll(collectCandidates(retry, "en", binaryScale))
+            } finally {
+                if (!binary.isRecycled) binary.recycle()
             }
         }
         val firstMerged = mergeOcrCandidates(allCandidates)
@@ -6415,7 +6887,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             val b = candidate.bounds
             b != null && b.height() > b.width() * 2.2f && countChars(candidate.text) { it in '\u3040'..'\u30FF' || it in '\u4E00'..'\u9FFF' } > 0
         }
-        if ((verticalJapanese || beforeRotation.size < 2) && forcedLanguage in setOf("auto", "ja")) {
+        if ((verticalJapanese || beforeRotation.size < 2) && activeLanguage == "ja") {
             onProgress(0.37f, "محاولة قراءة الأعمدة اليابانية بعد تدويرها")
             allCandidates.addAll(rotatedJapaneseCandidates(source))
         }
@@ -6441,13 +6913,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 Bitmap.createBitmap(source, left, top, w, h, Matrix().apply { setScale(enlarge, enlarge) }, true)
             }.getOrNull() ?: return@forEachIndexed
             try {
-                val regionEngines: List<Pair<String, TextRecognizer>> = when (forcedLanguage) {
-                    "ja" -> listOf("ja" to japaneseRecognizer)
-                    "ko" -> listOf("ko" to koreanRecognizer)
-                    "zh" -> listOf("zh" to chineseRecognizer)
-                    "en" -> listOf("en" to latinRecognizer)
-                    else -> listOf("en" to latinRecognizer, "zh" to chineseRecognizer, "ja" to japaneseRecognizer)
-                }
+                val regionEngines = engines
                 val variants = listOf(
                     runCatching { createOcrVariant(crop, inverted = false) }.getOrNull(),
                     runCatching { createBinarizedOcrVariant(crop) }.getOrNull()
@@ -6618,7 +7084,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                         MangaFoxLocalLlm.Bubble(blockIndex, block.language, block.text)
                     },
                     MangaFoxKnowledgeStore(this).glossary(),
-                    MangaFoxKnowledgeStore(this).characters()
+                    MangaFoxKnowledgeStore(this).characters(),
+                    previousPageContext.takeLast(5)
                 )
             }.getOrElse { error ->
                 onProgress(0.43f, "تعذر Qwen المحلي؛ رجوع تلقائي إلى ML Kit: ${error.message?.take(80).orEmpty()}")
@@ -6643,34 +7110,29 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     value.isNotBlank() && !value.equals(item.text, ignoreCase = true) &&
                         (!hasForeignLetters(normalizedSource) || isUsefulArabicTranslation(normalizedSource, cleanArabicTranslation(value)))
                 }
-                var translatedRaw: String? = learned ?: sfx ?: glossaryOverride ?: contextual
+                val mixed = hasArabicLetters(normalizedSource) && hasForeignLetters(normalizedSource)
+                // When Qwen has a candidate, produce an ML Kit candidate too and arbitrate
+                // using Arabic-script density, residual Latin, source/target length and identity.
+                val mlKitCandidate = if (contextual != null && learned == null && sfx == null && glossaryOverride == null) {
+                    runCatching {
+                        if (mixed) translateMixedTextPreservingArabic(normalizedSource, item.language)
+                        else translateInChunks(normalizedSource, item.language)
+                    }.getOrNull()
+                } else null
+                var translatedRaw: String? = learned ?: sfx ?: glossaryOverride
+                    ?: chooseBestTranslationCandidate(normalizedSource, contextual, mlKitCandidate)
                 if (translatedRaw == null) {
-                    val mixed = hasArabicLetters(normalizedSource) && hasForeignLetters(normalizedSource)
                     translatedRaw = runCatching {
                         if (mixed) translateMixedTextPreservingArabic(normalizedSource, item.language)
                         else translateInChunks(normalizedSource, item.language)
                     }.getOrNull()
-                    val firstClean = translatedRaw?.let { cleanArabicTranslation(it) }.orEmpty()
-                    val needsArabicOutput = hasForeignLetters(normalizedSource)
-                    if (firstClean.isBlank() || firstClean.equals(item.text, ignoreCase = true) ||
-                        (needsArabicOutput && !isUsefulArabicTranslation(normalizedSource, firstClean))) {
-                        // Retry not only on empty output: reject a model that simply echoes Latin OCR.
-                        for (retryCode in retryLanguageCandidates(normalizedSource, item.language)) {
-                            val retried = runCatching {
-                                if (mixed) translateMixedTextPreservingArabic(normalizedSource, retryCode)
-                                else translateInChunks(normalizedSource, retryCode)
-                            }.getOrNull()
-                            if (!retried.isNullOrBlank()) {
-                                val cleanedRetry = cleanArabicTranslation(retried)
-                                if (cleanedRetry.isNotBlank() && !cleanedRetry.equals(item.text, ignoreCase = true) &&
-                                    !hasUntranslatedLatinRuns(cleanedRetry) &&
-                                    (!needsArabicOutput || isUsefulArabicTranslation(normalizedSource, cleanedRetry))) {
-                                    translatedRaw = retried
-                                    break
-                                }
-                            }
-                        }
-                    }
+                }
+                // Confirmation pass applies to ML Kit, contextual, learned and glossary outputs.
+                // Any suspicious result receives exactly three additional translation attempts.
+                val currentClean = translatedRaw?.let { cleanArabicTranslation(it) }.orEmpty()
+                if (isSuspiciousTranslation(normalizedSource, currentClean)) {
+                    val confirmed = retryTranslationThreeTimes(normalizedSource, item.language, mixed)
+                    if (!confirmed.isNullOrBlank()) translatedRaw = confirmed
                 }
                 val translated = translatedRaw?.let { cleanArabicTranslation(it) }.orEmpty()
                 val sourceNeedsArabic = hasForeignLetters(item.text)
@@ -6716,9 +7178,16 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                     ))
                 }
             } catch (_: Exception) {
-                val rescued = runCatching { retranslateBlockWithEnhancedOcr(source, item, item.language) }.getOrNull()
+                // A thrown translation/model error also receives three independent retries
+                // before the more expensive enhanced-OCR recovery path.
+                val mixedSource = hasArabicLetters(item.text) && hasForeignLetters(item.text)
+                val retried = retryTranslationThreeTimes(item.text, item.language, mixedSource)
+                val retriedClean = retried?.let { cleanArabicTranslation(it) }.orEmpty()
+                val rescued = if (retriedClean.isNotBlank() && !isSuspiciousTranslation(item.text, retriedClean)) retried
+                    else runCatching { retranslateBlockWithEnhancedOcr(source, item, item.language) }.getOrNull()
                 val rescuedClean = rescued?.let { cleanArabicTranslation(it) }.orEmpty()
-                if (rescuedClean.isNotBlank() && !hasUntranslatedLatinRuns(rescuedClean)) {
+                if (rescuedClean.isNotBlank() && !hasUntranslatedLatinRuns(rescuedClean) &&
+                    (!hasForeignLetters(item.text) || isUsefulArabicTranslation(item.text, rescuedClean))) {
                     translatedBlocks.add(TranslationLine(
                         Rect(item.bounds), rescuedClean, item.text, item.language,
                         vertical = item.mergedLines <= 1 && MangaFoxLayoutEngine.shouldUseVertical(item.bounds),
@@ -6920,9 +7389,16 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 clipTextToBubbleShape(canvas, layoutRect, item.shape)
                 val fillColor = estimateBubbleFillColor(source, layoutRect, item.bounds)
                 val textColor = item.textColor ?: readableTextColor(fillColor)
-                val outlineColor = Color.BLACK
-val outlineWidth = 0f
-                drawArabicText(canvas, item.translated, layoutRect, item.vertical, textColor, outlineColor, outlineWidth, item.fontScale)
+                val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                val density = resources.displayMetrics.density.coerceAtLeast(1f)
+                val configuredWidthDp = prefs.getInt(PREF_TRANSLATED_OUTLINE_WIDTH, 0).coerceIn(0, 8)
+                val configuredColor = prefs.getInt(PREF_TRANSLATED_OUTLINE_COLOR, if (textColor == Color.WHITE) Color.BLACK else Color.WHITE)
+                val contrast = contrastRatio(textColor, fillColor)
+                val customWidth = item.outlineWidthDp
+                val outlineWidthDp = customWidth ?: if (configuredWidthDp > 0) configuredWidthDp else if (contrast < 4.5) 1 else 0
+                val outlineColor = item.outlineColor ?: if (configuredWidthDp > 0) configuredColor else if (textColor == Color.WHITE) Color.BLACK else Color.WHITE
+                val outlineWidthPx = outlineWidthDp.coerceIn(0, 8) * density
+                drawArabicText(canvas, item.translated, layoutRect, item.vertical, textColor, outlineColor, outlineWidthPx, item.fontScale)
                 canvas.restore()
             }
         }
@@ -6940,6 +7416,19 @@ val outlineWidth = 0f
         return runCatching {
             MangaFoxBubbleRepair.sampleInteriorColor(bitmap, layoutRect, centralGlyphArea)
         }.getOrDefault(Color.WHITE)
+    }
+
+    private fun contrastRatio(foreground: Int, background: Int): Double {
+        fun luminance(color: Int): Double {
+            fun linear(channel: Int): Double {
+                val value = channel / 255.0
+                return if (value <= 0.04045) value / 12.92 else Math.pow((value + 0.055) / 1.055, 2.4)
+            }
+            return 0.2126 * linear(Color.red(color)) + 0.7152 * linear(Color.green(color)) + 0.0722 * linear(Color.blue(color))
+        }
+        val a = luminance(foreground)
+        val b = luminance(background)
+        return (maxOf(a, b) + 0.05) / (minOf(a, b) + 0.05)
     }
 
     private fun readableTextColor(backgroundColor: Int): Int {
@@ -7920,7 +8409,8 @@ object MangaFoxChapterArchive {
         val captureOnly: Boolean,
         val quality: String,
         val createdAt: Long,
-        val coverPath: String = ""
+        val coverPath: String = "",
+        val sourcePageCount: Int = 0
     )
 
     private fun base(context: Context) = File(context.filesDir, "mfox_library").apply { mkdirs() }
@@ -7941,14 +8431,19 @@ object MangaFoxChapterArchive {
             if (id.isBlank() || !manifest.isFile) continue
             val manifestJson = runCatching { JSONObject(manifest.readText(Charsets.UTF_8)) }.getOrNull() ?: continue
             val resultNames = manifestJson.optJSONArray("results") ?: JSONArray()
+            val sourceNames = manifestJson.optJSONArray("sources") ?: JSONArray()
             val pages = resultNames.length()
+            val sourcePageCount = (0 until sourceNames.length()).count { index ->
+                val relative = sourceNames.optString(index, "")
+                relative.isNotBlank() && File(dir, File(relative).name).isFile
+            }
             val firstName = resultNames.optString(0, "")
             val coverPath = if (firstName.isBlank()) "" else File(dir, File(firstName).name).absolutePath
             result.add(ChapterInfo(
                 id, item.optString("workName", "عمل غير مصنف"),
                 item.optString("chapterName", "فصل"), item.optString("title", "فصل"),
                 pages, item.optBoolean("captureOnly", false), item.optString("quality", ""),
-                item.optLong("createdAt", 0L), coverPath
+                item.optLong("createdAt", 0L), coverPath, sourcePageCount
             ))
         }
         return result.sortedByDescending { it.createdAt }
@@ -9317,5 +9812,153 @@ object MangaFoxThemeStore {
             out.write(buffer, 0, count)
         }
         return out.toByteArray()
+    }
+}
+
+
+/** @N5CR4 — persistent FIFO chapter queue. Work itself remains in the AccessibilityService worker. */
+class MangaFoxChapterQueueService : android.app.Service() {
+    companion object {
+        private const val CHANNEL_ID = "mfox_chapter_queue"
+        private const val NOTIFICATION_ID = 74031
+        private const val QUEUE_PREFS = "mfox_chapter_queue_v1"
+        private const val KEY_PENDING = "pending_ids"
+        private const val KEY_ACTIVE = "active_id"
+        private const val ACTION_PROCESS = "com.manga.fox.action.PROCESS_CHAPTER_QUEUE"
+        @Volatile private var serviceInstance: MangaFoxChapterQueueService? = null
+
+        private fun prefs(context: Context) = context.getSharedPreferences(QUEUE_PREFS, Context.MODE_PRIVATE)
+        private fun readIds(context: Context): MutableList<String> {
+            val raw = prefs(context).getString(KEY_PENDING, "[]") ?: "[]"
+            val array = runCatching { JSONArray(raw) }.getOrDefault(JSONArray())
+            return (0 until array.length()).map { array.optString(it) }.filter { it.isNotBlank() }.distinct().toMutableList()
+        }
+        private fun writeIds(context: Context, ids: List<String>) {
+            val array = JSONArray(); ids.distinct().forEach { array.put(it) }
+            prefs(context).edit().putString(KEY_PENDING, array.toString()).apply()
+        }
+        private fun start(context: Context) {
+            val intent = Intent(context, MangaFoxChapterQueueService::class.java).setAction(ACTION_PROCESS)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent) else context.startService(intent)
+        }
+        fun enqueue(context: Context, ids: List<String>) {
+            require(ids.isNotEmpty()) { "لم يتم اختيار فصول" }
+            synchronized(this) {
+                val combined = (readIds(context) + ids).distinct()
+                writeIds(context, combined)
+            }
+            start(context)
+        }
+        fun kick(context: Context) {
+            if (readIds(context).isNotEmpty()) start(context)
+        }
+        fun onChapterFinished(context: Context, id: String, success: Boolean, detail: String) {
+            synchronized(this) {
+                val remaining = readIds(context).filterNot { it == id }
+                writeIds(context, remaining)
+                prefs(context).edit().remove(KEY_ACTIVE)
+                    .putString("last_result", if (success) "نجح: $id" else "فشل: $id · ${detail.take(180)}")
+                    .apply()
+            }
+            serviceInstance?.let { service ->
+                service.processing = false
+                service.updateNotification(if (success) "اكتمل فصل من الطابور" else "تجاوز فصل متعذر")
+                service.mainHandler.postDelayed({ service.processNext() }, 700L)
+            } ?: kick(context)
+        }
+    }
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var processing = false
+    private var retryCount = 0
+
+    override fun onCreate() {
+        super.onCreate()
+        serviceInstance = this
+        createChannel()
+        val initialNotification = buildNotification("تهيئة طابور الفصول")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                initialNotification,
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, initialNotification)
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && intent?.action != null && intent.action != ACTION_PROCESS) {
+            stopSelfResult(startId); return START_NOT_STICKY
+        }
+        updateNotification()
+        mainHandler.post { processNext() }
+        return START_STICKY
+    }
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "طابور ترجمة الفصول", NotificationManager.IMPORTANCE_LOW))
+        }
+    }
+
+    private fun buildNotification(message: String): Notification {
+        val pending = readIds(this).size
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) Notification.Builder(this, CHANNEL_ID)
+            else Notification.Builder(this)
+        val openIntent = PendingIntent.getActivity(
+            this, 74032, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            if (Build.VERSION.SDK_INT >= 23) PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE else PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        return builder.setSmallIcon(android.R.drawable.ic_menu_upload)
+            .setContentTitle("Manga Fox · طابور الفصول")
+            .setContentText("$message · المتبقي: $pending")
+            .setContentIntent(openIntent).setOngoing(pending > 0).build()
+    }
+
+    fun updateNotification(message: String = "معالجة الفصول في الخلفية") {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(NOTIFICATION_ID, buildNotification(message))
+    }
+
+    private fun processNext() {
+        if (processing) return
+        val ids = readIds(this)
+        if (ids.isEmpty()) {
+            getSharedPreferences(QUEUE_PREFS, Context.MODE_PRIVATE).edit().remove(KEY_ACTIVE).apply()
+            stopForeground(true)
+            stopSelf()
+            return
+        }
+        val accessibility = MangaFoxAccessibilityService.instance
+        if (accessibility == null) {
+            updateNotification("بانتظار تفعيل خدمة إمكانية الوصول")
+            mainHandler.postDelayed({ processNext() }, 4000L)
+            return
+        }
+        val active = getSharedPreferences(QUEUE_PREFS, Context.MODE_PRIVATE).getString(KEY_ACTIVE, "").orEmpty()
+        val nextId = active.takeIf { it.isNotBlank() } ?: ids.first()
+        getSharedPreferences(QUEUE_PREFS, Context.MODE_PRIVATE).edit().putString(KEY_ACTIVE, nextId).apply()
+        when (accessibility.startQueuedArchiveChapter(nextId)) {
+            1 -> { processing = true; retryCount = 0; updateNotification("تُترجم: ${ids.size} فصل متبقٍ") }
+            0 -> {
+                updateNotification("بانتظار انتهاء العملية الحالية")
+                mainHandler.postDelayed({ processNext() }, 3500L)
+            }
+            else -> {
+                retryCount++
+                if (retryCount <= 2) mainHandler.postDelayed({ processNext() }, 2500L)
+                else onChapterFinished(this, nextId, false, "لا توجد صور أصلية قابلة لإعادة الترجمة أو تعذر فتح الفصل")
+            }
+        }
+    }
+
+    override fun onBind(intent: Intent?) = null
+    override fun onDestroy() {
+        serviceInstance = null
+        processing = false
+        super.onDestroy()
     }
 }
