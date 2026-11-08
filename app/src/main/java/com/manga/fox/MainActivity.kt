@@ -228,9 +228,40 @@ class MainActivity : android.app.Activity() {
         applySystemBars()
         showSplashThen {
             handleIntent(this.intent)
+            offerInterruptedOperationRecovery()
             // Keep onboarding behind the splash so dialogs never cover the brand animation.
             homeUiHandler.postDelayed({ maybeShowOnboarding() }, 450L)
         }
+    }
+
+    private fun offerInterruptedOperationRecovery() {
+        val checkpoint = MangaFoxOperationCheckpoint.read(this) ?: return
+        val completed = checkpoint.optJSONArray("results")?.length() ?: 0
+        val inputs = checkpoint.optJSONArray("inputs")?.length() ?: 0
+        val groupSize = if (checkpoint.optBoolean("preserveInputs", false)) 1 else 2
+        val total = (inputs + groupSize - 1) / groupSize
+        val next = checkpoint.optInt("nextGroup", 0).coerceIn(0, total)
+        if (next >= total) {
+            MangaFoxOperationCheckpoint.clear(this)
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("استعادة عملية متوقفة")
+            .setMessage("تم العثور على عملية غير مكتملة.\nالصفحات المحفوظة: $completed\nالمتبقي تقريباً: ${total - next}\nهل تريد الاستكمال من آخر نقطة حفظ؟")
+            .setNegativeButton("ليس الآن", null)
+            .setNeutralButton("حذف بيانات الاستكمال") { _, _ ->
+                MangaFoxOperationCheckpoint.clear(this)
+                toast("تم حذف بيانات الاستكمال؛ الصفحات المكتملة تبقى محفوظة")
+            }
+            .setPositiveButton("استكمال") { _, _ ->
+                val service = MangaFoxAccessibilityService.instance
+                if (service?.resumeInterruptedOperation() == true) {
+                    toast("بدأ استكمال العملية من آخر صفحة محفوظة")
+                } else {
+                    toast("تعذر الاستكمال: تأكد من تفعيل خدمة Manga FOX وأن ملفات الصفحات المتبقية موجودة")
+                }
+            }
+            .show()
     }
 
     private fun showSplashThen(onFinished: () -> Unit) {
@@ -791,6 +822,22 @@ class MainActivity : android.app.Activity() {
             progressBackgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(55, 55, 62))
         }
         progressCard.addView(homeProgress, matchWrap(dp(8)))
+        progressCard.addView(actionButton("حذف العملية الحالية", false) {
+            AlertDialog.Builder(this)
+                .setTitle("إلغاء العملية الحالية؟")
+                .setMessage("اختر طريقة الإلغاء. لن تتأثر نتائج الفصول السابقة.")
+                .setItems(arrayOf(
+                    "إيقاف مع الاحتفاظ بالصفحات المكتملة",
+                    "إيقاف وحذف جميع صفحات هذه العملية"
+                )) { _, which ->
+                    val keepCompleted = which == 0
+                    val service = MangaFoxAccessibilityService.instance
+                    if (service == null) toast("خدمة Manga FOX غير متصلة")
+                    else service.cancelCurrentOperation(keepCompleted)
+                }
+                .setNegativeButton("تراجع", null)
+                .show()
+        }, matchWrap(dp(4)))
         progressCard.addView(actionButton("إيقاف الترجمة مؤقتاً / استئناف", false) {
             MangaFoxAccessibilityService.instance?.toggleTranslationPause()
                 ?: toast("خدمة Manga FOX غير متصلة")
@@ -2581,31 +2628,61 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun exportResultsAsPdf() {
-        if (MangaFoxRuntime.captureOnlyResult) {
-            exportResultsAsPdfAfterAudit()
+        val allPaths = MangaFoxRuntime.resultPages
+        if (allPaths.isEmpty()) {
+            toast("لا توجد نتيجة لتصديرها")
             return
         }
-        val audit = MangaFoxQualityGuard.inspect(MangaFoxRuntime.resultPages, MangaFoxRuntime.translationLayerFiles)
-        if (audit.errorCount > 0 || audit.warningCount > 0) {
-            AlertDialog.Builder(this)
-                .setTitle("FOX QUALITY GUARD · مراجعة قبل التصدير")
-                .setMessage(audit.toArabicText() + "\n\nهل تريد المتابعة إلى تصدير PDF رغم التحذيرات؟")
-                .setNegativeButton("العودة للإصلاح", null)
-                .setPositiveButton("متابعة التصدير") { _, _ -> exportResultsAsPdfAfterAudit() }
-                .show()
-            return
-        }
-        exportResultsAsPdfAfterAudit()
+        val labels = allPaths.mapIndexed { index, path ->
+            val file = File(path)
+            "الصفحة ${index + 1} · ${if (file.isFile) "${file.length() / 1024} KB" else "ملف مفقود"}"
+        }.toTypedArray()
+        val selected = BooleanArray(allPaths.size) { true }
+        AlertDialog.Builder(this)
+            .setTitle("تحديد صفحات التصدير (${allPaths.size})")
+            .setMultiChoiceItems(labels, selected) { _, which, checked -> selected[which] = checked }
+            .setNeutralButton("إلغاء التحديد") { dialog, _ ->
+                // Keep the dialog open so the user can select a smaller subset.
+                (dialog as? AlertDialog)?.listView?.let { list ->
+                    for (i in selected.indices) {
+                        selected[i] = false
+                        list.setItemChecked(i, false)
+                    }
+                }
+            }
+            .setNegativeButton("إلغاء", null)
+            .setPositiveButton("تصدير المحدد") { _, _ ->
+                val indices = selected.indices.filter { selected[it] }
+                if (indices.isEmpty()) {
+                    toast("حدد صفحة واحدة على الأقل")
+                    return@setPositiveButton
+                }
+                val paths = indices.map { allPaths[it] }
+                val layers = indices.map { MangaFoxRuntime.translationLayerFiles.getOrNull(it).orEmpty() }
+                if (MangaFoxRuntime.captureOnlyResult) {
+                    exportResultsAsPdfAfterAudit(paths)
+                    return@setPositiveButton
+                }
+                val audit = MangaFoxQualityGuard.inspect(paths, layers)
+                if (audit.errorCount > 0 || audit.warningCount > 0) {
+                    AlertDialog.Builder(this)
+                        .setTitle("FOX QUALITY GUARD · مراجعة قبل التصدير")
+                        .setMessage(audit.toArabicText() + "\n\nهل تريد المتابعة رغم التحذيرات؟")
+                        .setNegativeButton("العودة للإصلاح", null)
+                        .setPositiveButton("متابعة التصدير") { _, _ -> exportResultsAsPdfAfterAudit(paths) }
+                        .show()
+                } else exportResultsAsPdfAfterAudit(paths)
+            }
+            .show()
     }
 
-    private fun exportResultsAsPdfAfterAudit() {
-        val images = MangaFoxRuntime.resultPages.map { File(it) }
-            .filter { it.isFile && it.length() > 0L }
+    private fun exportResultsAsPdfAfterAudit(selectedPaths: List<String>) {
+        val images = selectedPaths.map { File(it) }.filter { it.isFile && it.length() > 0L }
         if (images.isEmpty()) {
-            toast("لا توجد نتيجة مترجمة لتصديرها")
+            toast("لا توجد صفحات صالحة لتصديرها")
             return
         }
-        toast("جارٍ تجهيز ملف PDF متصل الصفحات...")
+        toast("جارٍ تجهيز PDF من ${images.size} صفحة محددة...")
         fontDownloadExecutor.execute {
             var prepared: File? = null
             try {
@@ -2624,7 +2701,7 @@ class MainActivity : android.app.Activity() {
                     val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
                         addCategory(Intent.CATEGORY_OPENABLE)
                         type = "application/pdf"
-                        putExtra(Intent.EXTRA_TITLE, "$title.pdf")
+                        putExtra(Intent.EXTRA_TITLE, "${title}_${images.size}pages.pdf")
                     }
                     try {
                         startActivityForResult(intent, REQUEST_SAVE_PDF)
@@ -3964,6 +4041,8 @@ class MangaFoxAccessibilityService : AccessibilityService() {
     private var screenshotRetryCount = 0
     private var gestureFailureCount = 0
     @Volatile private var translationRunning = false
+    @Volatile private var cancelOperationRequested = false
+    @Volatile private var keepCompletedOnCancel = true
     @Volatile private var translationPauseRequested = false
     @Volatile private var translationPaused = false
     private val translationPauseLock = Object()
@@ -4122,6 +4201,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             toast("الالتقاط التلقائي يحتاج Android 11 أو أحدث")
             return
         }
+        cancelOperationRequested = false
         beginCaptureMetadata()
         captureRunning = true
         fullChapterMode = false
@@ -4196,6 +4276,7 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             toast("ترجمة الفصل الكامل تحتاج Android 11 أو أحدث")
             return
         }
+        cancelOperationRequested = false
         beginCaptureMetadata()
         captureRunning = true
         fullChapterMode = true
@@ -4352,6 +4433,49 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 mainHandler.postDelayed({ captureNextFrame() }, 900L)
             }
         }
+    }
+
+    /** @N5CR4 — Cancels the active capture/translation without touching older chapters. */
+    fun cancelCurrentOperation(keepCompleted: Boolean) {
+        keepCompletedOnCancel = keepCompleted
+        cancelOperationRequested = true
+        clearTranslationPause()
+
+        if (captureRunning) {
+            captureRunning = false
+            fullChapterMode = false
+            captureOnlyMode = false
+            clearCaptureNotification()
+            previousFrame?.recycle()
+            previousFrame = null
+            restoreFloatingBubble()
+            if (keepCompleted) {
+                // Captured segments remain as recoverable work files and are not auto-translated.
+                MangaFoxRuntime.status = "أُلغي الالتقاط؛ تم الاحتفاظ بـ ${capturedSegments.size} مقطع مكتمل للاستعادة"
+                MangaFoxRuntime.progressDetail = "المقاطع المكتملة محفوظة محلياً ويمكن استعادتها لاحقاً"
+            } else {
+                capturedSegments.forEach { runCatching { it.delete() } }
+                capturedSegments.clear()
+                pendingCaptureFiles().forEach { runCatching { it.delete() } }
+                MangaFoxRuntime.status = "أُلغيت العملية وحُذفت ملفات الالتقاط"
+                MangaFoxRuntime.progressDetail = "تم حذف ملفات هذه العملية"
+                MangaFoxRuntime.progressPercent = 0
+            }
+            cancelOperationRequested = false
+            notifyCaptureProgress()
+            toast(if (keepCompleted) "تم إيقاف الالتقاط والاحتفاظ بالمقاطع المكتملة" else "تم إيقاف الالتقاط وحذف ملفاته")
+            return
+        }
+
+        if (translationRunning) {
+            MangaFoxRuntime.status = "جارٍ إيقاف العملية بأمان..."
+            MangaFoxRuntime.progressDetail = if (keepCompleted) "سيتم الاحتفاظ بالصفحات المكتملة فقط" else "سيتم حذف نتائج هذه العملية"
+            mainHandler.post { toast("تم طلب إلغاء العملية؛ يجري إيقاف الصفحة الحالية بأمان") }
+            return
+        }
+
+        cancelOperationRequested = false
+        toast("لا توجد عملية نشطة حالياً")
     }
 
     fun stopCaptureByUser() {
@@ -4560,15 +4684,21 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         capturedSegments.clear()
         if (captureOnlyMode) {
             captureOnlyMode = false
+            translationRunning = true
+            cancelOperationRequested = false
             worker.execute {
+                val saved = ArrayList<String>()
                 try {
-                    val saved = workPages.mapIndexed { index, source ->
+                    workPages.forEachIndexed { index, source ->
+                        if (cancelOperationRequested) throw IllegalStateException("MFOX_OPERATION_CANCELLED")
                         val target = File(filesDir, "mfox_result_capture_${System.currentTimeMillis()}_$index.jpg")
                         if (!source.renameTo(target)) source.copyTo(target, overwrite = true)
                         source.delete()
-                        target.absolutePath
+                        saved.add(target.absolutePath)
                     }
+                    if (cancelOperationRequested) throw IllegalStateException("MFOX_OPERATION_CANCELLED")
                     Handler(Looper.getMainLooper()).post {
+                        translationRunning = false
                         MangaFoxRuntime.sourcePages = saved
                         MangaFoxRuntime.resultPages = saved
                         MangaFoxRuntime.translationLayerFiles = saved.map { "" }
@@ -4587,16 +4717,47 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                         MangaFoxRuntime.persist(this)
                         toast("اكتمل التقاط ${saved.size} صورة دون ترجمة")
                         val host = applicationContext
-                        // Open the result screen through the existing activity action.
                         startActivity(Intent(host, MainActivity::class.java).apply {
                             action = ACTION_SHOW_RESULTS
                             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                         })
                     }
                 } catch (e: Exception) {
-                    workPages.forEach { runCatching { it.delete() } }
-                    Handler(Looper.getMainLooper()).post {
-                        finishCaptureWithError("تعذر تجهيز الصور: ${e.localizedMessage ?: "خطأ"}")
+                    val cancelled = cancelOperationRequested || e.message == "MFOX_OPERATION_CANCELLED"
+                    if (cancelled && keepCompletedOnCancel) {
+                        Handler(Looper.getMainLooper()).post {
+                            translationRunning = false
+                            MangaFoxRuntime.sourcePages = saved.toList()
+                            MangaFoxRuntime.resultPages = saved.toList()
+                            MangaFoxRuntime.translationLayerFiles = saved.map { "" }
+                            MangaFoxRuntime.captureOnlyResult = true
+                            MangaFoxRuntime.qualitySummary = "نتيجة جزئية محفوظة: ${saved.size} صورة مكتملة دون ترجمة"
+                            MangaFoxRuntime.status = "أُلغيت العملية مع الاحتفاظ بالصور المكتملة"
+                            MangaFoxRuntime.progressDetail = "تم الاحتفاظ بـ ${saved.size} صورة مكتملة"
+                            MangaFoxRuntime.progressPercent = if (workPages.isEmpty()) 0 else (saved.size * 100 / workPages.size)
+                            if (saved.isNotEmpty()) runCatching {
+                                MangaFoxChapterArchive.save(
+                                    this, MangaFoxRuntime.activeWorkName, MangaFoxRuntime.activeChapterName,
+                                    MangaFoxRuntime.resultTitle, saved, saved, saved.map { "" }, true,
+                                    MangaFoxRuntime.qualitySummary
+                                )
+                            }
+                            MangaFoxRuntime.persist(this)
+                            cancelOperationRequested = false
+                            toast("تم الإلغاء مع الاحتفاظ بـ ${saved.size} صورة مكتملة")
+                        }
+                        workPages.forEach { runCatching { it.delete() } }
+                    } else {
+                        saved.forEach { runCatching { File(it).delete() } }
+                        workPages.forEach { runCatching { it.delete() } }
+                        Handler(Looper.getMainLooper()).post {
+                            translationRunning = false
+                            MangaFoxRuntime.status = if (cancelled) "أُلغيت العملية وحُذفت جميع صورها" else "تعذر تجهيز الصور"
+                            MangaFoxRuntime.progressDetail = if (cancelled) "تم حذف ملفات هذه العملية" else (e.localizedMessage ?: "خطأ")
+                            if (cancelled) MangaFoxRuntime.progressPercent = 0
+                            cancelOperationRequested = false
+                            toast(MangaFoxRuntime.status)
+                        }
                     }
                 }
             }
@@ -4919,10 +5080,13 @@ class MangaFoxAccessibilityService : AccessibilityService() {
         workPages: ArrayList<File>,
         note: String,
         title: String,
-        preserveInputs: Boolean = false
+        preserveInputs: Boolean = false,
+        resumeCheckpoint: JSONObject? = null
     ) {
         if (workPages.isEmpty() || translationRunning) return
         clearTranslationPause()
+        cancelOperationRequested = false
+        keepCompletedOnCancel = true
         translationRunning = true
         MangaFoxRuntime.progressPercent = 0
         MangaFoxRuntime.progressDetail = "تهيئة الترجمة"
@@ -4941,16 +5105,28 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                 val translatedFiles = ArrayList<String>()
                 val newSourceFiles = ArrayList<String>()
                 val newLayerFiles = ArrayList<String>()
+                fun checkpointPaths(key: String): List<String> {
+                    val array = resumeCheckpoint?.optJSONArray(key) ?: return emptyList()
+                    return (0 until array.length()).map { array.optString(it, "") }.filter { it.isNotBlank() && File(it).isFile }
+                }
+                translatedFiles.addAll(checkpointPaths("results"))
+                newSourceFiles.addAll(checkpointPaths("sources"))
+                newLayerFiles.addAll(checkpointPaths("layers"))
                 val groupSize = if (preserveInputs) 1 else 2
                 val groups = workPages.chunked(groupSize)
+                val startGroup = (resumeCheckpoint?.optInt("nextGroup", 0) ?: 0).coerceIn(0, groups.size)
                 try {
-                    groups.forEachIndexed { index, groupFiles ->
+                    groups.drop(startGroup).forEachIndexed { offset, groupFiles ->
+                        val index = startGroup + offset
+                        if (cancelOperationRequested) throw IllegalStateException("MFOX_OPERATION_CANCELLED")
                         awaitTranslationResume()
+                        if (cancelOperationRequested) throw IllegalStateException("MFOX_OPERATION_CANCELLED")
                         MangaFoxRuntime.status = "دمج وتحليل الصفحة ${index + 1} من ${groups.size}..."
                         updateTranslationLens((index * 100 / groups.size).coerceIn(0, 99), "الصفحة ${index + 1} من ${groups.size} · تجهيز الصورة وOCR")
                         val decodedParts = ArrayList<Bitmap>(groupFiles.size)
                         var page: Bitmap? = null
                         var translated: Bitmap? = null
+                        var pageCommitted = false
                         try {
                             groupFiles.forEach { file ->
                                 decodedParts.add(
@@ -5004,14 +5180,48 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                             val outputFile = File(filesDir, "mfox_result_${System.currentTimeMillis()}_$index.png")
                             writeRenderedBitmap(outputBitmap, outputFile)
                             translatedFiles.add(outputFile.absolutePath)
-                            updateTranslationLens((((index + 1).toFloat() / groups.size) * 100f).toInt().coerceIn(0, 99), "اكتملت الصفحة ${index + 1} من ${groups.size}")
+                            // Durable page checkpoint: publish only after image + layer files are fully written.
+                            // A process death can no longer discard already completed pages from the active session.
+                            MangaFoxRuntime.resultPages = translatedFiles.toList()
+                            MangaFoxRuntime.translationLayerFiles = newLayerFiles.toList()
+                            if (!preserveInputs) MangaFoxRuntime.sourcePages = newSourceFiles.toList()
+                            MangaFoxRuntime.resultTitle = title
+                            MangaFoxRuntime.status = "اكتملت الصفحة ${index + 1} من ${groups.size} · تم الحفظ تلقائياً"
+                            MangaFoxRuntime.progressDetail = "حُفظت الصفحة ${index + 1} بأمان"
+                            MangaFoxRuntime.persist(this@MangaFoxAccessibilityService)
+                            MangaFoxOperationCheckpoint.save(
+                                this@MangaFoxAccessibilityService,
+                                title,
+                                workPages.map { it.absolutePath },
+                                index + 1,
+                                translatedFiles,
+                                if (preserveInputs) MangaFoxRuntime.sourcePages else newSourceFiles,
+                                newLayerFiles,
+                                preserveInputs
+                            )
+                            pageCommitted = true
+                            runCatching {
+                                MangaFoxChapterArchive.save(
+                                    this@MangaFoxAccessibilityService,
+                                    MangaFoxRuntime.activeWorkName,
+                                    MangaFoxRuntime.activeChapterName.ifBlank { title },
+                                    title,
+                                    if (preserveInputs) MangaFoxRuntime.sourcePages else newSourceFiles,
+                                    translatedFiles,
+                                    newLayerFiles,
+                                    false,
+                                    "حفظ تلقائي · ${translatedFiles.size} صفحة مكتملة"
+                                )
+                            }
+                            updateTranslationLens((((index + 1).toFloat() / groups.size) * 100f).toInt().coerceIn(0, 99), "اكتملت الصفحة ${index + 1} من ${groups.size} · حُفظت")
+                            if (cancelOperationRequested) throw IllegalStateException("MFOX_OPERATION_CANCELLED")
                         } finally {
                             page?.let { merged ->
                                 if (decodedParts.none { it === merged } && !merged.isRecycled) merged.recycle()
                             }
                             translated?.let { if (!it.isRecycled) it.recycle() }
                             decodedParts.forEach { if (!it.isRecycled) it.recycle() }
-                            if (!preserveInputs) groupFiles.forEach { runCatching { it.delete() } }
+                            if (!preserveInputs && pageCommitted) groupFiles.forEach { runCatching { it.delete() } }
                         }
                     }
                     val oldFiles = MangaFoxRuntime.resultPages
@@ -5049,11 +5259,12 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                             if (!canonical.startsWith(permanentArchiveRoot)) file.delete()
                         }
                     }
-                    oldFiles.filterNot { it in retainedSources }.forEach(::deleteOnlyWorkingFile)
-                    oldLayers.forEach(::deleteOnlyWorkingFile)
-                    if (!preserveInputs) oldSources.forEach(::deleteOnlyWorkingFile)
+                    oldFiles.filterNot { it in retainedSources || it in translatedFiles }.forEach(::deleteOnlyWorkingFile)
+                    oldLayers.filterNot { it in newLayerFiles }.forEach(::deleteOnlyWorkingFile)
+                    if (!preserveInputs) oldSources.filterNot { it in newSourceFiles }.forEach(::deleteOnlyWorkingFile)
                     if (archivedId == null) MangaFoxRuntime.lastError = "${MangaFoxRuntime.lastError} · تعذر إنشاء نسخة الأرشيف".trim(' ', '·')
                     MangaFoxRuntime.persist(this@MangaFoxAccessibilityService)
+                    MangaFoxOperationCheckpoint.clear(this@MangaFoxAccessibilityService)
                     clearTranslationPause()
                     MangaFoxRuntime.progressPercent = 100
                     MangaFoxRuntime.progressDetail = "اكتملت الترجمة"
@@ -5066,20 +5277,82 @@ class MangaFoxAccessibilityService : AccessibilityService() {
                         toast(if (notified) "اكتملت الترجمة العربية. اضغط إشعار Manga Fox لعرض الفصل" else "اكتملت الترجمة. افتح Manga Fox ثم اختر عرض آخر نتيجة مترجمة")
                     }
                 } catch (e: Exception) {
-                    if (!preserveInputs) workPages.forEach { runCatching { it.delete() } }
-                    newSourceFiles.forEach { runCatching { File(it).delete() } }
-                    newLayerFiles.forEach { runCatching { File(it).delete() } }
-                    translatedFiles.forEach { runCatching { File(it).delete() } }
-                    clearTranslationPause()
-                    MangaFoxRuntime.lastError = "حدث خطأ أثناء الترجمة: ${e.localizedMessage ?: "خطأ غير معروف"}"
-                    MangaFoxRuntime.status = "تعذرت الترجمة"
-                    MangaFoxRuntime.progressDetail = "تعذرت الترجمة"
-                    mainHandler.post {
-                        translationRunning = false
-                        updateTranslationLens(-1, "تعذرت الترجمة")
-                        mainHandler.postDelayed({ resetLensProgress() }, 4000L)
-                        if (instance !== this@MangaFoxAccessibilityService) closeRecognitionResources()
-                        toast(MangaFoxRuntime.lastError)
+                    val cancelled = cancelOperationRequested || e.message == "MFOX_OPERATION_CANCELLED"
+                    if (cancelled) {
+                        val keep = keepCompletedOnCancel
+                        if (keep && translatedFiles.isNotEmpty()) {
+                            // Commit only fully rendered pages; the in-flight page is completed before this boundary.
+                            MangaFoxRuntime.resultPages = translatedFiles.toList()
+                            MangaFoxRuntime.translationLayerFiles = newLayerFiles.toList()
+                            if (!preserveInputs) MangaFoxRuntime.sourcePages = newSourceFiles.toList()
+                            MangaFoxRuntime.resultTitle = title
+                            MangaFoxRuntime.pendingEdits = false
+                            MangaFoxRuntime.qualitySummary = "نتيجة جزئية محفوظة: ${translatedFiles.size} صفحة مكتملة"
+                            MangaFoxRuntime.status = "أُلغيت العملية مع الاحتفاظ بالصفحات المكتملة"
+                            MangaFoxRuntime.progressDetail = "تم الاحتفاظ بـ ${translatedFiles.size} صفحة مكتملة"
+                            runCatching {
+                                MangaFoxChapterArchive.save(
+                                    this@MangaFoxAccessibilityService, MangaFoxRuntime.activeWorkName,
+                                    MangaFoxRuntime.activeChapterName.ifBlank { title }, title,
+                                    if (preserveInputs) MangaFoxRuntime.sourcePages else newSourceFiles,
+                                    translatedFiles, newLayerFiles, false, MangaFoxRuntime.qualitySummary
+                                )
+                            }
+                            MangaFoxRuntime.persist(this@MangaFoxAccessibilityService)
+                        } else {
+                            newSourceFiles.forEach { runCatching { File(it).delete() } }
+                            newLayerFiles.forEach { runCatching { File(it).delete() } }
+                            translatedFiles.forEach { runCatching { File(it).delete() } }
+                            MangaFoxRuntime.status = "أُلغيت العملية وحُذفت نتائجها"
+                            MangaFoxRuntime.progressDetail = "لم يتم الاحتفاظ بأي صفحة من هذه العملية"
+                            MangaFoxRuntime.progressPercent = 0
+                        }
+                        if (!preserveInputs) workPages.forEach { runCatching { it.delete() } }
+                        MangaFoxRuntime.lastError = ""
+                        MangaFoxOperationCheckpoint.clear(this@MangaFoxAccessibilityService)
+                        clearTranslationPause()
+                        cancelOperationRequested = false
+                        mainHandler.post {
+                            translationRunning = false
+                            updateTranslationLens(-1, "تم إلغاء العملية")
+                            mainHandler.postDelayed({ resetLensProgress() }, 2500L)
+                            if (instance !== this@MangaFoxAccessibilityService) closeRecognitionResources()
+                            toast(if (keep && translatedFiles.isNotEmpty()) "أُلغيت العملية مع الاحتفاظ بـ ${translatedFiles.size} صفحة مكتملة" else "أُلغيت العملية وحُذفت نتائجها")
+                        }
+                    } else {
+                        // Keep the last committed page boundary and remaining source files.
+                        // A transient OCR/model/storage failure must not destroy hours of capture work.
+                        MangaFoxRuntime.resultPages = translatedFiles.filter { File(it).isFile }
+                        MangaFoxRuntime.translationLayerFiles = newLayerFiles.filter { File(it).isFile }
+                        if (!preserveInputs) MangaFoxRuntime.sourcePages = newSourceFiles.filter { File(it).isFile }
+                        MangaFoxRuntime.resultTitle = title
+                        MangaFoxRuntime.qualitySummary = "توقف عند الصفحة ${translatedFiles.size + 1} · ${translatedFiles.size} صفحة محفوظة"
+                        MangaFoxRuntime.persist(this@MangaFoxAccessibilityService)
+                        runCatching {
+                            if (translatedFiles.isNotEmpty()) MangaFoxChapterArchive.save(
+                                this@MangaFoxAccessibilityService,
+                                MangaFoxRuntime.activeWorkName,
+                                MangaFoxRuntime.activeChapterName.ifBlank { title },
+                                title,
+                                if (preserveInputs) MangaFoxRuntime.sourcePages else newSourceFiles,
+                                translatedFiles,
+                                newLayerFiles,
+                                false,
+                                MangaFoxRuntime.qualitySummary
+                            )
+                        }
+                        // Do not clear the checkpoint. The next app launch can resume it.
+                        clearTranslationPause()
+                        MangaFoxRuntime.lastError = "حدث خطأ أثناء الترجمة: ${e.localizedMessage ?: "خطأ غير معروف"}"
+                        MangaFoxRuntime.status = "توقفت المعالجة مع حفظ التقدم"
+                        MangaFoxRuntime.progressDetail = "${translatedFiles.size} صفحة محفوظة · يمكن الاستكمال من آخر نقطة حفظ"
+                        mainHandler.post {
+                            translationRunning = false
+                            updateTranslationLens(-1, "توقفت المعالجة · التقدم محفوظ")
+                            mainHandler.postDelayed({ resetLensProgress() }, 4000L)
+                            if (instance !== this@MangaFoxAccessibilityService) closeRecognitionResources()
+                            toast("${MangaFoxRuntime.lastError} · تم حفظ الصفحات المكتملة ويمكن الاستكمال لاحقاً")
+                        }
                     }
                 }
             }
@@ -5089,6 +5362,28 @@ class MangaFoxAccessibilityService : AccessibilityService() {
             workPages.forEach { runCatching { it.delete() } }
             finishCaptureWithError("تعذر تشغيل عامل الترجمة: ${e.localizedMessage ?: "خطأ داخلي"}")
         }
+    }
+
+    /** Resume the last durable page boundary after the app/service process was interrupted. */
+    fun resumeInterruptedOperation(): Boolean {
+        if (translationRunning) return false
+        val checkpoint = MangaFoxOperationCheckpoint.read(this) ?: return false
+        val inputArray = checkpoint.optJSONArray("inputs") ?: return false
+        val inputs = (0 until inputArray.length()).map { File(inputArray.optString(it, "")) }
+        val next = checkpoint.optInt("nextGroup", 0).coerceAtLeast(0)
+        val groupSize = if (checkpoint.optBoolean("preserveInputs", false)) 1 else 2
+        val remaining = inputs.chunked(groupSize).drop(next).flatten()
+        if (remaining.isEmpty() || remaining.any { !it.isFile || it.length() <= 0L }) return false
+        val title = checkpoint.optString("title", MangaFoxRuntime.activeChapterName)
+        val preserve = checkpoint.optBoolean("preserveInputs", false)
+        translateSavedSegments(
+            ArrayList(inputs),
+            "استكمال العملية من الصفحة ${next + 1} بعد استعادة نقطة الحفظ.",
+            title,
+            preserve,
+            checkpoint
+        )
+        return true
     }
 
     private fun finishCaptureWithError(message: String) {
@@ -8615,6 +8910,56 @@ class ZoomableImageView(context: Context) : ImageView(context) {
 // ============================================================
 // MERGED FROM: MangaFox_V3_0_3_MangaFoxRuntime.kt
 // ============================================================
+
+/** @N5CR4 — Durable per-operation checkpoint metadata. Paths are app-private and validated on restore. */
+object MangaFoxOperationCheckpoint {
+    private const val FILE_NAME = "mfox_operation_checkpoint_v1.json"
+
+    @Synchronized fun save(
+        context: Context,
+        title: String,
+        inputs: List<String>,
+        nextGroup: Int,
+        completedResults: List<String>,
+        completedSources: List<String>,
+        completedLayers: List<String>,
+        preserveInputs: Boolean
+    ) {
+        runCatching {
+            val root = JSONObject()
+                .put("version", 1)
+                .put("title", title)
+                .put("inputs", JSONArray(inputs))
+                .put("nextGroup", nextGroup.coerceAtLeast(0))
+                .put("results", JSONArray(completedResults))
+                .put("sources", JSONArray(completedSources))
+                .put("layers", JSONArray(completedLayers))
+                .put("preserveInputs", preserveInputs)
+                .put("updatedAt", System.currentTimeMillis())
+            val target = File(context.filesDir, FILE_NAME)
+            val temp = File(context.filesDir, "$FILE_NAME.tmp")
+            temp.writeText(root.toString(), Charsets.UTF_8)
+            if (!temp.renameTo(target)) {
+                temp.copyTo(target, overwrite = true)
+                temp.delete()
+            }
+        }
+    }
+
+    @Synchronized fun read(context: Context): JSONObject? = runCatching {
+        val file = File(context.filesDir, FILE_NAME)
+        if (!file.isFile) return null
+        val json = JSONObject(file.readText(Charsets.UTF_8))
+        if (json.optInt("version") != 1) return null
+        json
+    }.getOrNull()
+
+    @Synchronized fun clear(context: Context) {
+        runCatching { File(context.filesDir, FILE_NAME).delete() }
+    }
+
+    fun completedPages(context: Context): Int = read(context)?.optJSONArray("results")?.length() ?: 0
+}
 
 object MangaFoxRuntime {
     private const val SESSION_MANIFEST = "mfox_session_v1.json"
