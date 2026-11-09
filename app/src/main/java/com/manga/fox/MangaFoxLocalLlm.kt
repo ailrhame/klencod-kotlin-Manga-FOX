@@ -466,10 +466,10 @@ ${characterText.ifBlank { "لا توجد بيانات" }}
                 }.text.trim()
                 val jsonStart = generated.indexOf('{')
                 val jsonEnd = generated.lastIndexOf('}')
-                if (jsonStart < 0 || jsonEnd <= jsonStart) continue
+                if (jsonStart < 0 || jsonEnd <= jsonStart) return@forEach
                 val rows = runCatching {
                     JSONObject(generated.substring(jsonStart, jsonEnd + 1)).optJSONArray("names")
-                }.getOrNull() ?: continue
+                }.getOrNull() ?: return@forEach
                 for (index in 0 until rows.length()) {
                     val row = rows.optJSONObject(index) ?: continue
                     val id = row.optInt("id", -1)
