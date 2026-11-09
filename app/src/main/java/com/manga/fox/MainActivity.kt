@@ -275,7 +275,7 @@ class MainActivity : android.app.Activity() {
         val center = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
             setPadding(dp(24), dp(24), dp(24), dp(24))
         }
         val glyph = TextView(this).apply {
@@ -608,7 +608,7 @@ class MainActivity : android.app.Activity() {
             setPadding(0, dp(14), 0, dp(4))
         }, matchWrap())
         root.addView(TextView(this).apply {
-            text = "programmer · N5CR4  ↗"
+            text = "حقوقي · N5CR4  ↗"
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(gold)
@@ -837,20 +837,147 @@ class MainActivity : android.app.Activity() {
         }
         progressCard.addView(homeProgress, matchWrap(dp(8)))
         progressCard.addView(actionButton("حذف العملية الحالية", false) {
-            AlertDialog.Builder(this)
-                .setTitle("إلغاء العملية الحالية؟")
-                .setMessage("اختر طريقة الإلغاء. لن تتأثر نتائج الفصول السابقة.")
-                .setItems(arrayOf(
-                    "إيقاف مع الاحتفاظ بالصفحات المكتملة",
-                    "إيقاف وحذف جميع صفحات هذه العملية"
-                )) { _, which ->
-                    val keepCompleted = which == 0
-                    val service = MangaFoxAccessibilityService.instance
-                    if (service == null) toast("خدمة Manga FOX غير متصلة")
-                    else service.cancelCurrentOperation(keepCompleted)
+            // @N5CR4 — Explicit two-choice cancellation dialog; avoids OEM setItems/message clipping.
+            var keepCompletedSelection = true
+            val dialogContent = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+                setPadding(dp(18), dp(4), dp(18), dp(12))
+                setBackgroundColor(Color.BLACK)
+            }
+
+            dialogContent.addView(
+                text("اختر طريقة الإلغاء. لن تتأثر نتائج الفصول السابقة.", 14f, Color.LTGRAY),
+                matchWrap(dp(12))
+            )
+
+            val keepCard = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+                setPadding(dp(14), dp(12), dp(14), dp(12))
+                isClickable = true
+                isFocusable = true
+            }
+            val keepHeader = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+            }
+            val keepMark = text("◉", 23f, Color.rgb(46, 190, 130), true).apply {
+                gravity = Gravity.CENTER
+                setPadding(0, 0, dp(10), 0)
+            }
+            val keepTitle = text("الخيار الأول: الاحتفاظ بالمكتمل", 17f, Color.WHITE, true).apply {
+                gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL
+            }
+            keepHeader.addView(keepMark, LinearLayout.LayoutParams(dp(34), dp(38)))
+            keepHeader.addView(keepTitle, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            keepCard.addView(keepHeader, matchWrap())
+            keepCard.addView(
+                text("إيقاف العملية وحذف الملفات غير المكتملة، مع الاحتفاظ بالصفحات التي اكتملت معالجتها.", 14f, Color.LTGRAY),
+                matchWrap(dp(2))
+            )
+
+            val deleteCard = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+                setPadding(dp(14), dp(12), dp(14), dp(12))
+                isClickable = true
+                isFocusable = true
+            }
+            val deleteHeader = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+            }
+            val deleteMark = text("○", 23f, Color.rgb(235, 95, 105), true).apply {
+                gravity = Gravity.CENTER
+                setPadding(0, 0, dp(10), 0)
+            }
+            val deleteTitle = text("الخيار الثاني: حذف الكل", 17f, Color.WHITE, true).apply {
+                gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL
+            }
+            deleteHeader.addView(deleteMark, LinearLayout.LayoutParams(dp(34), dp(38)))
+            deleteHeader.addView(deleteTitle, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            deleteCard.addView(deleteHeader, matchWrap())
+            deleteCard.addView(
+                text("إيقاف العملية وحذف جميع ملفات هذه العملية، حتى الصفحات المكتملة.", 14f, Color.LTGRAY),
+                matchWrap(dp(2))
+            )
+
+            fun refreshCancelChoiceStyle() {
+                keepCard.background = GradientDrawable().apply {
+                    setColor(Color.rgb(24, 22, 28))
+                    cornerRadius = dp(18).toFloat()
+                    setStroke(dp(if (keepCompletedSelection) 2 else 1), if (keepCompletedSelection) Color.rgb(46, 190, 130) else Color.rgb(65, 58, 70))
                 }
-                .setNegativeButton("تراجع", null)
-                .show()
+                deleteCard.background = GradientDrawable().apply {
+                    setColor(Color.rgb(24, 22, 28))
+                    cornerRadius = dp(18).toFloat()
+                    setStroke(dp(if (!keepCompletedSelection) 2 else 1), if (!keepCompletedSelection) Color.rgb(235, 95, 105) else Color.rgb(65, 58, 70))
+                }
+                keepMark.text = if (keepCompletedSelection) "☑" else "○"
+                deleteMark.text = if (!keepCompletedSelection) "☑" else "○"
+            }
+            keepCard.setOnClickListener {
+                keepCompletedSelection = true
+                refreshCancelChoiceStyle()
+            }
+            deleteCard.setOnClickListener {
+                keepCompletedSelection = false
+                refreshCancelChoiceStyle()
+            }
+            dialogContent.addView(keepCard, matchWrap(dp(12)))
+            dialogContent.addView(deleteCard, matchWrap(dp(16)))
+            refreshCancelChoiceStyle()
+
+            lateinit var cancelDialog: AlertDialog
+            val footer = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val backButton = Button(this).apply {
+                text = "تراجع"
+                textSize = 16f
+                isAllCaps = false
+                setTextColor(Color.WHITE)
+                background = rounded(Color.rgb(48, 48, 48), 15)
+                setOnClickListener { cancelDialog.dismiss() }
+            }
+            val confirmButton = Button(this).apply {
+                text = "تأكيد الإلغاء"
+                textSize = 16f
+                isAllCaps = false
+                setTextColor(Color.rgb(255, 190, 195))
+                background = rounded(Color.rgb(75, 39, 57), 15)
+                setOnClickListener {
+                    val service = MangaFoxAccessibilityService.instance
+                    if (service == null) {
+                        cancelDialog.dismiss()
+                        toast("خدمة Manga FOX غير متصلة")
+                    } else {
+                        cancelDialog.dismiss()
+                        service.cancelCurrentOperation(keepCompletedSelection)
+                    }
+                }
+            }
+            footer.addView(backButton, LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginEnd = dp(8) })
+            footer.addView(confirmButton, LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginStart = dp(8) })
+            dialogContent.addView(footer, matchWrap())
+
+            cancelDialog = AlertDialog.Builder(this)
+                .setTitle("إلغاء العملية الحالية؟")
+                .setView(dialogContent)
+                .create()
+            cancelDialog.setOnShowListener {
+                cancelDialog.window?.setBackgroundDrawable(rounded(Color.BLACK, 22))
+                cancelDialog.window?.setLayout(
+                    (resources.displayMetrics.widthPixels * 0.96f).toInt(),
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            }
+            cancelDialog.show()
         }, matchWrap(dp(4)))
         progressCard.addView(actionButton("إيقاف الترجمة مؤقتاً / استئناف", false) {
             MangaFoxAccessibilityService.instance?.toggleTranslationPause()
