@@ -601,14 +601,14 @@ class MainActivity : android.app.Activity() {
         }
         root.addView(homeContent, matchWrap())
         root.addView(TextView(this).apply {
-            text = "MANGA FOX  ·  N5CR4  ·  محرك 3.0.6b"
+            text = "MANGA FOX  ·  N5CR4  ·  محرك 3.0.6B"
             textSize = 12f
             setTextColor(gold)
             gravity = Gravity.CENTER
             setPadding(0, dp(14), 0, dp(4))
         }, matchWrap())
         root.addView(TextView(this).apply {
-            text = "حقوقي · N5CR4  ↗"
+            text = "Made by · N5CR4  ↗"
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(gold)
@@ -867,7 +867,7 @@ class MainActivity : android.app.Activity() {
                 gravity = Gravity.CENTER
                 setPadding(0, 0, dp(10), 0)
             }
-            val keepTitle = text("الخيار الأول: الاحتفاظ بالمكتمل", 17f, Color.WHITE, true).apply {
+            val keepTitle = text("الاحتفاظ بالمكتمل", 17f, Color.WHITE, true).apply {
                 gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL
             }
             keepHeader.addView(keepMark, LinearLayout.LayoutParams(dp(34), dp(38)))
@@ -894,7 +894,7 @@ class MainActivity : android.app.Activity() {
                 gravity = Gravity.CENTER
                 setPadding(0, 0, dp(10), 0)
             }
-            val deleteTitle = text("الخيار الثاني: حذف الكل", 17f, Color.WHITE, true).apply {
+            val deleteTitle = text("حذف الكل", 17f, Color.WHITE, true).apply {
                 gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL
             }
             deleteHeader.addView(deleteMark, LinearLayout.LayoutParams(dp(34), dp(38)))
